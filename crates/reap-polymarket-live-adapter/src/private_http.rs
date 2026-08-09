@@ -18,6 +18,7 @@ use crate::{
     PM_CLOB_PRODUCTION_ORIGIN, PmAccountHttpRole, PmLiveAdapterError, PmPrivateHttpConfig,
     PmPrivateReadEdgeClock, PmPrivateReadProductClock, PmReadOnlySignatureType,
     PmReconciliationHttpRole, config::OriginMode, private_credentials::PmHttpCredentialRole,
+    read_authority::PmHttpReadAuthorityProvider,
 };
 
 const FIRST_PAGE_CURSOR: &str = "MA==";
@@ -307,7 +308,7 @@ impl PmPrivateHttpTransport {
 /// The owner lends mutually exclusive, short-lived read capabilities. It has
 /// no generic request API and cannot authorize a mutation.
 pub struct PmAuthenticatedHttpOwner {
-    authority: PmHttpCredentialRole,
+    authority: Box<dyn PmHttpReadAuthorityProvider>,
     transport: PmPrivateHttpTransport,
     exact_order_scope: PmWireScope,
     l2_signer_address: EoaAddress,
@@ -316,13 +317,31 @@ pub struct PmAuthenticatedHttpOwner {
 }
 
 impl PmAuthenticatedHttpOwner {
-    pub(crate) const fn from_authority_with_account_profile(
+    pub(crate) fn from_authority_with_account_profile(
         transport: PmPrivateHttpTransport,
         exact_order_scope: PmWireScope,
         l2_signer_address: EoaAddress,
         expected_order_maker: EvmAddress,
         balance_signature_type: PmReadOnlySignatureType,
         authority: PmHttpCredentialRole,
+    ) -> Self {
+        Self::from_external_authority_with_account_profile(
+            transport,
+            exact_order_scope,
+            l2_signer_address,
+            expected_order_maker,
+            balance_signature_type,
+            Box::new(authority),
+        )
+    }
+
+    pub(crate) fn from_external_authority_with_account_profile(
+        transport: PmPrivateHttpTransport,
+        exact_order_scope: PmWireScope,
+        l2_signer_address: EoaAddress,
+        expected_order_maker: EvmAddress,
+        balance_signature_type: PmReadOnlySignatureType,
+        authority: Box<dyn PmHttpReadAuthorityProvider>,
     ) -> Self {
         Self {
             authority,
@@ -391,7 +410,7 @@ impl PmAuthenticatedHttpOwner {
     pub fn reconciliation(&mut self) -> PmReconciliationHttpRole<'_> {
         debug_assert_eq!(self.transport.configured_address, self.l2_signer_address);
         PmReconciliationHttpRole::new(
-            &mut self.authority,
+            self.authority.as_mut(),
             &self.transport,
             self.exact_order_scope,
             self.expected_order_maker,
@@ -401,7 +420,7 @@ impl PmAuthenticatedHttpOwner {
 
     pub fn account(&mut self) -> PmAccountHttpRole<'_> {
         PmAccountHttpRole::new(
-            &mut self.authority,
+            self.authority.as_mut(),
             &self.transport,
             self.exact_order_scope.token(),
             self.balance_signature_type,
@@ -411,7 +430,7 @@ impl PmAuthenticatedHttpOwner {
     /// Borrow the sole fixed authenticated account-safety read capability.
     pub fn preflight(&mut self) -> PmPrivatePreflightHttpRole<'_> {
         PmPrivatePreflightHttpRole {
-            authority: &mut self.authority,
+            authority: self.authority.as_mut(),
             transport: &self.transport,
             signature_type: self.balance_signature_type,
         }
@@ -426,7 +445,7 @@ impl PmAuthenticatedHttpOwner {
 /// Borrowed authenticated capability for only
 /// `GET /auth/ban-status/closed-only`.
 pub struct PmPrivatePreflightHttpRole<'a> {
-    authority: &'a mut PmHttpCredentialRole,
+    authority: &'a mut dyn PmHttpReadAuthorityProvider,
     transport: &'a PmPrivateHttpTransport,
     signature_type: PmReadOnlySignatureType,
 }

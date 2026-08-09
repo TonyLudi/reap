@@ -9,6 +9,7 @@ use crate::{
     config::OriginMode,
     private_credentials::PmHttpCredentialRole,
     private_http::{PmPrivateHttpObservation, PmPrivateHttpTransport, PmPrivateRoute},
+    read_authority::PmHttpReadAuthorityProvider,
 };
 
 const BALANCE_ALLOWANCE_OBSERVATION_COMMITMENT_DOMAIN: &[u8] =
@@ -169,7 +170,7 @@ struct FetchedBalanceAllowance {
 /// Borrowed authenticated capability for exactly two read-only EOA account
 /// projections: collateral and one configured conditional token.
 pub struct PmAccountHttpRole<'a> {
-    authority: &'a mut PmHttpCredentialRole,
+    authority: &'a mut dyn PmHttpReadAuthorityProvider,
     transport: &'a PmPrivateHttpTransport,
     conditional_token: PmTokenId,
     signature_type: PmReadOnlySignatureType,
@@ -224,7 +225,7 @@ impl std::fmt::Debug for PmReadOnlyAccountHttpOwner {
 
 impl<'a> PmAccountHttpRole<'a> {
     pub(crate) const fn new(
-        authority: &'a mut PmHttpCredentialRole,
+        authority: &'a mut dyn PmHttpReadAuthorityProvider,
         transport: &'a PmPrivateHttpTransport,
         conditional_token: PmTokenId,
         signature_type: PmReadOnlySignatureType,
@@ -341,7 +342,7 @@ impl<'a> PmAccountHttpRole<'a> {
     ) -> Result<FetchedBalanceAllowance, PmLiveAdapterError> {
         let headers = self
             .authority
-            .authenticate_balance(
+            .authenticate_balance_allowance(
                 server_time
                     .into_l2_timestamp()
                     .map_err(|_| PmLiveAdapterError::ProductClock)?,

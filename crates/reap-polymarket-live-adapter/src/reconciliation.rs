@@ -16,10 +16,10 @@ use crate::{
     PM_CLOB_PRODUCTION_ORIGIN, PmLiveAdapterError, PmPrivateReadEdgeClock,
     PmPrivateReadProductClock, PmReadOnlySignatureType, PmReadServerTime,
     config::OriginMode,
-    private_credentials::PmHttpCredentialRole,
     private_http::{
         PmPrivateHttpObservation, PmPrivateHttpTransport, PmPrivateRoute, first_page_cursor,
     },
+    read_authority::PmHttpReadAuthorityProvider,
 };
 
 /// A deliberate fail-closed ceiling for one account-wide paginated cut.
@@ -476,7 +476,7 @@ impl fmt::Debug for PmExactOrderDetailObservation {
 /// Borrowed authenticated capability for complete account cuts and one strict
 /// journal-known exact-order lookup.
 pub struct PmReconciliationHttpRole<'a> {
-    authority: &'a mut PmHttpCredentialRole,
+    authority: &'a mut dyn PmHttpReadAuthorityProvider,
     transport: &'a PmPrivateHttpTransport,
     exact_order_scope: PmWireScope,
     expected_order_maker: EvmAddress,
@@ -485,7 +485,7 @@ pub struct PmReconciliationHttpRole<'a> {
 
 impl<'a> PmReconciliationHttpRole<'a> {
     pub(crate) const fn new(
-        authority: &'a mut PmHttpCredentialRole,
+        authority: &'a mut dyn PmHttpReadAuthorityProvider,
         transport: &'a PmPrivateHttpTransport,
         exact_order_scope: PmWireScope,
         expected_order_maker: EvmAddress,

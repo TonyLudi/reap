@@ -7,11 +7,15 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use reap_pm_core::PmConditionId;
 use reap_polymarket_auth::{
     AuthenticatedL2Headers, AuthenticatedPlaceRequest, AuthenticatedUserSubscription,
     CredentialOwnedUserFrame, FixedEoaSigner, L2Credentials, L2Timestamp, PmAuthError,
     derive_place_public_request_identity,
+};
+use reap_polymarket_live_adapter::{
+    PmHttpReadAuthorityProvider, PmLiveAdapterError, PmUserWsReadAuthorityProvider,
 };
 use reap_polymarket_wire::{
     PmClobV2SignatureType, PmLiveOpenOrderPage, PmLiveOrder, PmLiveTradePage, PmLiveUserFrame,
@@ -526,6 +530,105 @@ impl fmt::Debug for FixedHttpAuthenticationRole {
     }
 }
 
+#[async_trait]
+impl PmHttpReadAuthorityProvider for FixedHttpAuthenticationRole {
+    async fn authenticate_open_orders(
+        &mut self,
+        timestamp: L2Timestamp,
+    ) -> Result<AuthenticatedL2Headers, PmLiveAdapterError> {
+        FixedHttpAuthenticationRole::authenticate_open_orders(
+            self,
+            AuthorizedL2Timestamp::new(timestamp),
+        )
+        .await
+        .map_err(map_external_read_error)
+    }
+
+    async fn authenticate_trades(
+        &mut self,
+        timestamp: L2Timestamp,
+    ) -> Result<AuthenticatedL2Headers, PmLiveAdapterError> {
+        FixedHttpAuthenticationRole::authenticate_trades(
+            self,
+            AuthorizedL2Timestamp::new(timestamp),
+        )
+        .await
+        .map_err(map_external_read_error)
+    }
+
+    async fn authenticate_balance_allowance(
+        &mut self,
+        timestamp: L2Timestamp,
+    ) -> Result<AuthenticatedL2Headers, PmLiveAdapterError> {
+        FixedHttpAuthenticationRole::authenticate_balance_allowance(
+            self,
+            AuthorizedL2Timestamp::new(timestamp),
+        )
+        .await
+        .map_err(map_external_read_error)
+    }
+
+    async fn authenticate_closed_only(
+        &mut self,
+        timestamp: L2Timestamp,
+    ) -> Result<AuthenticatedL2Headers, PmLiveAdapterError> {
+        FixedHttpAuthenticationRole::authenticate_closed_only(
+            self,
+            AuthorizedL2Timestamp::new(timestamp),
+        )
+        .await
+        .map_err(map_external_read_error)
+    }
+
+    async fn authenticate_exact_order(
+        &mut self,
+        timestamp: L2Timestamp,
+        order_id: reap_polymarket_auth::FixedOrderId,
+    ) -> Result<AuthenticatedL2Headers, PmLiveAdapterError> {
+        let authenticated = FixedHttpAuthenticationRole::authenticate_exact_owned_order(
+            self,
+            SealedExactOwnedOrderReadAuthentication::new(
+                order_id,
+                AuthorizedL2Timestamp::new(timestamp),
+            ),
+        )
+        .await
+        .map_err(map_external_read_error)?;
+        let (headers, sealed_order_id, sealed_timestamp) = authenticated.into_parts();
+        if sealed_order_id != order_id || sealed_timestamp != timestamp {
+            return Err(PmLiveAdapterError::CredentialAuthorityClosed);
+        }
+        Ok(headers)
+    }
+
+    async fn bind_open_orders(
+        &mut self,
+        page: PmLiveOpenOrderPage,
+    ) -> Result<PmLiveOpenOrderPage, PmLiveAdapterError> {
+        FixedHttpAuthenticationRole::bind_open_orders(self, page)
+            .await
+            .map_err(map_external_read_error)
+    }
+
+    async fn bind_trades(
+        &mut self,
+        page: PmLiveTradePage,
+    ) -> Result<PmLiveTradePage, PmLiveAdapterError> {
+        FixedHttpAuthenticationRole::bind_trades(self, page)
+            .await
+            .map_err(map_external_read_error)
+    }
+
+    async fn bind_exact_order(
+        &mut self,
+        order: PmLiveOrder,
+    ) -> Result<PmLiveOrder, PmLiveAdapterError> {
+        FixedHttpAuthenticationRole::bind_exact_order(self, order)
+            .await
+            .map_err(map_external_read_error)
+    }
+}
+
 /// User-WS subscription and complete-frame owner binding handle, separated
 /// from HTTP so acknowledged stream setup can overlap final account cuts.
 pub(super) struct FixedUserWsAuthenticationRole {
@@ -560,6 +663,37 @@ impl FixedUserWsAuthenticationRole {
 impl fmt::Debug for FixedUserWsAuthenticationRole {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("FixedUserWsAuthenticationRole(<opaque>)")
+    }
+}
+
+#[async_trait]
+impl PmUserWsReadAuthorityProvider for FixedUserWsAuthenticationRole {
+    async fn authenticate_user_subscription(
+        &mut self,
+        condition: PmConditionId,
+    ) -> Result<AuthenticatedUserSubscription, PmLiveAdapterError> {
+        FixedUserWsAuthenticationRole::user_subscription(self, condition)
+            .await
+            .map_err(map_external_read_error)
+    }
+
+    async fn bind_user_frame(
+        &mut self,
+        frame: PmLiveUserFrame,
+    ) -> Result<CredentialOwnedUserFrame, PmLiveAdapterError> {
+        FixedUserWsAuthenticationRole::bind_user_frame(self, frame)
+            .await
+            .map_err(map_external_read_error)
+    }
+}
+
+fn map_external_read_error(error: CredentialAuthorityError) -> PmLiveAdapterError {
+    match error {
+        CredentialAuthorityError::CredentialOwnerMismatch => {
+            PmLiveAdapterError::CredentialOwnerMismatch
+        }
+        CredentialAuthorityError::Auth(error) => PmLiveAdapterError::Auth(error),
+        _ => PmLiveAdapterError::CredentialAuthorityClosed,
     }
 }
 
@@ -1637,6 +1771,56 @@ mod tests {
         assert!(shutdown.staged_l2_files_removed());
         assert!(private_key_exists);
         assert!(l2_absent);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn external_read_provider_traits_share_the_recovery_authority_and_fail_owner_mismatch() {
+        let condition = PmConditionId::parse(CONDITION).unwrap();
+        let order_id = FixedOrderId::parse(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        let foreign_user_frame =
+            parse_live_user_frame(user_frame_json(order_id, FOREIGN_API_KEY).as_bytes()).unwrap();
+        let directory = stage_four();
+        let roles = recovery_owner(directory.path()).spawn().unwrap();
+        let (cancel, mut http, mut user_ws, supervisor) = roles.into_roles();
+
+        let headers = PmHttpReadAuthorityProvider::authenticate_closed_only(
+            &mut http,
+            L2Timestamp::from_unix_seconds(AUTH_SECONDS).unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut header_capture = HeaderCapture::default();
+        headers.apply_to(&mut header_capture).unwrap();
+        let subscription =
+            PmUserWsReadAuthorityProvider::authenticate_user_subscription(&mut user_ws, condition)
+                .await
+                .unwrap();
+        let mut frame_capture = FrameCapture::default();
+        subscription.dispatch(&mut frame_capture).unwrap();
+        let foreign =
+            PmUserWsReadAuthorityProvider::bind_user_frame(&mut user_ws, foreign_user_frame).await;
+
+        assert_eq!(header_capture.address, SIGNER);
+        assert_eq!(header_capture.api_key, API_KEY);
+        assert!(
+            String::from_utf8(frame_capture.0)
+                .unwrap()
+                .contains(API_KEY)
+        );
+        assert!(matches!(foreign, Err(PmLiveAdapterError::Auth(_))));
+
+        drop((cancel, http, user_ws));
+        assert!(
+            supervisor
+                .shutdown_bounded(normal_bounds())
+                .await
+                .unwrap()
+                .credentials_dropped()
+        );
+        assert!(directory.path().join("private-key").exists());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

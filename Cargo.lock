@@ -1515,9 +1515,11 @@ dependencies = [
 name = "reap-pm-controlled-trial-runner"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "libc",
  "reap-pm-core",
  "reap-polymarket-auth",
+ "reap-polymarket-live-adapter",
  "reap-polymarket-wire",
  "tempfile",
  "thiserror",

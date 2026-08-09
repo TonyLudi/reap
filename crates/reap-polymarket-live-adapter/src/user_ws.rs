@@ -1,11 +1,16 @@
 use std::fmt;
-use std::sync::OnceLock;
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use reap_pm_core::{ConnectionEpoch, PmConditionId, ReceivedEventClock};
-use reap_polymarket_auth::{CredentialOwnedUserFrame, PmAuthError};
+use reap_polymarket_auth::{
+    AuthenticatedUserSubscriptionSink, CredentialOwnedUserFrame, PmAuthError,
+};
 use reap_polymarket_wire::{PmLiveUserEvent, parse_live_user_frame};
 use thiserror::Error;
 use tokio::net::TcpStream;
@@ -18,12 +23,36 @@ use tokio_tungstenite::{
 use zeroize::Zeroizing;
 
 use crate::{
-    PmLiveAdapterError, PmUserWsConfig, private_credentials::PmUserWsCredentialRole,
+    PmLiveAdapterError, PmUserWsConfig, read_authority::PmUserWsReadAuthorityProvider,
     task_guard::AbortOnDropTask,
 };
 
 const APPLICATION_PING: &str = "PING";
 const APPLICATION_PONG: &str = "PONG";
+
+struct PmRetainedUserSubscription(Zeroizing<Vec<u8>>);
+
+impl PmRetainedUserSubscription {
+    fn as_bytes(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+struct RetainSubscriptionSink;
+
+impl AuthenticatedUserSubscriptionSink for RetainSubscriptionSink {
+    type Output = PmRetainedUserSubscription;
+    type Error = PmLiveAdapterError;
+
+    fn send_user_subscription(&mut self, exact_frame: &[u8]) -> Result<Self::Output, Self::Error> {
+        if exact_frame.is_empty() || exact_frame.len() > 1_024 {
+            return Err(PmLiveAdapterError::InvalidUserSubscription);
+        }
+        Ok(PmRetainedUserSubscription(Zeroizing::new(
+            exact_frame.to_vec(),
+        )))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum PmUserWsClockError {
@@ -92,6 +121,53 @@ pub struct PmUserWsConnection {
     connection_epoch: ConnectionEpoch,
 }
 
+/// Cloneable read-only high-water view of authenticated user-stream activity.
+///
+/// Every socket or lifecycle edge reserves a checked generation before any
+/// parse, owner binding, or queue handoff. A caller holding an older value can
+/// therefore detect queued, in-flight, rejected, or retirement activity even
+/// when no corresponding event was successfully delivered yet.
+#[derive(Clone)]
+pub struct PmUserWsActivityView {
+    generation: Arc<AtomicU64>,
+}
+
+impl PmUserWsActivityView {
+    fn new() -> Self {
+        Self {
+            generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn advance(&self) -> Result<u64, PmUserWsTransportError> {
+        self.generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+            .map(|previous| previous + 1)
+            .map_err(|_| PmUserWsTransportError::ActivityGenerationOverflow)
+    }
+
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn high_water(&self) -> u64 {
+        self.generation()
+    }
+}
+
+impl fmt::Debug for PmUserWsActivityView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PmUserWsActivityView")
+            .field("generation", &self.generation())
+            .finish()
+    }
+}
+
 impl PmUserWsConnection {
     #[must_use]
     pub const fn condition(self) -> PmConditionId {
@@ -108,6 +184,7 @@ impl PmUserWsConnection {
 pub struct PmUserWsObservation {
     connection: PmUserWsConnection,
     clock: PmUserWsEdgeClock,
+    activity_generation: u64,
 }
 
 impl PmUserWsObservation {
@@ -119,6 +196,11 @@ impl PmUserWsObservation {
     #[must_use]
     pub const fn clock(self) -> PmUserWsEdgeClock {
         self.clock
+    }
+
+    #[must_use]
+    pub const fn activity_generation(self) -> u64 {
+        self.activity_generation
     }
 }
 
@@ -221,6 +303,7 @@ pub struct PmUserWsReconnect {
     reconnect_attempt: u8,
     backoff: Duration,
     scheduled_clock: PmUserWsEdgeClock,
+    activity_generation: u64,
 }
 
 impl PmUserWsReconnect {
@@ -248,6 +331,11 @@ impl PmUserWsReconnect {
     pub const fn scheduled_clock(self) -> PmUserWsEdgeClock {
         self.scheduled_clock
     }
+
+    #[must_use]
+    pub const fn activity_generation(self) -> u64 {
+        self.activity_generation
+    }
 }
 
 #[derive(Debug)]
@@ -261,6 +349,24 @@ pub enum PmUserWsEvent {
     ReconnectScheduled(PmUserWsReconnect),
     RetryExhausted(PmUserWsRetirement),
     Shutdown(PmUserWsObservation),
+}
+
+impl PmUserWsEvent {
+    #[must_use]
+    pub const fn activity_generation(&self) -> u64 {
+        match self {
+            Self::ConnectionOpened(observation)
+            | Self::SubscriptionSent(observation)
+            | Self::PingSent(observation)
+            | Self::Pong(observation)
+            | Self::Shutdown(observation) => observation.activity_generation(),
+            Self::BoundFrame(frame) => frame.observation().activity_generation(),
+            Self::ConnectionRetired(retirement) | Self::RetryExhausted(retirement) => {
+                retirement.observation().activity_generation()
+            }
+            Self::ReconnectScheduled(reconnect) => reconnect.activity_generation(),
+        }
+    }
 }
 
 #[async_trait]
@@ -281,6 +387,8 @@ pub enum PmUserWsTransportError {
     },
     #[error("user WebSocket connection epoch overflowed")]
     ConnectionEpochOverflow,
+    #[error("user WebSocket activity generation overflowed")]
+    ActivityGenerationOverflow,
     #[error("user WebSocket evidence channel closed")]
     EventChannelClosed,
     #[error("user WebSocket evidence channel saturated")]
@@ -328,19 +436,28 @@ pub fn pm_user_ws_shutdown_channel() -> (PmUserWsShutdownHandle, PmUserWsShutdow
 /// freshly minted by the sole credential authority on every connection.
 pub struct PmAuthenticatedUserWsRole {
     config: PmUserWsConfig,
-    credentials: PmUserWsCredentialRole,
+    credentials: Box<dyn PmUserWsReadAuthorityProvider>,
     clock: Box<dyn PmUserWsClockSource>,
+    activity: PmUserWsActivityView,
 }
 
 impl PmAuthenticatedUserWsRole {
     pub(crate) fn from_authority(
         config: PmUserWsConfig,
-        credentials: PmUserWsCredentialRole,
+        credentials: crate::private_credentials::PmUserWsCredentialRole,
+    ) -> Self {
+        Self::from_external_authority(config, Box::new(credentials))
+    }
+
+    pub(crate) fn from_external_authority(
+        config: PmUserWsConfig,
+        credentials: Box<dyn PmUserWsReadAuthorityProvider>,
     ) -> Self {
         Self {
             config,
             credentials,
             clock: Box::new(SystemUserWsClock),
+            activity: PmUserWsActivityView::new(),
         }
     }
 
@@ -360,6 +477,11 @@ impl PmAuthenticatedUserWsRole {
         self.config.condition()
     }
 
+    #[must_use]
+    pub fn activity_view(&self) -> PmUserWsActivityView {
+        self.activity.clone()
+    }
+
     pub async fn run<S>(
         self,
         shutdown: PmUserWsShutdownSignal,
@@ -373,6 +495,7 @@ impl PmAuthenticatedUserWsRole {
             self.config,
             self.credentials,
             self.clock,
+            self.activity,
             shutdown.receiver,
             sender,
         )));
@@ -402,8 +525,9 @@ impl fmt::Debug for PmAuthenticatedUserWsRole {
 
 async fn run_worker(
     config: PmUserWsConfig,
-    mut credentials: PmUserWsCredentialRole,
+    mut credentials: Box<dyn PmUserWsReadAuthorityProvider>,
     mut clock: Box<dyn PmUserWsClockSource>,
+    activity: PmUserWsActivityView,
     mut shutdown: watch::Receiver<bool>,
     events: mpsc::Sender<PmUserWsEvent>,
 ) -> Result<(), PmUserWsTransportError> {
@@ -416,9 +540,10 @@ async fn run_worker(
         };
         let outcome = run_attempt(
             &config,
-            &mut credentials,
+            credentials.as_mut(),
             connection,
             clock.as_mut(),
+            &activity,
             &mut shutdown,
             &events,
         )
@@ -432,7 +557,8 @@ async fn run_worker(
         };
         emit(&events, PmUserWsEvent::ConnectionRetired(retired)).await?;
         if reconnects >= config.max_reconnect_attempts() {
-            emit(&events, PmUserWsEvent::RetryExhausted(retired)).await?;
+            let exhausted = retirement(&activity, clock.as_mut(), connection, retired.reason)?;
+            emit(&events, PmUserWsEvent::RetryExhausted(exhausted)).await?;
             return Err(PmUserWsTransportError::RetryExhausted {
                 attempts: reconnects.saturating_add(1),
                 final_reason: retired.reason,
@@ -445,6 +571,7 @@ async fn run_worker(
                 .checked_add(1)
                 .ok_or(PmUserWsTransportError::ConnectionEpochOverflow)?,
         );
+        let reconnect_generation = activity.advance()?;
         emit(
             &events,
             PmUserWsEvent::ReconnectScheduled(PmUserWsReconnect {
@@ -453,16 +580,15 @@ async fn run_worker(
                 reconnect_attempt: reconnects,
                 backoff: config.reconnect_backoff(),
                 scheduled_clock: observe(clock.as_mut())?,
+                activity_generation: reconnect_generation,
             }),
         )
         .await?;
         let deadline = Instant::now() + config.reconnect_backoff();
         tokio::select! {
             () = wait_for_shutdown(&mut shutdown) => {
-                emit(&events, PmUserWsEvent::Shutdown(PmUserWsObservation {
-                    connection,
-                    clock: observe(clock.as_mut())?,
-                })).await?;
+                let observation = reserve_observation(&activity, connection, clock.as_mut())?;
+                emit(&events, PmUserWsEvent::Shutdown(observation)).await?;
                 return Ok(());
             }
             () = sleep_until(deadline) => {}
@@ -478,9 +604,10 @@ enum AttemptOutcome {
 
 async fn run_attempt(
     config: &PmUserWsConfig,
-    credentials: &mut PmUserWsCredentialRole,
+    credentials: &mut dyn PmUserWsReadAuthorityProvider,
     connection: PmUserWsConnection,
     clock: &mut dyn PmUserWsClockSource,
+    activity: &PmUserWsActivityView,
     shutdown: &mut watch::Receiver<bool>,
     events: &mpsc::Sender<PmUserWsEvent>,
 ) -> Result<AttemptOutcome, PmUserWsTransportError> {
@@ -494,44 +621,73 @@ async fn run_attempt(
         connect_async_with_config(config.endpoint().as_str(), Some(websocket_config), true);
     let socket = tokio::select! {
         () = wait_for_shutdown(shutdown) => {
-            return Ok(AttemptOutcome::Shutdown(observation(connection, observe(clock)?)));
+            return Ok(AttemptOutcome::Shutdown(reserve_observation(activity, connection, clock)?));
         }
         result = timeout(config.connect_timeout(), connect) => match result {
-            Err(_) => return retired(clock, connection, PmUserWsDisconnectReason::ConnectTimeout),
-            Ok(Err(_)) => return retired(clock, connection, PmUserWsDisconnectReason::ConnectFailed),
+            Err(_) => return retired(activity, clock, connection, PmUserWsDisconnectReason::ConnectTimeout),
+            Ok(Err(_)) => return retired(activity, clock, connection, PmUserWsDisconnectReason::ConnectFailed),
             Ok(Ok((socket, _))) => socket,
         },
     };
-    emit(
-        events,
-        PmUserWsEvent::ConnectionOpened(observation(connection, observe(clock)?)),
-    )
-    .await?;
+    let opened = reserve_observation(activity, connection, clock)?;
+    emit(events, PmUserWsEvent::ConnectionOpened(opened)).await?;
     run_connected(
-        config,
-        credentials,
-        connection,
-        clock,
+        ConnectedContext {
+            config,
+            credentials,
+            connection,
+            clock,
+            activity,
+            shutdown,
+            events,
+        },
         socket,
-        shutdown,
-        events,
     )
     .await
 }
 
-async fn run_connected(
-    config: &PmUserWsConfig,
-    credentials: &mut PmUserWsCredentialRole,
+struct ConnectedContext<'a> {
+    config: &'a PmUserWsConfig,
+    credentials: &'a mut dyn PmUserWsReadAuthorityProvider,
     connection: PmUserWsConnection,
-    clock: &mut dyn PmUserWsClockSource,
+    clock: &'a mut dyn PmUserWsClockSource,
+    activity: &'a PmUserWsActivityView,
+    shutdown: &'a mut watch::Receiver<bool>,
+    events: &'a mpsc::Sender<PmUserWsEvent>,
+}
+
+async fn run_connected(
+    context: ConnectedContext<'_>,
     mut socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
-    shutdown: &mut watch::Receiver<bool>,
-    events: &mpsc::Sender<PmUserWsEvent>,
 ) -> Result<AttemptOutcome, PmUserWsTransportError> {
-    let subscription = match credentials.fresh_subscription(config.condition()).await {
+    let ConnectedContext {
+        config,
+        credentials,
+        connection,
+        clock,
+        activity,
+        shutdown,
+        events,
+    } = context;
+    let subscription = match credentials
+        .authenticate_user_subscription(config.condition())
+        .await
+    {
         Ok(subscription) => subscription,
         Err(_) => {
             return retired(
+                activity,
+                clock,
+                connection,
+                PmUserWsDisconnectReason::SubscriptionAuthenticationFailed,
+            );
+        }
+    };
+    let subscription = match subscription.dispatch(&mut RetainSubscriptionSink) {
+        Ok(subscription) => subscription,
+        Err(_) => {
+            return retired(
+                activity,
                 clock,
                 connection,
                 PmUserWsDisconnectReason::SubscriptionAuthenticationFailed,
@@ -542,6 +698,7 @@ async fn run_connected(
         Ok(text) => Zeroizing::new(text.to_owned()),
         Err(_) => {
             return retired(
+                activity,
                 clock,
                 connection,
                 PmUserWsDisconnectReason::SubscriptionAuthenticationFailed,
@@ -556,6 +713,7 @@ async fn run_connected(
     {
         Err(_) => {
             return retired(
+                activity,
                 clock,
                 connection,
                 PmUserWsDisconnectReason::SubscriptionWriteTimeout,
@@ -563,6 +721,7 @@ async fn run_connected(
         }
         Ok(Err(_)) => {
             return retired(
+                activity,
                 clock,
                 connection,
                 PmUserWsDisconnectReason::SubscriptionWriteFailed,
@@ -570,11 +729,8 @@ async fn run_connected(
         }
         Ok(Ok(())) => {}
     }
-    emit(
-        events,
-        PmUserWsEvent::SubscriptionSent(observation(connection, observe(clock)?)),
-    )
-    .await?;
+    let subscribed = reserve_observation(activity, connection, clock)?;
+    emit(events, PmUserWsEvent::SubscriptionSent(subscribed)).await?;
 
     let now = Instant::now();
     let mut last_inbound = now;
@@ -586,90 +742,124 @@ async fn run_connected(
         tokio::select! {
             () = wait_for_shutdown(shutdown) => {
                 let _ = timeout(config.pong_timeout(), socket.close(None)).await;
-                return Ok(AttemptOutcome::Shutdown(observation(connection, observe(clock)?)));
+                return Ok(AttemptOutcome::Shutdown(reserve_observation(activity, connection, clock)?));
             }
             () = sleep_until(next_heartbeat), if outstanding_pong.is_none() => {
                 match timeout(config.pong_timeout(), socket.send(Message::text(APPLICATION_PING))).await {
-                    Err(_) => return retired(clock, connection, PmUserWsDisconnectReason::SocketWriteTimeout),
-                    Ok(Err(_)) => return retired(clock, connection, PmUserWsDisconnectReason::SocketWriteFailed),
+                    Err(_) => return retired(activity, clock, connection, PmUserWsDisconnectReason::SocketWriteTimeout),
+                    Ok(Err(_)) => return retired(activity, clock, connection, PmUserWsDisconnectReason::SocketWriteFailed),
                     Ok(Ok(())) => {}
                 }
                 let sent = Instant::now();
                 outstanding_pong = Some(sent + config.pong_timeout());
                 next_heartbeat = sent + config.heartbeat_interval();
-                emit(events, PmUserWsEvent::PingSent(observation(connection, observe(clock)?))).await?;
+                let ping = reserve_observation(activity, connection, clock)?;
+                emit(events, PmUserWsEvent::PingSent(ping)).await?;
             }
             () = sleep_until(pong_deadline), if outstanding_pong.is_some() => {
-                return retired(clock, connection, PmUserWsDisconnectReason::PongTimeout);
+                return retired(activity, clock, connection, PmUserWsDisconnectReason::PongTimeout);
             }
             () = sleep_until(idle_deadline) => {
-                return retired(clock, connection, PmUserWsDisconnectReason::IdleTimeout);
+                return retired(activity, clock, connection, PmUserWsDisconnectReason::IdleTimeout);
             }
             message = socket.next() => {
+                // The completed socket-read edge invalidates an older cut
+                // even when it reports EOF or a transport/capacity error.
+                let received_generation = activity.advance()?;
                 let Some(message) = message else {
-                    return retired(clock, connection, PmUserWsDisconnectReason::SocketClosed);
+                    return retired(activity, clock, connection, PmUserWsDisconnectReason::SocketClosed);
                 };
                 let message = match message {
                     Ok(message) => message,
-                    Err(error) => return retired(clock, connection, classify_read_error(&error)),
+                    Err(error) => return retired(activity, clock, connection, classify_read_error(&error)),
                 };
-                // Sample immediately after the socket read and before parsing,
-                // credential binding, or bounded-queue service.
+                // Reserve high-water and sample immediately after the socket
+                // read, before parsing, credential binding, or queue service.
+                // Failures never roll this generation back. Raw protocol
+                // Ping/Pong frames intentionally consume an un-emitted
+                // generation as a conservative invalidation interval.
                 let received_clock = observe(clock)?;
                 last_inbound = Instant::now();
                 match message {
                     Message::Text(text) if text.as_str() == APPLICATION_PONG => {
                         if outstanding_pong.take().is_none() {
                             return retired(
+                                activity,
                                 clock,
                                 connection,
                                 PmUserWsDisconnectReason::UnexpectedProtocolFrame,
                             );
                         }
-                        emit(events, PmUserWsEvent::Pong(observation(connection, received_clock))).await?;
+                        emit(events, PmUserWsEvent::Pong(observation_at(
+                            connection,
+                            received_clock,
+                            received_generation,
+                        ))).await?;
                     }
                     Message::Text(text) => {
                         if text.len() > config.max_frame_bytes() {
-                            return retired(clock, connection, PmUserWsDisconnectReason::FrameTooLarge);
+                            return retired(activity, clock, connection, PmUserWsDisconnectReason::FrameTooLarge);
                         }
                         let raw = Zeroizing::new(text.as_str().as_bytes().to_vec());
                         let frame = match parse_live_user_frame(raw.as_slice()) {
                             Ok(frame) => frame,
-                            Err(_) => return retired(clock, connection, PmUserWsDisconnectReason::MalformedFrame),
+                            Err(_) => return retired(activity, clock, connection, PmUserWsDisconnectReason::MalformedFrame),
                         };
-                        let frame = match credentials.bind_frame(frame).await {
+                        let frame = match credentials.bind_user_frame(frame).await {
                             Ok(frame) => frame,
                             Err(PmLiveAdapterError::Auth(
                                 PmAuthError::UserOrderOwnerMismatch
                                 | PmAuthError::UserOrderOrderOwnerMismatch
                                 | PmAuthError::UserTradeOwnerMismatch
                                 | PmAuthError::UserTradeTradeOwnerMismatch,
-                            )) => return retired(clock, connection, PmUserWsDisconnectReason::CredentialOwnerMismatch),
-                            Err(_) => return retired(clock, connection, PmUserWsDisconnectReason::CredentialAuthorityUnavailable),
+                            ) | PmLiveAdapterError::CredentialOwnerMismatch) => return retired(activity, clock, connection, PmUserWsDisconnectReason::CredentialOwnerMismatch),
+                            Err(_) => return retired(activity, clock, connection, PmUserWsDisconnectReason::CredentialAuthorityUnavailable),
                         };
                         emit(events, PmUserWsEvent::BoundFrame(PmUserWsBoundFrame {
-                            observation: observation(connection, received_clock),
+                            observation: observation_at(
+                                connection,
+                                received_clock,
+                                received_generation,
+                            ),
                             frame,
                         })).await?;
                     }
-                    Message::Binary(_) => return retired(clock, connection, PmUserWsDisconnectReason::BinaryFrame),
+                    Message::Binary(_) => return retired(activity, clock, connection, PmUserWsDisconnectReason::BinaryFrame),
                     Message::Ping(_) | Message::Pong(_) => {
                         match timeout(config.pong_timeout(), socket.flush()).await {
-                            Err(_) => return retired(clock, connection, PmUserWsDisconnectReason::SocketWriteTimeout),
-                            Ok(Err(_)) => return retired(clock, connection, PmUserWsDisconnectReason::SocketWriteFailed),
+                            Err(_) => return retired(activity, clock, connection, PmUserWsDisconnectReason::SocketWriteTimeout),
+                            Ok(Err(_)) => return retired(activity, clock, connection, PmUserWsDisconnectReason::SocketWriteFailed),
                             Ok(Ok(())) => {}
                         }
                     }
-                    Message::Close(_) => return retired(clock, connection, PmUserWsDisconnectReason::SocketClosed),
-                    Message::Frame(_) => return retired(clock, connection, PmUserWsDisconnectReason::UnexpectedProtocolFrame),
+                    Message::Close(_) => return retired(activity, clock, connection, PmUserWsDisconnectReason::SocketClosed),
+                    Message::Frame(_) => return retired(activity, clock, connection, PmUserWsDisconnectReason::UnexpectedProtocolFrame),
                 }
             }
         }
     }
 }
 
-fn observation(connection: PmUserWsConnection, clock: PmUserWsEdgeClock) -> PmUserWsObservation {
-    PmUserWsObservation { connection, clock }
+fn reserve_observation(
+    activity: &PmUserWsActivityView,
+    connection: PmUserWsConnection,
+    clock: &mut dyn PmUserWsClockSource,
+) -> Result<PmUserWsObservation, PmUserWsTransportError> {
+    let activity_generation = activity.advance()?;
+    let clock = observe(clock)?;
+    Ok(observation_at(connection, clock, activity_generation))
+}
+
+const fn observation_at(
+    connection: PmUserWsConnection,
+    clock: PmUserWsEdgeClock,
+    activity_generation: u64,
+) -> PmUserWsObservation {
+    PmUserWsObservation {
+        connection,
+        clock,
+        activity_generation,
+    }
 }
 
 fn observe(
@@ -681,14 +871,26 @@ fn observe(
 }
 
 fn retired(
+    activity: &PmUserWsActivityView,
     clock: &mut dyn PmUserWsClockSource,
     connection: PmUserWsConnection,
     reason: PmUserWsDisconnectReason,
 ) -> Result<AttemptOutcome, PmUserWsTransportError> {
-    Ok(AttemptOutcome::Retired(PmUserWsRetirement {
-        observation: observation(connection, observe(clock)?),
+    Ok(AttemptOutcome::Retired(retirement(
+        activity, clock, connection, reason,
+    )?))
+}
+
+fn retirement(
+    activity: &PmUserWsActivityView,
+    clock: &mut dyn PmUserWsClockSource,
+    connection: PmUserWsConnection,
+    reason: PmUserWsDisconnectReason,
+) -> Result<PmUserWsRetirement, PmUserWsTransportError> {
+    Ok(PmUserWsRetirement {
+        observation: reserve_observation(activity, connection, clock)?,
         reason,
-    }))
+    })
 }
 
 fn classify_read_error(error: &WebSocketError) -> PmUserWsDisconnectReason {
@@ -827,6 +1029,7 @@ mod tests {
     struct TestSink {
         sender: mpsc::UnboundedSender<Seen>,
         rendered: Arc<Mutex<Vec<String>>>,
+        generations: Arc<Mutex<Vec<u64>>>,
     }
 
     #[async_trait]
@@ -835,6 +1038,10 @@ mod tests {
 
         async fn deliver_user_ws_event(&mut self, event: PmUserWsEvent) -> Result<(), Self::Error> {
             self.rendered.lock().unwrap().push(format!("{event:?}"));
+            self.generations
+                .lock()
+                .unwrap()
+                .push(event.activity_generation());
             let seen = match event {
                 PmUserWsEvent::ConnectionOpened(value) => {
                     Seen::Open(value.connection().connection_epoch().value())
@@ -955,30 +1162,35 @@ mod tests {
     }
 
     type RoleTask = JoinHandle<Result<(), PmUserWsRunError<&'static str>>>;
-
-    fn spawn_role(
-        config: PmUserWsConfig,
-    ) -> (
+    type SpawnedRole = (
         PmUserWsShutdownHandle,
         mpsc::UnboundedReceiver<Seen>,
         Arc<Mutex<Vec<String>>>,
+        Arc<Mutex<Vec<u64>>>,
+        PmUserWsActivityView,
         RoleTask,
-    ) {
+    );
+
+    fn spawn_role(config: PmUserWsConfig) -> SpawnedRole {
         let (role, supervisor) = role(config);
+        let activity = role.activity_view();
         let (shutdown, signal) = pm_user_ws_shutdown_channel();
         let (sender, receiver) = mpsc::unbounded_channel();
         let rendered = Arc::new(Mutex::new(Vec::new()));
         let sink_rendered = Arc::clone(&rendered);
+        let generations = Arc::new(Mutex::new(Vec::new()));
+        let sink_generations = Arc::clone(&generations);
         let task = tokio::spawn(async move {
             let mut sink = TestSink {
                 sender,
                 rendered: sink_rendered,
+                generations: sink_generations,
             };
             let result = role.run(signal, &mut sink).await;
             supervisor.shutdown().await.unwrap();
             result
         });
-        (shutdown, receiver, rendered, task)
+        (shutdown, receiver, rendered, generations, activity, task)
     }
 
     async fn next(receiver: &mut mpsc::UnboundedReceiver<Seen>) -> Seen {
@@ -1028,7 +1240,8 @@ mod tests {
             socket.send(Message::text(APPLICATION_PONG)).await.unwrap();
             let _ = socket.next().await;
         });
-        let (shutdown, mut events, rendered, task) = spawn_role(local_user_config(address, 0));
+        let (shutdown, mut events, rendered, generations, activity, task) =
+            spawn_role(local_user_config(address, 0));
         assert_eq!(next(&mut events).await, Seen::Open(5));
         assert_eq!(next(&mut events).await, Seen::Subscription(5));
         assert_eq!(next(&mut events).await, Seen::Bound(5, 1, 3));
@@ -1038,6 +1251,14 @@ mod tests {
         assert_eq!(next(&mut events).await, Seen::Shutdown(5));
         task.await.unwrap().unwrap();
         server.await.unwrap();
+        {
+            let generations = generations.lock().unwrap();
+            assert!(
+                generations.windows(2).all(|pair| pair[0] < pair[1]),
+                "every emitted user event must carry a strictly newer generation",
+            );
+            assert_eq!(activity.high_water(), *generations.last().unwrap());
+        }
         for debug in rendered.lock().unwrap().iter() {
             assert!(!debug.contains(API_KEY));
             assert!(!debug.contains(API_SECRET));
@@ -1058,7 +1279,8 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let (_shutdown, mut events, rendered, task) = spawn_role(local_user_config(address, 0));
+        let (_shutdown, mut events, rendered, generations, activity, task) =
+            spawn_role(local_user_config(address, 0));
         let error = task.await.unwrap().unwrap_err();
         assert!(matches!(
             error,
@@ -1076,6 +1298,14 @@ mod tests {
             PmUserWsDisconnectReason::CredentialOwnerMismatch
         )));
         assert!(!seen.iter().any(|event| matches!(event, Seen::Bound(..))));
+        {
+            let generations = generations.lock().unwrap();
+            assert!(
+                generations.windows(2).any(|pair| pair[1] > pair[0] + 1),
+                "the rejected frame edge must invalidate the prior delivered cut",
+            );
+            assert_eq!(activity.high_water(), *generations.last().unwrap());
+        }
         for debug in rendered.lock().unwrap().iter() {
             assert!(!debug.contains(FOREIGN_API_KEY));
         }
@@ -1100,7 +1330,8 @@ mod tests {
                 .unwrap();
             let _ = second.next().await;
         });
-        let (shutdown, mut events, _rendered, task) = spawn_role(local_user_config(address, 1));
+        let (shutdown, mut events, _rendered, _generations, _activity, task) =
+            spawn_role(local_user_config(address, 1));
         let mut seen = Vec::new();
         loop {
             let event = next(&mut events).await;
@@ -1130,7 +1361,7 @@ mod tests {
             read_exact_subscription(&mut socket).await;
             socket.send(message).await.unwrap();
         });
-        let (_shutdown, mut events, _rendered, task) = spawn_role(
+        let (_shutdown, mut events, _rendered, generations, activity, task) = spawn_role(
             local_user_config_with_frame_bound(address, 0, max_frame_bytes),
         );
         let error = task.await.unwrap().unwrap_err();
@@ -1146,6 +1377,14 @@ mod tests {
             saw_bound |= matches!(event, Seen::Bound(..));
         }
         assert!(!saw_bound);
+        {
+            let generations = generations.lock().unwrap();
+            assert!(
+                generations.windows(2).any(|pair| pair[1] > pair[0] + 1),
+                "a rejected socket frame must reserve an un-emitted generation",
+            );
+            assert_eq!(activity.high_water(), *generations.last().unwrap());
+        }
         server.await.unwrap();
     }
 
@@ -1177,6 +1416,42 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn raw_protocol_ping_creates_an_intentional_unemitted_invalidation_interval() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            read_exact_subscription(&mut socket).await;
+            socket
+                .send(Message::Ping(b"edge".to_vec().into()))
+                .await
+                .unwrap();
+            socket.close(None).await.unwrap();
+        });
+        let (_shutdown, mut events, _rendered, generations, activity, task) =
+            spawn_role(local_user_config(address, 0));
+        let error = task.await.unwrap().unwrap_err();
+        assert!(matches!(
+            error,
+            PmUserWsRunError::Transport(PmUserWsTransportError::RetryExhausted {
+                final_reason: PmUserWsDisconnectReason::SocketClosed,
+                ..
+            })
+        ));
+        while events.recv().await.is_some() {}
+        {
+            let generations = generations.lock().unwrap();
+            assert!(
+                generations.windows(2).any(|pair| pair[1] > pair[0] + 1),
+                "the raw control-frame edge must invalidate an older admitted cut",
+            );
+            assert_eq!(activity.generation(), *generations.last().unwrap());
+        }
+        server.await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn second_private_receive_is_stamped_before_first_sink_service_releases() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1202,6 +1477,7 @@ mod tests {
         let second_raw_sampled = Arc::new(Notify::new());
         let next_clock = Arc::new(AtomicU64::new(1));
         let (role, supervisor) = role(local_user_config(address, 0));
+        let activity = role.activity_view();
         let role = role.with_clock_source(QueueClock {
             next: Arc::clone(&next_clock),
             second_raw_sampled: Arc::clone(&second_raw_sampled),
@@ -1227,6 +1503,10 @@ mod tests {
             .await
             .expect("second frame was not stamped while sink was blocked");
         assert!(next_clock.load(Ordering::SeqCst) >= 5);
+        assert!(
+            activity.high_water() >= 4,
+            "queued second frame must invalidate a cut held at the first sink barrier",
+        );
         release.notify_one();
         shutdown.request_shutdown();
         timeout(Duration::from_secs(5), task)
@@ -1258,6 +1538,7 @@ mod tests {
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let (role, supervisor) = role(local_user_config_with_capacity(address, 0, 1_024, 1));
+        let activity = role.activity_view();
         let (_shutdown, signal) = pm_user_ws_shutdown_channel();
         let sink_entered = Arc::clone(&entered);
         let sink_release = Arc::clone(&release);
@@ -1277,6 +1558,10 @@ mod tests {
         timeout(Duration::from_secs(5), socket_closed.notified())
             .await
             .expect("saturated worker did not close its socket");
+        assert!(
+            activity.high_water() >= 2,
+            "failed queue handoff must leave the activity high-water advanced",
+        );
         release.notify_one();
         assert!(matches!(
             timeout(Duration::from_secs(5), task)
@@ -1288,6 +1573,18 @@ mod tests {
             ))
         ));
         server.await.unwrap();
+    }
+
+    #[test]
+    fn activity_generation_fails_closed_at_u64_max_without_wrapping() {
+        let activity = PmUserWsActivityView {
+            generation: Arc::new(AtomicU64::new(u64::MAX)),
+        };
+        assert_eq!(
+            activity.advance(),
+            Err(PmUserWsTransportError::ActivityGenerationOverflow),
+        );
+        assert_eq!(activity.high_water(), u64::MAX);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

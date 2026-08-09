@@ -1,20 +1,23 @@
 use std::{fmt, time::Duration};
 
+use async_trait::async_trait;
 use reap_pm_core::EvmAddress;
 use reap_polymarket_auth::{
-    AuthenticatedL2Headers, AuthenticatedUserSubscription, AuthenticatedUserSubscriptionSink,
-    CredentialOwnedUserFrame, FixedOrderId, L2Credentials, L2Timestamp,
+    AuthenticatedL2Headers, AuthenticatedUserSubscription, CredentialOwnedUserFrame, FixedOrderId,
+    L2Credentials, L2Timestamp,
 };
 use reap_polymarket_wire::{PmLiveOpenOrderPage, PmLiveOrder, PmLiveTradePage, PmLiveUserFrame};
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
 };
-use zeroize::Zeroizing;
 
 use crate::{
     PmAuthenticatedHttpOwner, PmLiveAdapterError, PmPrivateHttpConfig, PmReadOnlySignatureType,
-    PmUserWsConfig, private_http::PmPrivateHttpTransport, user_ws::PmAuthenticatedUserWsRole,
+    PmUserWsConfig,
+    private_http::PmPrivateHttpTransport,
+    read_authority::{PmHttpReadAuthorityProvider, PmUserWsReadAuthorityProvider},
+    user_ws::PmAuthenticatedUserWsRole,
 };
 
 const CREDENTIAL_AUTHORITY_CAPACITY: usize = 32;
@@ -210,6 +213,27 @@ pub(crate) fn test_http_credential_role(
 ) -> Result<(PmHttpCredentialRole, PmCredentialAuthoritySupervisor), PmLiveAdapterError> {
     let (sender, supervisor) = spawn_credential_authority(credentials)?;
     Ok((PmHttpCredentialRole { sender }, supervisor))
+}
+
+#[cfg(test)]
+pub(crate) fn test_read_credential_roles(
+    credentials: L2Credentials,
+) -> Result<
+    (
+        PmHttpCredentialRole,
+        PmUserWsCredentialRole,
+        PmCredentialAuthoritySupervisor,
+    ),
+    PmLiveAdapterError,
+> {
+    let (sender, supervisor) = spawn_credential_authority(credentials)?;
+    Ok((
+        PmHttpCredentialRole {
+            sender: sender.clone(),
+        },
+        PmUserWsCredentialRole { sender },
+        supervisor,
+    ))
 }
 
 pub(crate) fn account_http_credential_role(
@@ -482,6 +506,66 @@ impl PmHttpCredentialRole {
     }
 }
 
+#[async_trait]
+impl PmHttpReadAuthorityProvider for PmHttpCredentialRole {
+    async fn authenticate_open_orders(
+        &mut self,
+        timestamp: L2Timestamp,
+    ) -> Result<AuthenticatedL2Headers, PmLiveAdapterError> {
+        Self::authenticate_open_orders(self, timestamp).await
+    }
+
+    async fn authenticate_trades(
+        &mut self,
+        timestamp: L2Timestamp,
+    ) -> Result<AuthenticatedL2Headers, PmLiveAdapterError> {
+        Self::authenticate_trades(self, timestamp).await
+    }
+
+    async fn authenticate_balance_allowance(
+        &mut self,
+        timestamp: L2Timestamp,
+    ) -> Result<AuthenticatedL2Headers, PmLiveAdapterError> {
+        self.authenticate_balance(timestamp).await
+    }
+
+    async fn authenticate_closed_only(
+        &mut self,
+        timestamp: L2Timestamp,
+    ) -> Result<AuthenticatedL2Headers, PmLiveAdapterError> {
+        Self::authenticate_closed_only(self, timestamp).await
+    }
+
+    async fn authenticate_exact_order(
+        &mut self,
+        timestamp: L2Timestamp,
+        order_id: FixedOrderId,
+    ) -> Result<AuthenticatedL2Headers, PmLiveAdapterError> {
+        Self::authenticate_exact_order(self, timestamp, order_id).await
+    }
+
+    async fn bind_open_orders(
+        &mut self,
+        page: PmLiveOpenOrderPage,
+    ) -> Result<PmLiveOpenOrderPage, PmLiveAdapterError> {
+        Self::bind_open_orders(self, page).await
+    }
+
+    async fn bind_trades(
+        &mut self,
+        page: PmLiveTradePage,
+    ) -> Result<PmLiveTradePage, PmLiveAdapterError> {
+        Self::bind_trades(self, page).await
+    }
+
+    async fn bind_exact_order(
+        &mut self,
+        order: PmLiveOrder,
+    ) -> Result<PmLiveOrder, PmLiveAdapterError> {
+        Self::bind_exact_order(self, order).await
+    }
+}
+
 pub(crate) struct PmUserWsCredentialRole {
     sender: mpsc::Sender<CredentialRequest>,
 }
@@ -495,7 +579,7 @@ impl PmUserWsCredentialRole {
     pub(crate) async fn fresh_subscription(
         &mut self,
         condition: reap_pm_core::PmConditionId,
-    ) -> Result<PmRetainedUserSubscription, PmLiveAdapterError> {
+    ) -> Result<AuthenticatedUserSubscription, PmLiveAdapterError> {
         request(&self.sender, |response| {
             CredentialRequest::UserSubscription {
                 condition,
@@ -517,27 +601,20 @@ impl PmUserWsCredentialRole {
     }
 }
 
-pub(crate) struct PmRetainedUserSubscription(Zeroizing<Vec<u8>>);
-
-impl PmRetainedUserSubscription {
-    pub(crate) fn as_bytes(&self) -> &[u8] {
-        self.0.as_slice()
+#[async_trait]
+impl PmUserWsReadAuthorityProvider for PmUserWsCredentialRole {
+    async fn authenticate_user_subscription(
+        &mut self,
+        condition: reap_pm_core::PmConditionId,
+    ) -> Result<AuthenticatedUserSubscription, PmLiveAdapterError> {
+        self.fresh_subscription(condition).await
     }
-}
 
-struct RetainSubscriptionSink;
-
-impl AuthenticatedUserSubscriptionSink for RetainSubscriptionSink {
-    type Output = PmRetainedUserSubscription;
-    type Error = PmLiveAdapterError;
-
-    fn send_user_subscription(&mut self, exact_frame: &[u8]) -> Result<Self::Output, Self::Error> {
-        if exact_frame.is_empty() || exact_frame.len() > 1_024 {
-            return Err(PmLiveAdapterError::InvalidUserSubscription);
-        }
-        Ok(PmRetainedUserSubscription(Zeroizing::new(
-            exact_frame.to_vec(),
-        )))
+    async fn bind_user_frame(
+        &mut self,
+        frame: PmLiveUserFrame,
+    ) -> Result<CredentialOwnedUserFrame, PmLiveAdapterError> {
+        self.bind_frame(frame).await
     }
 }
 
@@ -577,7 +654,7 @@ pub(crate) enum CredentialRequest {
     },
     UserSubscription {
         condition: reap_pm_core::PmConditionId,
-        response: oneshot::Sender<Result<PmRetainedUserSubscription, PmLiveAdapterError>>,
+        response: oneshot::Sender<Result<AuthenticatedUserSubscription, PmLiveAdapterError>>,
     },
     BindUserFrame {
         frame: PmLiveUserFrame,
@@ -677,13 +754,12 @@ pub(crate) fn handle_credential_request(credentials: &L2Credentials, request: Cr
         CredentialRequest::UserSubscription {
             condition,
             response,
-        } => {
-            let value = credentials
+        } => respond(
+            response,
+            credentials
                 .user_subscription(condition)
-                .map_err(PmLiveAdapterError::from)
-                .and_then(retain_subscription);
-            respond(response, value);
-        }
+                .map_err(PmLiveAdapterError::from),
+        ),
         CredentialRequest::BindUserFrame { frame, response } => respond(
             response,
             credentials
@@ -719,12 +795,6 @@ fn spawn_credential_authority(
         sender,
         PmCredentialAuthoritySupervisor::from_task(shutdown, task),
     ))
-}
-
-fn retain_subscription(
-    subscription: AuthenticatedUserSubscription,
-) -> Result<PmRetainedUserSubscription, PmLiveAdapterError> {
-    subscription.dispatch(&mut RetainSubscriptionSink)
 }
 
 fn owner_match(matches: bool) -> Result<(), PmLiveAdapterError> {

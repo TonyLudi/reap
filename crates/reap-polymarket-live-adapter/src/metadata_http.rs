@@ -1,5 +1,9 @@
 use std::fmt;
 
+use reap_pm_core::{PmInstrumentHandle, PmMarketMetadata, PmProductSource, SnapshotRevision};
+use reap_polymarket_adapter::{
+    PmAuthoritativeMetadata, PmMetadataJoinError, PmMetadataRevisionInput,
+};
 use reap_polymarket_wire::{
     MAX_PUBLIC_REST_BODY_BYTES, PmClobV2Metadata, PmClobV2RequestScope, PmLifecycleMetadata,
     PmLiveClobMarketLifecycle, PmLongMarketLifecycleDetails, PmWireScope,
@@ -7,6 +11,8 @@ use reap_polymarket_wire::{
     validate_live_clob_lifecycle_agreement,
 };
 use sha2::{Digest as _, Sha256};
+use thiserror::Error;
+use zeroize::Zeroizing;
 
 use crate::{
     PM_CLOB_PRODUCTION_ORIGIN, PmHttpReceiveClock, PmLiveAdapterError, PmPublicHttpConfig,
@@ -167,6 +173,54 @@ impl PmLiveMetadataObservation {
     }
 }
 
+/// One source-owned live observation paired with the authoritative metadata
+/// joined from the exact same two response bodies and receive edge.
+///
+/// The carrier is deliberately move-only. Neither native response body is
+/// retained or exposed after both validations complete.
+#[derive(Debug)]
+pub struct PmLiveAuthoritativeMetadataObservation {
+    live_observation: PmLiveMetadataObservation,
+    authoritative_metadata: PmAuthoritativeMetadata,
+}
+
+impl PmLiveAuthoritativeMetadataObservation {
+    fn from_source(
+        live_observation: PmLiveMetadataObservation,
+        authoritative_metadata: PmAuthoritativeMetadata,
+    ) -> Self {
+        Self {
+            live_observation,
+            authoritative_metadata,
+        }
+    }
+
+    #[must_use]
+    pub const fn live_observation(&self) -> &PmLiveMetadataObservation {
+        &self.live_observation
+    }
+
+    #[must_use]
+    pub const fn authoritative_metadata(&self) -> &PmAuthoritativeMetadata {
+        &self.authoritative_metadata
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (PmLiveMetadataObservation, PmAuthoritativeMetadata) {
+        (self.live_observation, self.authoritative_metadata)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum PmLiveAuthoritativeMetadataError {
+    #[error("authoritative metadata differs from the fixed live metadata source scope")]
+    ScopeMismatch,
+    #[error(transparent)]
+    Live(#[from] PmLiveAdapterError),
+    #[error(transparent)]
+    Authoritative(#[from] PmMetadataJoinError),
+}
+
 /// Exact two-route public metadata capability for one configured PM outcome.
 #[derive(Clone)]
 pub struct PmPublicMetadataHttpRole {
@@ -228,9 +282,54 @@ impl PmPublicMetadataHttpRole {
     ) -> Result<PmLiveMetadataObservation, PmLiveAdapterError> {
         let (market_bytes, clob_v2_bytes) = self.fetch_pair().await?;
         let receive_clock = self.clock.observe()?;
-        let long_market = parse_live_clob_market_lifecycle_details(&market_bytes, self.scope)?;
-        let clob = parse_live_clob_v2_metadata(
+        self.seal_pair(&market_bytes, &clob_v2_bytes, receive_clock)
+    }
+
+    /// Fetch the two fixed public routes exactly once, validate and seal their
+    /// live observation, and join authoritative metadata from those same
+    /// source-owned bytes. The authoritative revision uses the observation's
+    /// source-captured monotonic receive edge.
+    pub async fn refresh_authoritative_observation(
+        &self,
+        instrument: PmInstrumentHandle,
+        source: PmProductSource,
+        expected: PmMarketMetadata,
+        revision: SnapshotRevision,
+    ) -> Result<PmLiveAuthoritativeMetadataObservation, PmLiveAuthoritativeMetadataError> {
+        if metadata_scope(expected) != self.scope {
+            return Err(PmLiveAuthoritativeMetadataError::ScopeMismatch);
+        }
+
+        let (market_bytes, clob_v2_bytes) = self.fetch_pair().await?;
+        let receive_clock = self.clock.observe()?;
+        let live_observation = self.seal_pair(&market_bytes, &clob_v2_bytes, receive_clock)?;
+        let revision = PmMetadataRevisionInput::new(
+            revision,
+            live_observation.receive_clock().monotonic_receive_ns(),
+        )?;
+        let authoritative_metadata = PmAuthoritativeMetadata::join_live_clob_v2_raw(
+            instrument,
+            source,
+            expected,
+            &market_bytes,
             &clob_v2_bytes,
+            revision,
+        )?;
+        Ok(PmLiveAuthoritativeMetadataObservation::from_source(
+            live_observation,
+            authoritative_metadata,
+        ))
+    }
+
+    fn seal_pair(
+        &self,
+        market_bytes: &[u8],
+        clob_v2_bytes: &[u8],
+        receive_clock: PmHttpReceiveClock,
+    ) -> Result<PmLiveMetadataObservation, PmLiveAdapterError> {
+        let long_market = parse_live_clob_market_lifecycle_details(market_bytes, self.scope)?;
+        let clob = parse_live_clob_v2_metadata(
+            clob_v2_bytes,
             PmClobV2RequestScope::new(self.scope.condition(), self.scope.token()),
         )?;
         validate_live_clob_lifecycle_agreement(&long_market, &clob)?;
@@ -238,8 +337,8 @@ impl PmPublicMetadataHttpRole {
         let commitment = live_metadata_observation_commitment(
             self.mode,
             self.scope,
-            &market_bytes,
-            &clob_v2_bytes,
+            market_bytes,
+            clob_v2_bytes,
             &details,
             receive_clock,
         );
@@ -250,23 +349,35 @@ impl PmPublicMetadataHttpRole {
         ))
     }
 
-    async fn fetch_pair(&self) -> Result<(Vec<u8>, Vec<u8>), PmLiveAdapterError> {
-        let market_bytes = self
-            .transport
-            .get(
-                PmPublicRoute::MarketMetadata(self.scope.condition()),
-                MAX_PUBLIC_REST_BODY_BYTES,
-            )
-            .await?;
-        let clob_v2_bytes = self
-            .transport
-            .get(
-                PmPublicRoute::ClobV2Metadata(self.scope.condition()),
-                MAX_PUBLIC_REST_BODY_BYTES,
-            )
-            .await?;
+    async fn fetch_pair(
+        &self,
+    ) -> Result<(Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>), PmLiveAdapterError> {
+        let market_bytes = Zeroizing::new(
+            self.transport
+                .get(
+                    PmPublicRoute::MarketMetadata(self.scope.condition()),
+                    MAX_PUBLIC_REST_BODY_BYTES,
+                )
+                .await?,
+        );
+        let clob_v2_bytes = Zeroizing::new(
+            self.transport
+                .get(
+                    PmPublicRoute::ClobV2Metadata(self.scope.condition()),
+                    MAX_PUBLIC_REST_BODY_BYTES,
+                )
+                .await?,
+        );
         Ok((market_bytes, clob_v2_bytes))
     }
+}
+
+fn metadata_scope(expected: PmMarketMetadata) -> PmWireScope {
+    PmWireScope::new(
+        expected.condition(),
+        expected.market(),
+        expected.outcome().token(),
+    )
 }
 
 fn live_metadata_observation_commitment(
@@ -432,7 +543,12 @@ const fn origin_mode_name(mode: OriginMode) -> &'static [u8] {
 mod tests {
     use std::time::Duration;
 
-    use reap_pm_core::{PmConditionId, PmMarketId, PmQuantity, PmTokenId, U256};
+    use reap_pm_core::{
+        EvmAddress, MAX_REQUIRED_SPENDERS, PmAssetId, PmChainId, PmConditionId, PmInstrumentHandle,
+        PmMarketHandle, PmMarketId, PmMarketLifecycle, PmMarketMetadata, PmOutcomeLabel,
+        PmOutcomeMetadata, PmProductSource, PmQuantity, PmSourceHandle, PmSpenderDomain,
+        PmSpenderRequirement, PmTick, PmTokenHandle, PmTokenId, SnapshotRevision, U256,
+    };
     use reap_polymarket_wire::{
         PmBookMarketBinding, PmBookParserConfig, PmClobV2RequestScope, PmWireError,
         parse_live_clob_market_lifecycle, parse_live_clob_market_lifecycle_details,
@@ -449,6 +565,9 @@ mod tests {
 
     const CONDITION: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
     const MARKET: &str = "0x2222222222222222222222222222222222222222222222222222222222222222";
+    const PUSD: &str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
+    const CONDITIONAL_TOKENS: &str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
+    const STANDARD_EXCHANGE: &str = "0xE111180000d2663C0091e4f400237545B87B996B";
 
     struct MockResponse {
         status: u16,
@@ -534,6 +653,52 @@ mod tests {
         )
     }
 
+    fn instrument() -> PmInstrumentHandle {
+        PmInstrumentHandle::new(
+            PmMarketHandle::from_ordinal(1),
+            PmTokenHandle::from_ordinal(2),
+        )
+    }
+
+    fn source() -> PmProductSource {
+        PmProductSource::polymarket_market(PmSourceHandle::from_ordinal(11), instrument().token())
+    }
+
+    fn expected_metadata(tick: &str) -> PmMarketMetadata {
+        let chain = PmChainId::new(137).unwrap();
+        let exchange = EvmAddress::parse(STANDARD_EXCHANGE).unwrap();
+        let mut spenders = [None; MAX_REQUIRED_SPENDERS];
+        spenders[0] = Some(PmSpenderRequirement::new(
+            chain,
+            exchange,
+            PmSpenderDomain::Standard,
+            PmAssetId::collateral(EvmAddress::parse(PUSD).unwrap()),
+        ));
+        spenders[1] = Some(PmSpenderRequirement::new(
+            chain,
+            exchange,
+            PmSpenderDomain::Standard,
+            PmAssetId::outcome(
+                EvmAddress::parse(CONDITIONAL_TOKENS).unwrap(),
+                scope().token(),
+            ),
+        ));
+        PmMarketMetadata::new(
+            scope().condition(),
+            scope().market(),
+            PmOutcomeMetadata::new(scope().token(), PmOutcomeLabel::new("Yes").unwrap()),
+            PmMarketLifecycle::new(true, false, false, true, true),
+            PmTick::parse_decimal(tick).unwrap(),
+            PmQuantity::parse_decimal("5").unwrap(),
+            false,
+            chain,
+            exchange,
+            spenders,
+            2,
+        )
+        .unwrap()
+    }
+
     fn long_market() -> String {
         format!(
             r#"{{"condition_id":"{CONDITION}","question_id":"{MARKET}","active":true,"closed":false,"archived":false,"accepting_orders":true,"enable_order_book":true,"accepting_order_timestamp":"2026-08-08T00:00:00Z","end_date_iso":"2027-01-01T00:00:00Z","game_start_time":null,"seconds_delay":0}}"#
@@ -546,14 +711,21 @@ mod tests {
         )
     }
 
-    fn local_role(origin: &str) -> PmPublicMetadataHttpRole {
+    fn local_role_for_scope(
+        origin: &str,
+        configured_scope: PmWireScope,
+    ) -> PmPublicMetadataHttpRole {
         let config = PmPublicHttpConfig::local_evidence(
             origin,
             Duration::from_millis(100),
             Duration::from_secs(1),
         )
         .unwrap();
-        PmPublicMetadataHttpRole::new(config, scope()).unwrap()
+        PmPublicMetadataHttpRole::new(config, configured_scope).unwrap()
+    }
+
+    fn local_role(origin: &str) -> PmPublicMetadataHttpRole {
+        local_role_for_scope(origin, scope())
     }
 
     #[derive(Default)]
@@ -669,6 +841,126 @@ mod tests {
             format!("GET /clob-markets/{CONDITION} HTTP/1.1")
         );
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authoritative_bridge_fetches_one_pair_and_shares_its_receive_provenance() {
+        let (origin, mut requests, task) = mock_server(vec![
+            MockResponse::ok(long_market()),
+            MockResponse::ok(short_market()),
+        ])
+        .await;
+        let role = local_role(&origin);
+        let expected = expected_metadata("0.01");
+        let revision = SnapshotRevision::new(9);
+        let observation = role
+            .refresh_authoritative_observation(instrument(), source(), expected, revision)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            observation.live_observation().lifecycle().condition(),
+            expected.condition()
+        );
+        assert_eq!(
+            observation.live_observation().lifecycle().market(),
+            expected.market()
+        );
+        assert_eq!(
+            observation.live_observation().clob().configured_outcome(),
+            expected.outcome()
+        );
+        assert_ne!(observation.live_observation().commitment().bytes(), [0; 32]);
+
+        let authoritative = observation.authoritative_metadata();
+        assert_eq!(authoritative.event().instrument(), instrument());
+        assert_eq!(authoritative.event().source(), source());
+        assert_eq!(authoritative.event().metadata_revision(), revision);
+        assert_eq!(authoritative.event().metadata(), expected);
+        assert_eq!(authoritative.parser_config().scope(), scope());
+        assert!(authoritative.uses_condition_bound_books());
+        assert_eq!(
+            authoritative.monotonic_receive_ns(),
+            observation
+                .live_observation()
+                .receive_clock()
+                .monotonic_receive_ns()
+        );
+
+        assert_eq!(
+            requests.recv().await.unwrap(),
+            format!("GET /markets/{CONDITION} HTTP/1.1")
+        );
+        assert_eq!(
+            requests.recv().await.unwrap(),
+            format!("GET /clob-markets/{CONDITION} HTTP/1.1")
+        );
+        task.await.unwrap();
+        assert!(requests.try_recv().is_err());
+
+        let (live, authoritative) = observation.into_parts();
+        assert_eq!(
+            authoritative.monotonic_receive_ns(),
+            live.receive_clock().monotonic_receive_ns()
+        );
+        assert_eq!(authoritative.event().metadata(), expected);
+    }
+
+    #[tokio::test]
+    async fn authoritative_bridge_rejects_scope_mismatch_before_any_fetch() {
+        let (origin, mut requests, task) = mock_server(Vec::new()).await;
+        let alternate_scope = PmWireScope::new(
+            scope().condition(),
+            scope().market(),
+            PmTokenId::new(U256::from_u64(456)).unwrap(),
+        );
+        let role = local_role_for_scope(&origin, alternate_scope);
+
+        assert!(matches!(
+            role.refresh_authoritative_observation(
+                instrument(),
+                source(),
+                expected_metadata("0.01"),
+                SnapshotRevision::new(1),
+            )
+            .await,
+            Err(PmLiveAuthoritativeMetadataError::ScopeMismatch)
+        ));
+        task.await.unwrap();
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn authoritative_bridge_reports_typed_agreement_drift_after_one_pair() {
+        let (origin, mut requests, task) = mock_server(vec![
+            MockResponse::ok(long_market()),
+            MockResponse::ok(short_market()),
+        ])
+        .await;
+        let role = local_role(&origin);
+
+        assert!(matches!(
+            role.refresh_authoritative_observation(
+                instrument(),
+                source(),
+                expected_metadata("0.001"),
+                SnapshotRevision::new(1),
+            )
+            .await,
+            Err(PmLiveAuthoritativeMetadataError::Authoritative(
+                PmMetadataJoinError::TickDrift
+            ))
+        ));
+        assert_eq!(
+            requests.recv().await.unwrap(),
+            format!("GET /markets/{CONDITION} HTTP/1.1")
+        );
+        assert_eq!(
+            requests.recv().await.unwrap(),
+            format!("GET /clob-markets/{CONDITION} HTTP/1.1")
+        );
+        task.await.unwrap();
+        assert!(requests.try_recv().is_err());
     }
 
     #[tokio::test]

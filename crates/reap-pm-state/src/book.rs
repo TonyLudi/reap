@@ -2,8 +2,8 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use reap_pm_core::{
     ConnectionEpoch, IngressSequence, MAX_PM_BOOK_LEVELS, PmBookDeltaBatch, PmBookLevel,
-    PmBookQuantity, PmBookSnapshot, PmBookUpdate, PmInstrumentHandle, SnapshotRevision,
-    VenueEventHash, VenueEventHashAlgorithm,
+    PmBookPoint, PmBookQuantity, PmBookSide, PmBookSnapshot, PmBookTop, PmBookUpdate,
+    PmInstrumentHandle, SnapshotRevision, VenueEventHash, VenueEventHashAlgorithm,
 };
 
 use crate::readiness::{
@@ -356,6 +356,38 @@ impl PmBookReducer {
     #[must_use]
     pub fn levels(&self) -> &[PmBookLevel] {
         &self.levels
+    }
+
+    /// Returns the exact canonical best bid and ask owned by this reducer.
+    ///
+    /// A stale retained level vector never escapes as a ready top: metadata,
+    /// epoch, freshness/fault, and snapshot readiness must still be available,
+    /// and the retained shape is rechecked for two positive, non-crossed sides.
+    #[must_use]
+    pub fn ready_top(&self) -> Option<PmBookTop> {
+        if !self.readiness().is_ready() {
+            return None;
+        }
+        let (bid_price, ask_price) = canonical_top(&self.levels).ok()?;
+        let bid = self
+            .levels
+            .iter()
+            .find(|level| level.side() == PmBookSide::Bid && level.price() == bid_price)?;
+        let ask = self
+            .levels
+            .iter()
+            .find(|level| level.side() == PmBookSide::Ask && level.price() == ask_price)?;
+        let PmBookQuantity::Quantity(bid_quantity) = bid.quantity() else {
+            return None;
+        };
+        let PmBookQuantity::Quantity(ask_quantity) = ask.quantity() else {
+            return None;
+        };
+        PmBookTop::new(
+            Some(PmBookPoint::new(bid_price, bid_quantity)),
+            Some(PmBookPoint::new(ask_price, ask_quantity)),
+        )
+        .ok()
     }
 
     #[must_use]

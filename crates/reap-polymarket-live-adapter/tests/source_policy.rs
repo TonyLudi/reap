@@ -164,6 +164,107 @@ fn public_preflight_observations_are_source_clocked_committed_and_sealed() {
 }
 
 #[test]
+fn public_metadata_authority_bridge_is_one_fetch_same_bytes_and_move_only() {
+    let bridge_start = METADATA_HTTP
+        .find("pub async fn refresh_authoritative_observation(")
+        .unwrap();
+    let bridge_end = METADATA_HTTP[bridge_start..]
+        .find("\n    fn seal_pair(")
+        .map(|offset| bridge_start + offset)
+        .unwrap();
+    let bridge = &METADATA_HTTP[bridge_start..bridge_end];
+
+    assert_eq!(bridge.matches("fetch_pair(").count(), 1);
+    assert_eq!(bridge.matches("self.fetch_pair().await?").count(), 1);
+    assert_eq!(bridge.matches("self.clock.observe()?").count(), 1);
+    assert_eq!(bridge.matches("&market_bytes").count(), 2);
+    assert_eq!(bridge.matches("&clob_v2_bytes").count(), 2);
+    for required in [
+        "if metadata_scope(expected) != self.scope",
+        "let (market_bytes, clob_v2_bytes) = self.fetch_pair().await?;",
+        "let receive_clock = self.clock.observe()?;",
+        "self.seal_pair(&market_bytes, &clob_v2_bytes, receive_clock)?",
+        "live_observation.receive_clock().monotonic_receive_ns()",
+        "PmAuthoritativeMetadata::join_live_clob_v2_raw(",
+        "&market_bytes,",
+        "&clob_v2_bytes,",
+        "PmLiveAuthoritativeMetadataObservation::from_source(",
+    ] {
+        assert!(
+            bridge.contains(required),
+            "missing one-fetch metadata authority bridge invariant: {required}"
+        );
+    }
+    assert!(
+        bridge.find("metadata_scope(expected)").unwrap()
+            < bridge.find("self.fetch_pair().await?").unwrap()
+    );
+    for forbidden in [
+        "origin:",
+        "PmPublicHttpConfig",
+        "market_bytes.to_vec()",
+        "clob_v2_bytes.to_vec()",
+        "market_bytes.clone()",
+        "clob_v2_bytes.clone()",
+    ] {
+        assert!(
+            !bridge.contains(forbidden),
+            "metadata authority bridge widened its source seam: {forbidden}"
+        );
+    }
+
+    for required in [
+        "Result<(Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>), PmLiveAdapterError>",
+        "let market_bytes = Zeroizing::new(",
+        "let clob_v2_bytes = Zeroizing::new(",
+        "pub struct PmLiveAuthoritativeMetadataObservation",
+        "live_observation: PmLiveMetadataObservation",
+        "authoritative_metadata: PmAuthoritativeMetadata",
+        "fn from_source(",
+        "pub fn into_parts(self)",
+    ] {
+        assert!(
+            METADATA_HTTP.contains(required),
+            "missing sealed/zeroizing metadata bridge invariant: {required}"
+        );
+    }
+
+    let carrier_start = METADATA_HTTP
+        .find("pub struct PmLiveAuthoritativeMetadataObservation")
+        .unwrap();
+    let carrier_end = METADATA_HTTP[carrier_start..]
+        .find("pub enum PmLiveAuthoritativeMetadataError")
+        .map(|offset| carrier_start + offset)
+        .unwrap();
+    let carrier = &METADATA_HTTP[carrier_start..carrier_end];
+    for forbidden in [
+        "#[derive(Debug, Clone",
+        "market_bytes:",
+        "clob_v2_bytes:",
+        "raw_body:",
+        "pub fn from_source(",
+        "pub fn market_bytes(",
+        "pub fn clob_v2_bytes(",
+    ] {
+        assert!(
+            !carrier.contains(forbidden),
+            "metadata authority carrier widened provenance: {forbidden}"
+        );
+    }
+
+    for preserved in [
+        "pub async fn refresh<S>(",
+        "pub async fn refresh_typed(&self)",
+        "pub async fn refresh_typed_observation(",
+    ] {
+        assert!(
+            METADATA_HTTP.contains(preserved),
+            "existing metadata API was not preserved: {preserved}"
+        );
+    }
+}
+
+#[test]
 fn server_time_and_type_one_account_observations_are_sealed_and_source_clocked() {
     let source = [PUBLIC_HTTP, PRIVATE_HTTP, ACCOUNT].join("\n");
     for required in [
@@ -646,7 +747,7 @@ fn public_market_websocket_is_exact_scoped_bounded_and_transport_private() {
         "PmPublicWsEvent::Pong",
         "PmPublicWsEvent::ReconnectScheduled",
         "PmPublicWsReconnectDirective",
-        "request_reconnect_authority(&events, retired).await?",
+        "request_reconnect_authority(&activity, &events, retired).await?",
         "PmPublicWsClockSource",
         "observe(clock)?",
     ] {
@@ -679,6 +780,33 @@ fn public_market_websocket_is_exact_scoped_bounded_and_transport_private() {
     assert!(PUBLIC_WS_CONFIG.contains("pub fn loopback_evidence"));
     assert!(!LIB.contains("local_evidence"));
     assert!(LIB.contains("PRODUCTION_ORDER_ENTRY_AUTHORIZED: bool = false"));
+}
+
+#[test]
+fn public_websocket_activity_watermark_is_checked_source_issued_and_read_only() {
+    for required in [
+        "pub struct PmPublicWsActivityView",
+        "pub fn activity_view(&self) -> PmPublicWsActivityView",
+        ".fetch_update(",
+        "|current| current.checked_add(1)",
+        "ActivityGenerationOverflow",
+        "source_observation(",
+        "event.activity_generation()",
+    ] {
+        assert!(
+            PUBLIC_WS.contains(required),
+            "missing public-WS activity watermark invariant: {required}"
+        );
+    }
+    assert!(LIB.contains("PmPublicWsActivityView"));
+
+    let issuer_start = PUBLIC_WS.find("struct PmPublicWsActivitySource").unwrap();
+    let issuer_end = PUBLIC_WS[issuer_start..]
+        .find("struct SystemPublicWsClock")
+        .map(|offset| issuer_start + offset)
+        .unwrap();
+    let issuer = &PUBLIC_WS[issuer_start..issuer_end];
+    assert!(!issuer.contains(".fetch_add("));
 }
 
 #[test]
@@ -884,8 +1012,10 @@ fn borrowing_roles_are_distinct_and_credentials_have_one_owner() {
     assert!(PRIVATE_HTTP.contains("Found(Zeroizing<Vec<u8>>)"));
     assert!(!PRIVATE_HTTP.contains("Found(Vec<u8>)"));
     assert!(!PRIVATE_HTTP.contains("Clone for PmAuthenticatedHttpOwner"));
-    assert!(RECONCILIATION.contains("authority: &'a mut PmHttpCredentialRole"));
-    assert!(ACCOUNT.contains("authority: &'a mut PmHttpCredentialRole"));
+    assert!(RECONCILIATION.contains("authority: &'a mut dyn PmHttpReadAuthorityProvider"));
+    assert!(ACCOUNT.contains("authority: &'a mut dyn PmHttpReadAuthorityProvider"));
+    assert!(PRIVATE_HTTP.contains("authority: Box<dyn PmHttpReadAuthorityProvider>"));
+    assert!(USER_WS.contains("credentials: Box<dyn PmUserWsReadAuthorityProvider>"));
     assert!(RECONCILIATION.contains("assembly: PmOpenOrdersAssembly"));
     assert!(!RECONCILIATION.contains("assembly: &PmOpenOrdersAssembly"));
     assert!(RECONCILIATION.contains("PmOpenOrdersCutProgress::Complete"));
@@ -910,9 +1040,10 @@ fn authenticated_user_websocket_is_fixed_bound_and_has_no_raw_or_mutation_escape
     for required in [
         "wss://ws-subscriptions-clob.polymarket.com/ws/user",
         "PM_USER_WS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10)",
-        "fresh_subscription(config.condition()).await",
+        "authenticate_user_subscription(config.condition())",
+        "subscription.dispatch(&mut RetainSubscriptionSink)",
         "parse_live_user_frame(raw.as_slice())",
-        "credentials.bind_frame(frame).await",
+        "credentials.bind_user_frame(frame).await",
         "PmUserWsEvent::BoundFrame",
         "into_credential_owned_frame(self) -> CredentialOwnedUserFrame",
         "Zeroizing::new(text.as_str().as_bytes().to_vec())",

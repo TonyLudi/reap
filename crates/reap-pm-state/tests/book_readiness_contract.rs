@@ -322,6 +322,90 @@ fn bootstrap(freshness: PmBookFreshness) -> PmBookReducer {
 }
 
 #[test]
+fn ready_top_is_available_only_from_the_ready_canonical_shape_and_tracks_updates() {
+    let mut not_ready = reducer_with_freshness(1_000, 1_000);
+    assert_eq!(not_ready.ready_top(), None);
+    not_ready.apply_metadata(base_observation(1, 100)).unwrap();
+    not_ready.begin_epoch(ConnectionEpoch::new(1)).unwrap();
+    assert_eq!(not_ready.ready_top(), None);
+
+    let empty = snapshot_from(Vec::new()).unwrap();
+    assert_eq!(
+        not_ready
+            .apply_snapshot(snapshot_ev(1, 1, 10, 1, 110), &empty)
+            .unwrap_err(),
+        PmPublicReadinessReason::EmptyBook
+    );
+    assert_eq!(not_ready.ready_top(), None);
+
+    let mut crossed = reducer_with_freshness(1_000, 1_000);
+    crossed.apply_metadata(base_observation(1, 100)).unwrap();
+    crossed.begin_epoch(ConnectionEpoch::new(1)).unwrap();
+    let crossed_snapshot = snapshot_from(vec![
+        level(PmBookSide::Bid, 600_000, "2"),
+        level(PmBookSide::Ask, 500_000, "3"),
+    ])
+    .unwrap();
+    assert_eq!(
+        crossed
+            .apply_snapshot(snapshot_ev(1, 1, 10, 1, 110), &crossed_snapshot)
+            .unwrap_err(),
+        PmPublicReadinessReason::CrossedBook
+    );
+    assert_eq!(crossed.ready_top(), None);
+
+    let mut reducer = bootstrap(PmBookFreshness::new(1_000, 1_000).unwrap());
+    let initial = reducer.ready_top().expect("ready snapshot has a top");
+    assert_eq!(
+        initial.bid().expect("bid").price(),
+        PmPrice::from_units(500_000).unwrap()
+    );
+    assert_eq!(
+        initial.bid().expect("bid").quantity(),
+        PmQuantity::parse_decimal("5").unwrap()
+    );
+    assert_eq!(
+        initial.ask().expect("ask").price(),
+        PmPrice::from_units(600_000).unwrap()
+    );
+    assert_eq!(
+        initial.ask().expect("ask").quantity(),
+        PmQuantity::parse_decimal("6").unwrap()
+    );
+
+    let update = delta_with_top(
+        vec![
+            delete(PmBookSide::Bid, 500_000),
+            level(PmBookSide::Bid, 550_000, "8"),
+            level(PmBookSide::Ask, 600_000, "9"),
+        ],
+        550_000,
+        600_000,
+    )
+    .unwrap();
+    assert_eq!(
+        reducer.apply_delta_batch(ev(1, 1, 10, 2, 120), &update),
+        Ok(PmBookTransition::DeltaBatchCommitted {
+            revision: SnapshotRevision::new(10),
+            changes: 3,
+        })
+    );
+    let updated = reducer.ready_top().expect("ready delta has a top");
+    assert_eq!(
+        updated.bid().expect("bid").price(),
+        PmPrice::from_units(550_000).unwrap()
+    );
+    assert_eq!(
+        updated.bid().expect("bid").quantity(),
+        PmQuantity::parse_decimal("8").unwrap()
+    );
+    assert_eq!(
+        updated.ask().expect("ask").quantity(),
+        PmQuantity::parse_decimal("9").unwrap()
+    );
+}
+
+#[test]
 fn constructor_values_reject_zeroes_and_expected_contract_mismatch() {
     assert_eq!(
         PmMetadataFingerprint::new([0; 32]),

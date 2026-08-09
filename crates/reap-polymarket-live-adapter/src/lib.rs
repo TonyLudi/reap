@@ -26,6 +26,7 @@ mod public_connectivity;
 mod public_http;
 mod public_ws;
 mod public_ws_config;
+mod read_authority;
 mod read_only_private;
 mod reconciliation;
 mod task_guard;
@@ -53,6 +54,7 @@ pub use loopback_mutation_credentials::{
     PmLoopbackPlaceAuthenticationFailure, PmLoopbackPlaceAuthenticationRole,
 };
 pub use metadata_http::{
+    PmLiveAuthoritativeMetadataError, PmLiveAuthoritativeMetadataObservation,
     PmLiveMetadataObservation, PmLiveMetadataObservationCommitment, PmLiveMetadataPair,
     PmLiveMetadataPairSink, PmPublicMetadataHttpRole, PmTypedLiveMarketDetails,
 };
@@ -91,15 +93,20 @@ pub use public_http::{
     PmRestBookSnapshotSink,
 };
 pub use public_ws::{
-    PmPublicMarketWsRole, PmPublicWsClockError, PmPublicWsClockSource, PmPublicWsConnection,
-    PmPublicWsDisconnectReason, PmPublicWsEdgeClock, PmPublicWsEvent, PmPublicWsEventSink,
-    PmPublicWsObservation, PmPublicWsRawData, PmPublicWsReconnect, PmPublicWsReconnectDirective,
-    PmPublicWsRetirement, PmPublicWsRunError, PmPublicWsShutdownHandle, PmPublicWsShutdownSignal,
-    PmPublicWsTransportError, pm_public_ws_shutdown_channel,
+    PmPublicMarketWsRole, PmPublicWsActivityView, PmPublicWsClockError, PmPublicWsClockSource,
+    PmPublicWsConnection, PmPublicWsDisconnectReason, PmPublicWsEdgeClock, PmPublicWsEvent,
+    PmPublicWsEventSink, PmPublicWsObservation, PmPublicWsRawData, PmPublicWsReconnect,
+    PmPublicWsReconnectDirective, PmPublicWsRetirement, PmPublicWsRunError,
+    PmPublicWsShutdownHandle, PmPublicWsShutdownSignal, PmPublicWsTransportError,
+    pm_public_ws_shutdown_channel,
 };
 pub use public_ws_config::{
     PM_PUBLIC_MARKET_WS_ENDPOINT, PM_PUBLIC_WS_HEARTBEAT_INTERVAL, PmPublicWsBounds,
     PmPublicWsConfig, PmPublicWsTransportPolicy,
+};
+pub use read_authority::{
+    PmExternalProxyReadConnectivityOwner, PmHttpReadAuthorityProvider,
+    PmUserWsReadAuthorityProvider,
 };
 pub use read_only_private::{
     PmReadOnlyAccountConnectivityOwner, PmReadOnlyAccountConnectivityRoles,
@@ -115,9 +122,9 @@ pub use reconciliation::{
     PmOpenOrdersCutProgress, PmReconciliationHttpRole, PmTradesAssembly, PmTradesCutProgress,
 };
 pub use user_ws::{
-    PmAuthenticatedUserWsRole, PmUserWsBoundFrame, PmUserWsClockError, PmUserWsClockSource,
-    PmUserWsConnection, PmUserWsDisconnectReason, PmUserWsEdgeClock, PmUserWsEvent,
-    PmUserWsEventSink, PmUserWsObservation, PmUserWsReconnect, PmUserWsRetirement,
+    PmAuthenticatedUserWsRole, PmUserWsActivityView, PmUserWsBoundFrame, PmUserWsClockError,
+    PmUserWsClockSource, PmUserWsConnection, PmUserWsDisconnectReason, PmUserWsEdgeClock,
+    PmUserWsEvent, PmUserWsEventSink, PmUserWsObservation, PmUserWsReconnect, PmUserWsRetirement,
     PmUserWsRunError, PmUserWsShutdownHandle, PmUserWsShutdownSignal, PmUserWsTransportError,
     pm_user_ws_shutdown_channel,
 };

@@ -8,13 +8,16 @@ name = "reap-pm-controlled-trial-runner"
 path = "src/main.rs"
 
 [dependencies]
+async-trait.workspace = true
 libc.workspace = true
 reap-pm-core.workspace = true
 reap-polymarket-auth.workspace = true
+reap-polymarket-live-adapter.workspace = true
 reap-polymarket-wire.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+reap-polymarket-live-adapter = { workspace = true, features = ["loopback-evidence"] }
 tempfile = "3"

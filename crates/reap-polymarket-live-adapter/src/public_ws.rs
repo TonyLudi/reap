@@ -1,5 +1,8 @@
 use std::fmt;
-use std::sync::OnceLock;
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicU64, Ordering as AtomicOrdering},
+};
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -60,6 +63,63 @@ pub trait PmPublicWsClockSource: Send + 'static {
     fn observe_public_ws_edge(&mut self) -> Result<PmPublicWsEdgeClock, PmPublicWsClockError>;
 }
 
+/// Cloneable, read-only view of the latest activity generation issued by one
+/// concrete public-WebSocket source.
+///
+/// The transport advances the shared high-water before attempting each
+/// socket/lifecycle handoff. Callers can therefore compare this value with
+/// the generation on the last event they fully admitted. There is no public
+/// constructor or mutation method, and the view grants no socket authority.
+#[derive(Clone)]
+pub struct PmPublicWsActivityView {
+    generation: Arc<AtomicU64>,
+}
+
+impl PmPublicWsActivityView {
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(AtomicOrdering::Acquire)
+    }
+}
+
+impl fmt::Debug for PmPublicWsActivityView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PmPublicWsActivityView")
+            .field("generation", &self.generation())
+            .finish()
+    }
+}
+
+struct PmPublicWsActivitySource {
+    generation: Arc<AtomicU64>,
+}
+
+impl PmPublicWsActivitySource {
+    fn new() -> (Self, PmPublicWsActivityView) {
+        let generation = Arc::new(AtomicU64::new(0));
+        (
+            Self {
+                generation: Arc::clone(&generation),
+            },
+            PmPublicWsActivityView { generation },
+        )
+    }
+
+    fn issue(&self) -> Result<u64, PmPublicWsTransportError> {
+        let success = AtomicOrdering::AcqRel;
+        let failure = AtomicOrdering::Acquire;
+        self.generation
+            .fetch_update(success, failure, |current| current.checked_add(1))
+            .map(|previous| {
+                previous
+                    .checked_add(1)
+                    .expect("successful checked activity update cannot overflow")
+            })
+            .map_err(|_| PmPublicWsTransportError::ActivityGenerationOverflow)
+    }
+}
+
 struct SystemPublicWsClock;
 
 impl PmPublicWsClockSource for SystemPublicWsClock {
@@ -92,6 +152,7 @@ pub struct PmPublicWsConnection {
 pub struct PmPublicWsObservation {
     connection: PmPublicWsConnection,
     clock: PmPublicWsEdgeClock,
+    activity_generation: u64,
 }
 
 impl PmPublicWsObservation {
@@ -103,6 +164,11 @@ impl PmPublicWsObservation {
     #[must_use]
     pub const fn clock(self) -> PmPublicWsEdgeClock {
         self.clock
+    }
+
+    #[must_use]
+    pub const fn activity_generation(self) -> u64 {
+        self.activity_generation
     }
 }
 
@@ -133,6 +199,11 @@ impl PmPublicWsRawData {
     #[must_use]
     pub const fn clock(&self) -> PmPublicWsEdgeClock {
         self.observation.clock
+    }
+
+    #[must_use]
+    pub const fn activity_generation(&self) -> u64 {
+        self.observation.activity_generation
     }
 
     #[must_use]
@@ -189,6 +260,11 @@ impl PmPublicWsRetirement {
     }
 
     #[must_use]
+    pub const fn activity_generation(self) -> u64 {
+        self.observation.activity_generation
+    }
+
+    #[must_use]
     pub const fn reason(self) -> PmPublicWsDisconnectReason {
         self.reason
     }
@@ -203,6 +279,7 @@ pub struct PmPublicWsReconnect {
     reconnect_attempt: u8,
     backoff: Duration,
     scheduled_clock: PmPublicWsEdgeClock,
+    activity_generation: u64,
 }
 
 /// Reconnect authority returned by the composition-owned public session.
@@ -268,6 +345,11 @@ impl PmPublicWsReconnect {
     pub const fn scheduled_clock(self) -> PmPublicWsEdgeClock {
         self.scheduled_clock
     }
+
+    #[must_use]
+    pub const fn activity_generation(self) -> u64 {
+        self.activity_generation
+    }
 }
 
 /// Purpose-specific public market transport evidence.
@@ -290,6 +372,25 @@ pub enum PmPublicWsEvent {
     ReconnectScheduled(PmPublicWsReconnect),
     ReconnectStopped(PmPublicWsRetirement),
     Shutdown(PmPublicWsObservation),
+}
+
+impl PmPublicWsEvent {
+    /// Source-issued high-water stamped before this event's bounded handoff.
+    #[must_use]
+    pub const fn activity_generation(&self) -> u64 {
+        match self {
+            Self::ConnectionOpened(observation)
+            | Self::SubscriptionSent(observation)
+            | Self::PingSent(observation)
+            | Self::Pong(observation)
+            | Self::Shutdown(observation) => observation.activity_generation(),
+            Self::RawData(raw) => raw.activity_generation(),
+            Self::ConnectionRetired(retired) | Self::ReconnectStopped(retired) => {
+                retired.activity_generation()
+            }
+            Self::ReconnectScheduled(reconnect) => reconnect.activity_generation(),
+        }
+    }
 }
 
 #[async_trait]
@@ -318,6 +419,8 @@ pub enum PmPublicWsTransportError {
     EventChannelSaturated,
     #[error("public market WebSocket worker task failed")]
     WorkerFailed,
+    #[error("public market WebSocket activity generation overflowed")]
+    ActivityGenerationOverflow,
     #[error(transparent)]
     Clock(#[from] PmPublicWsClockError),
 }
@@ -360,6 +463,8 @@ pub struct PmPublicMarketWsRole {
     config: PmPublicWsConfig,
     subscription: String,
     clock: Box<dyn PmPublicWsClockSource>,
+    activity_source: PmPublicWsActivitySource,
+    activity_view: PmPublicWsActivityView,
 }
 
 impl fmt::Debug for PmPublicMarketWsRole {
@@ -389,10 +494,13 @@ impl PmPublicMarketWsRole {
         C: PmPublicWsClockSource,
     {
         let subscription = PmMarketSubscription::new(config.scope().token()).to_json()?;
+        let (activity_source, activity_view) = PmPublicWsActivitySource::new();
         Ok(Self {
             config,
             subscription,
             clock: Box::new(clock),
+            activity_source,
+            activity_view,
         })
     }
 
@@ -408,6 +516,13 @@ impl PmPublicMarketWsRole {
         self.config.transport_policy()
     }
 
+    /// Read-only source high-water for detecting socket/lifecycle activity
+    /// that has been stamped but not yet admitted by an event sink.
+    #[must_use]
+    pub fn activity_view(&self) -> PmPublicWsActivityView {
+        self.activity_view.clone()
+    }
+
     pub async fn run<S>(
         self,
         shutdown: PmPublicWsShutdownSignal,
@@ -421,8 +536,17 @@ impl PmPublicMarketWsRole {
         let config = self.config;
         let subscription = self.subscription;
         let clock = self.clock;
+        let activity_source = self.activity_source;
         let mut worker = AbortOnDropTask::new(tokio::spawn(async move {
-            run_worker(config, subscription, clock, shutdown.receiver, event_sender).await
+            run_worker(
+                config,
+                subscription,
+                clock,
+                activity_source,
+                shutdown.receiver,
+                event_sender,
+            )
+            .await
         }));
 
         while let Some(event) = event_receiver.recv().await {
@@ -465,6 +589,7 @@ async fn run_worker(
     config: PmPublicWsConfig,
     subscription: String,
     mut clock: Box<dyn PmPublicWsClockSource>,
+    activity: PmPublicWsActivitySource,
     mut shutdown: watch::Receiver<bool>,
     events: mpsc::Sender<WorkerEvent>,
 ) -> Result<(), PmPublicWsTransportError> {
@@ -480,6 +605,7 @@ async fn run_worker(
             &subscription,
             connection,
             clock.as_mut(),
+            &activity,
             &mut shutdown,
             &events,
         )
@@ -493,7 +619,7 @@ async fn run_worker(
         };
         emit(&events, PmPublicWsEvent::ConnectionRetired(retired)).await?;
 
-        let directive = request_reconnect_authority(&events, retired).await?;
+        let directive = request_reconnect_authority(&activity, &events, retired).await?;
         let PmPublicWsReconnectDirective::Reconnect {
             retired_epoch,
             replacement_epoch,
@@ -501,7 +627,8 @@ async fn run_worker(
             backoff,
         } = directive
         else {
-            emit(&events, PmPublicWsEvent::ReconnectStopped(retired)).await?;
+            let stopped = restamp_retirement(&activity, retired)?;
+            emit(&events, PmPublicWsEvent::ReconnectStopped(stopped)).await?;
             return Ok(());
         };
         if retired_epoch != connection_epoch
@@ -513,6 +640,7 @@ async fn run_worker(
         {
             return Err(PmPublicWsTransportError::InvalidReconnectDirective);
         }
+        let scheduled = source_observation(&activity, connection, clock.as_mut())?;
         emit(
             &events,
             PmPublicWsEvent::ReconnectScheduled(PmPublicWsReconnect {
@@ -520,7 +648,8 @@ async fn run_worker(
                 replacement_epoch,
                 reconnect_attempt,
                 backoff,
-                scheduled_clock: observe(clock.as_mut())?,
+                scheduled_clock: scheduled.clock(),
+                activity_generation: scheduled.activity_generation(),
             }),
         )
         .await?;
@@ -530,10 +659,11 @@ async fn run_worker(
             () = wait_for_shutdown(&mut shutdown) => {
                 emit(
                     &events,
-                    PmPublicWsEvent::Shutdown(PmPublicWsObservation {
+                    PmPublicWsEvent::Shutdown(source_observation(
+                        &activity,
                         connection,
-                        clock: observe(clock.as_mut())?,
-                    }),
+                        clock.as_mut(),
+                    )?),
                 )
                 .await?;
                 return Ok(());
@@ -554,6 +684,7 @@ async fn run_attempt(
     subscription: &str,
     connection: PmPublicWsConnection,
     clock: &mut dyn PmPublicWsClockSource,
+    activity: &PmPublicWsActivitySource,
     shutdown: &mut watch::Receiver<bool>,
     events: &mpsc::Sender<WorkerEvent>,
 ) -> Result<AttemptOutcome, PmPublicWsTransportError> {
@@ -567,24 +698,22 @@ async fn run_attempt(
         connect_async_with_config(config.endpoint().as_str(), Some(websocket_config), true);
     let socket = tokio::select! {
         () = wait_for_shutdown(shutdown) => {
-            return Ok(AttemptOutcome::Shutdown(PmPublicWsObservation {
+            return Ok(AttemptOutcome::Shutdown(source_observation(
+                activity,
                 connection,
-                clock: observe(clock)?,
-            }));
+                clock,
+            )?));
         }
         result = timeout(config.connect_timeout(), connect) => match result {
-            Err(_) => return retired(clock, connection, PmPublicWsDisconnectReason::ConnectTimeout),
-            Ok(Err(_)) => return retired(clock, connection, PmPublicWsDisconnectReason::ConnectFailed),
+            Err(_) => return retired(activity, clock, connection, PmPublicWsDisconnectReason::ConnectTimeout),
+            Ok(Err(_)) => return retired(activity, clock, connection, PmPublicWsDisconnectReason::ConnectFailed),
             Ok(Ok((socket, _response))) => socket,
         },
     };
 
     emit(
         events,
-        PmPublicWsEvent::ConnectionOpened(PmPublicWsObservation {
-            connection,
-            clock: observe(clock)?,
-        }),
+        PmPublicWsEvent::ConnectionOpened(source_observation(activity, connection, clock)?),
     )
     .await?;
     run_connected(
@@ -592,6 +721,7 @@ async fn run_attempt(
         subscription,
         connection,
         clock,
+        activity,
         socket,
         shutdown,
         events,
@@ -599,11 +729,13 @@ async fn run_attempt(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_connected(
     config: &PmPublicWsConfig,
     subscription: &str,
     connection: PmPublicWsConnection,
     clock: &mut dyn PmPublicWsClockSource,
+    activity: &PmPublicWsActivitySource,
     mut socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
     shutdown: &mut watch::Receiver<bool>,
     events: &mpsc::Sender<WorkerEvent>,
@@ -616,6 +748,7 @@ async fn run_connected(
     {
         Err(_) => {
             return retired(
+                activity,
                 clock,
                 connection,
                 PmPublicWsDisconnectReason::SubscriptionWriteTimeout,
@@ -623,6 +756,7 @@ async fn run_connected(
         }
         Ok(Err(_)) => {
             return retired(
+                activity,
                 clock,
                 connection,
                 PmPublicWsDisconnectReason::SubscriptionWriteFailed,
@@ -632,10 +766,7 @@ async fn run_connected(
     }
     emit(
         events,
-        PmPublicWsEvent::SubscriptionSent(PmPublicWsObservation {
-            connection,
-            clock: observe(clock)?,
-        }),
+        PmPublicWsEvent::SubscriptionSent(source_observation(activity, connection, clock)?),
     )
     .await?;
 
@@ -650,18 +781,19 @@ async fn run_connected(
         tokio::select! {
             () = wait_for_shutdown(shutdown) => {
                 let _ = timeout(config.pong_timeout(), socket.close(None)).await;
-                return Ok(AttemptOutcome::Shutdown(PmPublicWsObservation {
+                return Ok(AttemptOutcome::Shutdown(source_observation(
+                    activity,
                     connection,
-                    clock: observe(clock)?,
-                }));
+                    clock,
+                )?));
             }
             () = sleep_until(next_heartbeat), if outstanding_pong.is_none() => {
                 match timeout(
                     config.pong_timeout(),
                     socket.send(Message::text(APPLICATION_PING)),
                 ).await {
-                    Err(_) => return retired(clock, connection, PmPublicWsDisconnectReason::SocketWriteTimeout),
-                    Ok(Err(_)) => return retired(clock, connection, PmPublicWsDisconnectReason::SocketWriteFailed),
+                    Err(_) => return retired(activity, clock, connection, PmPublicWsDisconnectReason::SocketWriteTimeout),
+                    Ok(Err(_)) => return retired(activity, clock, connection, PmPublicWsDisconnectReason::SocketWriteFailed),
                     Ok(Ok(())) => {}
                 }
                 let sent_at = Instant::now();
@@ -669,31 +801,29 @@ async fn run_connected(
                 next_heartbeat = sent_at + config.heartbeat_interval();
                 emit(
                     events,
-                    PmPublicWsEvent::PingSent(PmPublicWsObservation {
-                        connection,
-                        clock: observe(clock)?,
-                    }),
+                    PmPublicWsEvent::PingSent(source_observation(activity, connection, clock)?),
                 )
                 .await?;
             }
             () = sleep_until(pong_deadline), if outstanding_pong.is_some() => {
-                return retired(clock, connection, PmPublicWsDisconnectReason::PongTimeout);
+                return retired(activity, clock, connection, PmPublicWsDisconnectReason::PongTimeout);
             }
             () = sleep_until(idle_deadline) => {
-                return retired(clock, connection, PmPublicWsDisconnectReason::IdleTimeout);
+                return retired(activity, clock, connection, PmPublicWsDisconnectReason::IdleTimeout);
             }
             message = socket.next() => {
                 let Some(message) = message else {
-                    return retired(clock, connection, PmPublicWsDisconnectReason::SocketClosed);
+                    return retired(activity, clock, connection, PmPublicWsDisconnectReason::SocketClosed);
                 };
                 let message = match message {
                     Ok(message) => message,
-                    Err(error) => return retired(clock, connection, classify_read_error(&error)),
+                    Err(error) => return retired(activity, clock, connection, classify_read_error(&error)),
                 };
                 let received_at = Instant::now();
                 last_inbound = received_at;
                 match message {
                     Message::Text(text) if text.as_str() == APPLICATION_PONG => {
+                        let observation = source_observation(activity, connection, clock)?;
                         outstanding_pong = None;
                         // The canonical public session rebases its next ping
                         // from the application-PONG receive edge. Keep the
@@ -702,44 +832,43 @@ async fn run_connected(
                         next_heartbeat = received_at + config.heartbeat_interval();
                         emit(
                             events,
-                            PmPublicWsEvent::Pong(PmPublicWsObservation {
-                                connection,
-                                clock: observe(clock)?,
-                            }),
+                            PmPublicWsEvent::Pong(observation),
                         )
                         .await?;
                     }
                     Message::Text(text) => {
+                        // Stamp the source edge before validation or owned-byte
+                        // allocation. A later rejection/failed handoff leaves
+                        // the read-only high-water ahead and invalidates old
+                        // runtime evidence.
+                        let observation = source_observation(activity, connection, clock)?;
                         if text.len() > config.max_frame_bytes() {
-                            return retired(clock, connection, PmPublicWsDisconnectReason::FrameTooLarge);
+                            return retired(activity, clock, connection, PmPublicWsDisconnectReason::FrameTooLarge);
                         }
                         emit(
                             events,
                             PmPublicWsEvent::RawData(PmPublicWsRawData {
-                                observation: PmPublicWsObservation {
-                                    connection,
-                                    clock: observe(clock)?,
-                                },
+                                observation,
                                 bytes: text.as_str().as_bytes().to_vec().into_boxed_slice(),
                             }),
                         )
                         .await?;
                     }
                     Message::Binary(_) => {
-                        return retired(clock, connection, PmPublicWsDisconnectReason::BinaryFrame);
+                        return retired(activity, clock, connection, PmPublicWsDisconnectReason::BinaryFrame);
                     }
                     Message::Ping(_) | Message::Pong(_) => {
                         match timeout(config.pong_timeout(), socket.flush()).await {
-                            Err(_) => return retired(clock, connection, PmPublicWsDisconnectReason::SocketWriteTimeout),
-                            Ok(Err(_)) => return retired(clock, connection, PmPublicWsDisconnectReason::SocketWriteFailed),
+                            Err(_) => return retired(activity, clock, connection, PmPublicWsDisconnectReason::SocketWriteTimeout),
+                            Ok(Err(_)) => return retired(activity, clock, connection, PmPublicWsDisconnectReason::SocketWriteFailed),
                             Ok(Ok(())) => {}
                         }
                     }
                     Message::Close(_) => {
-                        return retired(clock, connection, PmPublicWsDisconnectReason::SocketClosed);
+                        return retired(activity, clock, connection, PmPublicWsDisconnectReason::SocketClosed);
                     }
                     Message::Frame(_) => {
-                        return retired(clock, connection, PmPublicWsDisconnectReason::UnexpectedProtocolFrame);
+                        return retired(activity, clock, connection, PmPublicWsDisconnectReason::UnexpectedProtocolFrame);
                     }
                 }
             }
@@ -763,16 +892,44 @@ fn observe(
         .map_err(PmPublicWsTransportError::Clock)
 }
 
+fn source_observation(
+    activity: &PmPublicWsActivitySource,
+    connection: PmPublicWsConnection,
+    clock: &mut dyn PmPublicWsClockSource,
+) -> Result<PmPublicWsObservation, PmPublicWsTransportError> {
+    // Allocate first. If clocking or the eventual bounded handoff fails, the
+    // externally retained view stays ahead of the last admitted observation.
+    let activity_generation = activity.issue()?;
+    let clock = observe(clock)?;
+    Ok(PmPublicWsObservation {
+        connection,
+        clock,
+        activity_generation,
+    })
+}
+
+fn restamp_retirement(
+    activity: &PmPublicWsActivitySource,
+    retired: PmPublicWsRetirement,
+) -> Result<PmPublicWsRetirement, PmPublicWsTransportError> {
+    Ok(PmPublicWsRetirement {
+        observation: PmPublicWsObservation {
+            connection: retired.connection(),
+            clock: retired.clock(),
+            activity_generation: activity.issue()?,
+        },
+        reason: retired.reason(),
+    })
+}
+
 fn retired(
+    activity: &PmPublicWsActivitySource,
     clock: &mut dyn PmPublicWsClockSource,
     connection: PmPublicWsConnection,
     reason: PmPublicWsDisconnectReason,
 ) -> Result<AttemptOutcome, PmPublicWsTransportError> {
     Ok(AttemptOutcome::Retired(PmPublicWsRetirement {
-        observation: PmPublicWsObservation {
-            connection,
-            clock: observe(clock)?,
-        },
+        observation: source_observation(activity, connection, clock)?,
         reason,
     }))
 }
@@ -781,6 +938,7 @@ async fn emit(
     events: &mpsc::Sender<WorkerEvent>,
     event: PmPublicWsEvent,
 ) -> Result<(), PmPublicWsTransportError> {
+    debug_assert_ne!(event.activity_generation(), 0);
     events
         .try_send(WorkerEvent::Evidence(event))
         .map_err(classify_event_send_error)
@@ -795,10 +953,12 @@ enum WorkerEvent {
 }
 
 async fn request_reconnect_authority(
+    activity: &PmPublicWsActivitySource,
     events: &mpsc::Sender<WorkerEvent>,
     retired: PmPublicWsRetirement,
 ) -> Result<PmPublicWsReconnectDirective, PmPublicWsTransportError> {
     let (response, decision) = oneshot::channel();
+    let retired = restamp_retirement(activity, retired)?;
     events
         .try_send(WorkerEvent::ReconnectAuthority { retired, response })
         .map_err(classify_event_send_error)?;
@@ -877,6 +1037,7 @@ mod tests {
         edge: &'static str,
         local_wall_receive_ns: u64,
         monotonic_receive_ns: u64,
+        activity_generation: u64,
     }
 
     struct TestClock {
@@ -1070,6 +1231,7 @@ mod tests {
                 return Err("synthetic sink rejection");
             }
             self.delivered += 1;
+            let activity_generation = event.activity_generation();
             let (edge, clock) = match &event {
                 PmPublicWsEvent::ConnectionOpened(observation) => ("opened", observation.clock()),
                 PmPublicWsEvent::SubscriptionSent(observation) => {
@@ -1089,6 +1251,7 @@ mod tests {
                 edge,
                 local_wall_receive_ns: clock.local_wall_receive_ns(),
                 monotonic_receive_ns: clock.monotonic_receive_ns(),
+                activity_generation,
             });
             let seen = match event {
                 PmPublicWsEvent::ConnectionOpened(observation) => {
@@ -1636,31 +1799,37 @@ mod tests {
                     edge: "opened",
                     local_wall_receive_ns: 1_000_001,
                     monotonic_receive_ns: 1,
+                    activity_generation: 1,
                 },
                 SeenClock {
                     edge: "subscription",
                     local_wall_receive_ns: 1_000_002,
                     monotonic_receive_ns: 2,
+                    activity_generation: 2,
                 },
                 SeenClock {
                     edge: "raw",
                     local_wall_receive_ns: 1_000_003,
                     monotonic_receive_ns: 3,
+                    activity_generation: 3,
                 },
                 SeenClock {
                     edge: "ping",
                     local_wall_receive_ns: 1_000_004,
                     monotonic_receive_ns: 4,
+                    activity_generation: 4,
                 },
                 SeenClock {
                     edge: "pong",
                     local_wall_receive_ns: 1_000_005,
                     monotonic_receive_ns: 5,
+                    activity_generation: 5,
                 },
                 SeenClock {
                     edge: "shutdown",
                     local_wall_receive_ns: 1_000_006,
                     monotonic_receive_ns: 6,
+                    activity_generation: 6,
                 },
             ]
         );
@@ -1708,6 +1877,7 @@ mod tests {
             },
         )
         .unwrap();
+        let activity_view = role.activity_view();
         let sink_gate = Arc::new((Mutex::new(RawSinkGate::default()), Condvar::new()));
         let sink_task_gate = Arc::clone(&sink_gate);
         let (shutdown, signal) = pm_public_ws_shutdown_channel();
@@ -1739,6 +1909,10 @@ mod tests {
         )
         .await;
         let sampled_clock_count = next_clock.load(Ordering::SeqCst);
+        assert!(
+            activity_view.generation() >= 4,
+            "second queued raw must advance the source high-water beyond the admitted first raw",
+        );
 
         {
             let (state, changed) = &*sink_gate;
@@ -1757,6 +1931,72 @@ mod tests {
             .expect("loopback server did not observe shutdown")
             .unwrap();
         assert!(sampled_clock_count >= 5);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queued_retirement_advances_activity_before_the_blocked_sink_admits_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            read_subscription(&mut socket).await;
+            socket.close(None).await.unwrap();
+        });
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let role = PmPublicMarketWsRole::with_clock_source(
+            standard_config(address, 1_024, 0, 19),
+            TestClock { next: 1 },
+        )
+        .unwrap();
+        let activity = role.activity_view();
+        let (_shutdown, signal) = pm_public_ws_shutdown_channel();
+        let sink_entered = Arc::clone(&entered);
+        let sink_release = Arc::clone(&release);
+        let task = tokio::spawn(async move {
+            let mut sink = BlockingOpenedSink {
+                entered: sink_entered,
+                release: sink_release,
+            };
+            role.run(signal, &mut sink).await
+        });
+
+        timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("opened evidence never reached blocked sink");
+        timeout(Duration::from_secs(5), async {
+            while activity.generation() < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retirement was not source-stamped behind the blocked sink");
+        assert!(
+            activity.generation() > 1,
+            "queued lifecycle evidence must invalidate the last admitted open generation",
+        );
+
+        release.notify_one();
+        timeout(Duration::from_secs(5), task)
+            .await
+            .expect("role did not finish after releasing lifecycle sink")
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn activity_generation_overflow_is_closed_and_never_wraps() {
+        let (source, view) = PmPublicWsActivitySource::new();
+        source.generation.store(u64::MAX, AtomicOrdering::Release);
+        assert_eq!(view.generation(), u64::MAX);
+        assert_eq!(
+            source.issue(),
+            Err(PmPublicWsTransportError::ActivityGenerationOverflow)
+        );
+        assert_eq!(view.generation(), u64::MAX);
     }
 
     #[tokio::test]
@@ -2033,6 +2273,7 @@ mod tests {
             TestClock { next: 1 },
         )
         .unwrap();
+        let activity = role.activity_view();
         let (_shutdown, signal) = pm_public_ws_shutdown_channel();
         let sink_entered = Arc::clone(&entered);
         let sink_release = Arc::clone(&release);
@@ -2061,6 +2302,10 @@ mod tests {
                 PmPublicWsTransportError::EventChannelSaturated
             ))
         ));
+        assert!(
+            activity.generation() > 1,
+            "failed handoff must leave the source high-water ahead of admitted evidence",
+        );
         server.await.unwrap();
     }
 

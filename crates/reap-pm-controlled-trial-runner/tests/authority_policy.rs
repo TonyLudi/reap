@@ -135,6 +135,34 @@ fn sole_task_routes_every_fixed_http_user_ws_binding_and_exact_cancel_operation(
 }
 
 #[test]
+fn external_live_read_seam_is_purpose_closed_and_recovery_implements_no_place_provider() {
+    assert!(MANIFEST_SOURCE.contains("reap-polymarket-live-adapter.workspace = true"));
+    assert!(!MANIFEST_SOURCE.contains("reqwest"));
+    for required in [
+        "impl PmHttpReadAuthorityProvider for FixedHttpAuthenticationRole",
+        "impl PmUserWsReadAuthorityProvider for FixedUserWsAuthenticationRole",
+        "AuthorizedL2Timestamp::new(timestamp)",
+        "SealedExactOwnedOrderReadAuthentication::new(",
+        "sealed_order_id != order_id || sealed_timestamp != timestamp",
+        "map_external_read_error",
+    ] {
+        assert!(
+            AUTHORITY_SOURCE.contains(required),
+            "external read seam is missing `{required}`",
+        );
+    }
+    let recovery = between(
+        AUTHORITY_SOURCE,
+        "// BEGIN RECOVERY_ROLE_SURFACE",
+        "// END RECOVERY_ROLE_SURFACE",
+    );
+    assert!(recovery.contains("FixedHttpAuthenticationRole"));
+    assert!(recovery.contains("FixedUserWsAuthenticationRole"));
+    assert!(!recovery.contains("FreshPlaceAuthenticationOnce"));
+    assert!(!recovery.contains("PmFixedPlace"));
+}
+
+#[test]
 fn production_authority_has_no_persistence_logging_or_raw_secret_escape() {
     let production = AUTHORITY_SOURCE
         .split_once("#[cfg(all(test, target_os = \"linux\"))]")
