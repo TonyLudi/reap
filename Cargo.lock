@@ -1480,6 +1480,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "reap-pm-controlled-trial"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "libc",
+ "reap-pm-core",
+ "reap-polymarket-auth",
+ "reap-polymarket-wire",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "reap-pm-core"
 version = "0.1.0"
 dependencies = [
@@ -1604,6 +1622,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "reap-polymarket-chain-source"
+version = "0.1.0"
+dependencies = [
+ "reap-pm-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "reap-polymarket-live-adapter"
 version = "0.1.0"
 dependencies = [
@@ -1622,6 +1653,18 @@ dependencies = [
  "trybuild",
  "url",
  "zeroize",
+]
+
+[[package]]
+name = "reap-polymarket-public-source"
+version = "0.1.0"
+dependencies = [
+ "reap-pm-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
