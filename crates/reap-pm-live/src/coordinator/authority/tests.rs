@@ -61,6 +61,7 @@ fn quote_facts() -> PmQuoteAuthorityFacts {
     let execution = PmFixtureOwnedExecution::new(account_scope, instrument);
     PmQuoteAuthorityFacts {
         account_scope,
+        account_signature_profile: PmAccountSignatureProfile::EoaType0,
         instrument,
         instrument_id: instrument_id(),
         intent: PmOwnedIntentId::new(1).expect("nonzero intent"),
@@ -114,6 +115,28 @@ fn quote_journal_intent_carries_every_execution_authority_fact() {
 }
 
 #[test]
+fn proxy_quote_journal_intent_carries_the_config_proven_profile_and_split_identities() {
+    let mut facts = quote_facts();
+    facts.account_scope = PmAccountScope::new(
+        facts.account_scope.environment(),
+        facts.account_scope.chain(),
+        facts.account_scope.signer(),
+        PmFunderId::new(EvmAddress::from_bytes([0xcd; 20]).expect("proxy funder")),
+        facts.account_scope.handle(),
+    );
+    facts.account_signature_profile = PmAccountSignatureProfile::ProxyType1;
+
+    let intent = quote_journal_intent(facts);
+    assert_eq!(
+        intent.profile,
+        PmJournalQuoteProfileV1::PassiveGtcPostOnlyProxyType1
+    );
+    assert_eq!(intent.maker, facts.account_scope.funder().address());
+    assert_eq!(intent.signer, facts.account_scope.signer().address());
+    assert_ne!(intent.maker, intent.signer);
+}
+
+#[test]
 fn cancel_journal_intent_carries_exact_owned_order_identity_and_reason() {
     let quote = quote_facts();
     let venue_order = PmVenueOrderKey::new(
@@ -123,6 +146,7 @@ fn cancel_journal_intent_carries_exact_owned_order_identity_and_reason() {
     let execution = PmFixtureOwnedExecution::new(quote.account_scope, quote.instrument);
     let cancel = PmCancelAuthorityFacts {
         account_scope: quote.account_scope,
+        account_signature_profile: quote.account_signature_profile,
         instrument: quote.instrument,
         instrument_id: quote.instrument_id,
         intent: quote.intent,
@@ -150,6 +174,35 @@ fn cancel_journal_intent_carries_exact_owned_order_identity_and_reason() {
             venue_order,
             reason: PmJournalCancelReasonV1::SafetyHalt,
         }
+    );
+}
+
+#[test]
+fn signature_profile_validation_is_closed_over_eoa_and_proxy_identities() {
+    let eoa_scope = account_scope();
+    assert_eq!(
+        validate_account_signature_profile(PmAccountSignatureProfile::EoaType0, eoa_scope),
+        Ok(())
+    );
+    assert_eq!(
+        validate_account_signature_profile(PmAccountSignatureProfile::ProxyType1, eoa_scope),
+        Err(PmAuthorityError::AccountSignatureProfileMismatch)
+    );
+
+    let proxy_scope = PmAccountScope::new(
+        eoa_scope.environment(),
+        eoa_scope.chain(),
+        eoa_scope.signer(),
+        PmFunderId::new(EvmAddress::from_bytes([0xcd; 20]).expect("proxy funder")),
+        eoa_scope.handle(),
+    );
+    assert_eq!(
+        validate_account_signature_profile(PmAccountSignatureProfile::ProxyType1, proxy_scope),
+        Ok(())
+    );
+    assert_eq!(
+        validate_account_signature_profile(PmAccountSignatureProfile::EoaType0, proxy_scope),
+        Err(PmAuthorityError::EoaIdentityMismatch)
     );
 }
 

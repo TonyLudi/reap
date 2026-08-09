@@ -766,6 +766,9 @@ pub(super) fn recover_lines(
             return Err(PmAuthenticatedJournalRecoveryError::WrongEnvelopeShape);
         }
         let decoded: PmAuthenticatedJournalLineV1 = serde_json::from_slice(&line)?;
+        if decoded.schema_version() != expected_scope.schema_version() {
+            return Err(PmAuthenticatedJournalRecoveryError::ScopeMismatch);
+        }
         if decoded.scope() != expected_scope.fingerprint() {
             return Err(PmAuthenticatedJournalRecoveryError::ScopeMismatch);
         }

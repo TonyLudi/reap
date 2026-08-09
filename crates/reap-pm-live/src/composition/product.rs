@@ -59,7 +59,8 @@ impl<M: PmQuoteModelRequirements> PmProduct<M> {
             .expect("product plan carries account config");
         let capture = PmCaptureBlueprint::new(public)?;
         let private = Box::new(PmPrivateMonitorRuntime::new(account_config, risk_limits)?);
-        let fake_effect = PmFakeEffectRole::new(
+        let fake_effect = PmFakeEffectRole::for_account_signature_profile(
+            account_config.signature_profile(),
             account_config.account_scope(),
             account_config.instrument(),
             account_config.instrument_id(),

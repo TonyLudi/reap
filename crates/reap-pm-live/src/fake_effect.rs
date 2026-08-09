@@ -1,5 +1,5 @@
 use reap_pm_core::{PmAccountScope, PmInstrumentHandle, PmInstrumentId};
-use reap_pm_live_contracts::ConstructedRoleBinding;
+use reap_pm_live_contracts::{ConstructedRoleBinding, PmAccountSignatureProfile};
 use reap_polymarket_adapter::{
     PmCancelOwnedPurpose, PmFakeCancelResult, PmFakeCancelScript, PmFakePlaceResult,
     PmFakePlaceScript, PmFixedMutationPreparation, PmFixtureInstrumentScope,
@@ -26,6 +26,7 @@ pub(crate) struct PmFakeEffectRole {
 pub(crate) struct PmMutationPreparationRole {
     preparation: PmFixedMutationPreparation,
     instrument_id: PmInstrumentId,
+    account_signature_profile: PmAccountSignatureProfile,
 }
 
 /// Fixture-only result synthesis retained solely by `PmProductRun`.
@@ -43,6 +44,25 @@ impl PmFakeEffectRole {
     ) -> Self {
         Self {
             preparation: PmMutationPreparationRole::new(account_scope, instrument, instrument_id),
+            executor: PmFixtureEffectExecutor::new(account_scope, instrument, instrument_id),
+        }
+    }
+
+    pub(crate) const fn for_account_signature_profile(
+        account_signature_profile: PmAccountSignatureProfile,
+        account_scope: PmAccountScope,
+        instrument: PmInstrumentHandle,
+        instrument_id: PmInstrumentId,
+    ) -> Self {
+        Self {
+            preparation: PmMutationPreparationRole::for_account_signature_profile(
+                account_signature_profile,
+                account_scope,
+                instrument,
+                instrument_id,
+            ),
+            // This executor remains fixture-only and carries no signer or
+            // transport. Authenticated composition destroys it before start.
             executor: PmFixtureEffectExecutor::new(account_scope, instrument, instrument_id),
         }
     }
@@ -77,6 +97,35 @@ impl PmMutationPreparationRole {
         Self {
             preparation: PmFixedMutationPreparation::new(account_scope, instrument),
             instrument_id,
+            account_signature_profile: PmAccountSignatureProfile::EoaType0,
+        }
+    }
+
+    pub(crate) const fn new_pm_t2_proxy(
+        account_scope: PmAccountScope,
+        instrument: PmInstrumentHandle,
+        instrument_id: PmInstrumentId,
+    ) -> Self {
+        Self {
+            preparation: PmFixedMutationPreparation::new_pm_t2_proxy(account_scope, instrument),
+            instrument_id,
+            account_signature_profile: PmAccountSignatureProfile::ProxyType1,
+        }
+    }
+
+    pub(crate) const fn for_account_signature_profile(
+        account_signature_profile: PmAccountSignatureProfile,
+        account_scope: PmAccountScope,
+        instrument: PmInstrumentHandle,
+        instrument_id: PmInstrumentId,
+    ) -> Self {
+        match account_signature_profile {
+            PmAccountSignatureProfile::EoaType0 => {
+                Self::new(account_scope, instrument, instrument_id)
+            }
+            PmAccountSignatureProfile::ProxyType1 => {
+                Self::new_pm_t2_proxy(account_scope, instrument, instrument_id)
+            }
         }
     }
 
@@ -90,6 +139,10 @@ impl PmMutationPreparationRole {
 
     pub(crate) const fn instrument_id(&self) -> PmInstrumentId {
         self.instrument_id
+    }
+
+    pub(crate) const fn account_signature_profile(&self) -> PmAccountSignatureProfile {
+        self.account_signature_profile
     }
 
     pub(crate) const fn place_profile(&self) -> PmGtcPostOnlyProfile {

@@ -2,6 +2,7 @@ use reap_pm_core::{
     PmAccountScope, PmClientOrderKey, PmInstrumentHandle, PmInstrumentId, PmOrderSalt, PmOrderSide,
     PmPrice, PmQuantity, PmVenueOrderKey, SnapshotRevision, U256, exact_order_amounts,
 };
+use reap_pm_live_contracts::PmAccountSignatureProfile;
 use reap_pm_state::{
     PmExactReservation, PmOwnedCancelRequestApply, PmOwnedIntentId, PmOwnedOrderProjection,
     PmOwnedQuoteAdmission, PmOwnedQuoteIntent, PmPrivateReady, PmReservationBasis, PmRiskDecision,
@@ -89,6 +90,7 @@ impl PmAuthorityRevisions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PmQuoteAuthorityFacts {
     account_scope: PmAccountScope,
+    account_signature_profile: PmAccountSignatureProfile,
     instrument: PmInstrumentHandle,
     instrument_id: PmInstrumentId,
     intent: PmOwnedIntentId,
@@ -139,6 +141,11 @@ macro_rules! quote_accessors {
             #[must_use]
             pub const fn account_scope(&self) -> PmAccountScope {
                 self.facts.account_scope
+            }
+
+            #[must_use]
+            pub const fn account_signature_profile(&self) -> PmAccountSignatureProfile {
+                self.facts.account_signature_profile
             }
 
             #[must_use]
@@ -267,6 +274,7 @@ impl PreparedPmQuote {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn approve_pm_quote(
     account_scope: PmAccountScope,
+    account_signature_profile: PmAccountSignatureProfile,
     instrument_id: PmInstrumentId,
     intent: PmOwnedIntentId,
     client_order: PmClientOrderKey,
@@ -287,9 +295,7 @@ pub(crate) fn approve_pm_quote(
     if candidate.instrument_id() != instrument_id {
         return Err(PmAuthorityError::ScopeMismatch);
     }
-    if account_scope.signer().address() != account_scope.funder().address() {
-        return Err(PmAuthorityError::EoaIdentityMismatch);
-    }
+    validate_account_signature_profile(account_signature_profile, account_scope)?;
     validate_profile(profile)?;
     validate_window(
         timestamp_ms,
@@ -315,6 +321,7 @@ pub(crate) fn approve_pm_quote(
     Ok(ApprovedPmQuote {
         facts: PmQuoteAuthorityFacts {
             account_scope,
+            account_signature_profile,
             instrument: candidate.instrument(),
             instrument_id,
             intent,
@@ -370,7 +377,10 @@ pub(crate) fn prepare_pm_quote(
         facts.timestamp_ms,
     )?;
     let unsigned = request.unsigned_order();
-    if unsigned.maker_amount() != facts.maker_amount
+    if unsigned.maker() != facts.account_scope.funder().address()
+        || unsigned.signer() != facts.account_scope.signer().address()
+        || unsigned.signature_type() != facts.account_signature_profile.signature_type()
+        || unsigned.maker_amount() != facts.maker_amount
         || unsigned.taker_amount() != facts.taker_amount
         || request.profile() != facts.profile
     {
@@ -386,10 +396,12 @@ pub(crate) fn prepare_pm_quote(
 pub(crate) fn take_prepared_place_dispatch(
     prepared: PreparedPmQuote,
     account_scope: PmAccountScope,
+    account_signature_profile: PmAccountSignatureProfile,
     instrument: PmInstrumentHandle,
     instrument_id: PmInstrumentId,
 ) -> Result<PmPreparedPlaceDispatch, PmAuthorityError> {
     if prepared.facts.account_scope != account_scope
+        || prepared.facts.account_signature_profile != account_signature_profile
         || prepared.facts.instrument != instrument
         || prepared.facts.instrument_id != instrument_id
     {
@@ -413,7 +425,12 @@ fn quote_journal_intent(facts: PmQuoteAuthorityFacts) -> PmJournalQuoteIntentV1 
         quantity: facts.quantity,
         reserved_collateral: facts.reservation.collateral(),
         reserved_outcome: facts.reservation.outcome(),
-        profile: PmJournalQuoteProfileV1::PassiveGtcPostOnlyEoa,
+        profile: match facts.account_signature_profile {
+            PmAccountSignatureProfile::EoaType0 => PmJournalQuoteProfileV1::PassiveGtcPostOnlyEoa,
+            PmAccountSignatureProfile::ProxyType1 => {
+                PmJournalQuoteProfileV1::PassiveGtcPostOnlyProxyType1
+            }
+        },
         metadata_revision: facts.revisions.metadata().value(),
         book_revision: facts.revisions.book().value(),
         model_revision: facts.revisions.model(),
@@ -432,6 +449,7 @@ fn quote_journal_intent(facts: PmQuoteAuthorityFacts) -> PmJournalQuoteIntentV1 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PmCancelAuthorityFacts {
     account_scope: PmAccountScope,
+    account_signature_profile: PmAccountSignatureProfile,
     instrument: PmInstrumentHandle,
     instrument_id: PmInstrumentId,
     intent: PmOwnedIntentId,
@@ -475,6 +493,11 @@ macro_rules! cancel_accessors {
             #[must_use]
             pub const fn account_scope(&self) -> PmAccountScope {
                 self.facts.account_scope
+            }
+
+            #[must_use]
+            pub const fn account_signature_profile(&self) -> PmAccountSignatureProfile {
+                self.facts.account_signature_profile
             }
 
             #[must_use]
@@ -608,6 +631,7 @@ impl PreparedPmCancel {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn approve_pm_cancel(
     account_scope: PmAccountScope,
+    account_signature_profile: PmAccountSignatureProfile,
     instrument_id: PmInstrumentId,
     order: PmOwnedOrderProjection,
     quote_profile: PmGtcPostOnlyProfile,
@@ -628,9 +652,7 @@ pub(crate) fn approve_pm_cancel(
     {
         return Err(PmAuthorityError::ScopeMismatch);
     }
-    if account_scope.signer().address() != account_scope.funder().address() {
-        return Err(PmAuthorityError::EoaIdentityMismatch);
-    }
+    validate_account_signature_profile(account_signature_profile, account_scope)?;
     validate_profile(quote_profile)?;
     validate_window(
         timestamp_ms,
@@ -650,6 +672,7 @@ pub(crate) fn approve_pm_cancel(
     Ok(ApprovedPmCancel {
         facts: PmCancelAuthorityFacts {
             account_scope,
+            account_signature_profile,
             instrument: slot.instrument(),
             instrument_id,
             intent: order.intent(),
@@ -704,10 +727,12 @@ pub(crate) fn prepare_pm_cancel(
 pub(crate) fn take_prepared_cancel_dispatch(
     prepared: PreparedPmCancel,
     account_scope: PmAccountScope,
+    account_signature_profile: PmAccountSignatureProfile,
     instrument: PmInstrumentHandle,
     instrument_id: PmInstrumentId,
 ) -> Result<PmPreparedCancelDispatch, PmAuthorityError> {
     if prepared.facts.account_scope != account_scope
+        || prepared.facts.account_signature_profile != account_signature_profile
         || prepared.facts.instrument != instrument
         || prepared.facts.instrument_id != instrument_id
     {
@@ -750,6 +775,22 @@ fn validate_profile(profile: PmGtcPostOnlyProfile) -> Result<(), PmAuthorityErro
         Err(PmAuthorityError::ProfileMismatch)
     } else {
         Ok(())
+    }
+}
+
+fn validate_account_signature_profile(
+    profile: PmAccountSignatureProfile,
+    account_scope: PmAccountScope,
+) -> Result<(), PmAuthorityError> {
+    if profile.matches_account_scope(account_scope) {
+        Ok(())
+    } else {
+        Err(match profile {
+            PmAccountSignatureProfile::EoaType0 => PmAuthorityError::EoaIdentityMismatch,
+            PmAccountSignatureProfile::ProxyType1 => {
+                PmAuthorityError::AccountSignatureProfileMismatch
+            }
+        })
     }
 }
 
@@ -835,6 +876,10 @@ pub enum PmAuthorityError {
     ScopeMismatch,
     #[error("PM mutation authority requires the fixed GTC post-only execution profile")]
     ProfileMismatch,
+    #[error(
+        "PM mutation authority account identities do not match the config-proven signature profile"
+    )]
+    AccountSignatureProfileMismatch,
     #[error("PM mutation authority requires maker, signer, and funder to be one EOA")]
     EoaIdentityMismatch,
     #[error("PM mutation authority has an invalid timestamp or monotonic expiry")]

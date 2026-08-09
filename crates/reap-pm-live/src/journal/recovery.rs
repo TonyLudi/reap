@@ -547,6 +547,9 @@ fn recover_lines(
             return Err(PmJournalRecoveryError::WrongEnvelopeShape);
         }
         let decoded: PmJournalLineV1 = serde_json::from_slice(&line)?;
+        if decoded.schema_version() != expected_scope.schema_version() {
+            return Err(PmJournalRecoveryError::ScopeVersionMismatch);
+        }
         if decoded.scope() != expected_scope.fingerprint() {
             return Err(PmJournalRecoveryError::ScopeMismatch);
         }
@@ -1357,6 +1360,8 @@ pub enum PmJournalRecoveryError {
     DuplicateHeader,
     #[error("PM journal line scope differs from the expected lease scope")]
     ScopeMismatch,
+    #[error("PM journal line version differs from the expected account-profile domain")]
+    ScopeVersionMismatch,
     #[error("PM journal sequence is not contiguous: expected {expected}, got {actual}")]
     NonContiguousSequence { expected: u64, actual: u64 },
     #[error("PM journal intent identity is not monotonic: prior {prior}, got {actual}")]

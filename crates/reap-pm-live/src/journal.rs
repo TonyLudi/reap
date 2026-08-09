@@ -24,22 +24,22 @@ pub(crate) use recovery::{
 };
 pub use recovery::{PmJournalRecovery, recover_pm_mutation_journal};
 pub(crate) use schema::PmJournalLineV1;
-pub(crate) use schema::derive_pm_journal_client_order_from_fingerprint;
+pub(crate) use schema::derive_pm_journal_v1_client_order_from_fingerprint;
 use schema::next_sequence;
 pub use schema::{
     MAX_PM_JOURNAL_BYTES, MAX_PM_JOURNAL_LINE_BYTES, MAX_PM_JOURNAL_RECORDS,
-    PM_MUTATION_JOURNAL_FAMILY, PM_MUTATION_JOURNAL_VERSION, PmJournalAuthenticatedCancelResultV1,
-    PmJournalAuthenticatedClassificationV1, PmJournalAuthenticatedPlaceResultV1,
-    PmJournalAuthenticatedResultV1, PmJournalCancelIntentV1, PmJournalCancelOutcomeV1,
-    PmJournalCancelReasonV1, PmJournalCancelRejectReasonV1, PmJournalCancelResultV1,
-    PmJournalFillAppliedV1, PmJournalFillCursorV1, PmJournalFillDeliveryV1, PmJournalFillFeeV1,
-    PmJournalFillKeyV1, PmJournalFillOccurrenceV1, PmJournalFillRoleV1, PmJournalFillSettlementV1,
-    PmJournalFillSourceV1, PmJournalFillV1, PmJournalFillWatermarkV1, PmJournalFingerprintV1,
-    PmJournalHeaderV1, PmJournalImmediateFillsV1, PmJournalOrderProgressSourceV1,
-    PmJournalOrderTerminalV1, PmJournalPlaceOutcomeV1, PmJournalPlaceRejectReasonV1,
-    PmJournalPlaceResultV1, PmJournalQuoteIntentV1, PmJournalQuoteProfileV1, PmJournalRecordV1,
-    PmJournalSafetyHaltV1, PmJournalSafetyReasonV1, PmJournalSchemaError, PmJournalScopeV1,
-    PmJournalSideV1, PmJournalTerminalStatusV1,
+    PM_MUTATION_JOURNAL_FAMILY, PM_MUTATION_JOURNAL_VERSION, PM_T2_PROXY_MUTATION_JOURNAL_VERSION,
+    PmJournalAuthenticatedCancelResultV1, PmJournalAuthenticatedClassificationV1,
+    PmJournalAuthenticatedPlaceResultV1, PmJournalAuthenticatedResultV1, PmJournalCancelIntentV1,
+    PmJournalCancelOutcomeV1, PmJournalCancelReasonV1, PmJournalCancelRejectReasonV1,
+    PmJournalCancelResultV1, PmJournalFillAppliedV1, PmJournalFillCursorV1,
+    PmJournalFillDeliveryV1, PmJournalFillFeeV1, PmJournalFillKeyV1, PmJournalFillOccurrenceV1,
+    PmJournalFillRoleV1, PmJournalFillSettlementV1, PmJournalFillSourceV1, PmJournalFillV1,
+    PmJournalFillWatermarkV1, PmJournalFingerprintV1, PmJournalHeaderV1, PmJournalImmediateFillsV1,
+    PmJournalOrderProgressSourceV1, PmJournalOrderTerminalV1, PmJournalPlaceOutcomeV1,
+    PmJournalPlaceRejectReasonV1, PmJournalPlaceResultV1, PmJournalQuoteIntentV1,
+    PmJournalQuoteProfileV1, PmJournalRecordV1, PmJournalSafetyHaltV1, PmJournalSafetyReasonV1,
+    PmJournalSchemaError, PmJournalScopeV1, PmJournalSideV1, PmJournalTerminalStatusV1,
 };
 use writer::{PmJournalCodec, PmJournalCodecError};
 
@@ -161,8 +161,8 @@ impl PmMutationJournal {
                 .await
                 .map_err(map_writer_error)?;
         if empty {
-            let header = PmJournalLineV1::new(
-                expected_scope.fingerprint(),
+            let header = PmJournalLineV1::new_for_scope(
+                &expected_scope,
                 0,
                 PmJournalRecordV1::Header(PmJournalHeaderV1::new(expected_scope.clone())),
             );
@@ -240,11 +240,9 @@ impl PmMutationJournal {
                     .sink()
                     .try_reserve_durable()
                     .map_err(map_enqueue_error)?;
-                PmJournalPendingReceipt::Durable(reservation.commit(PmJournalLineV1::new(
-                    self.scope.fingerprint(),
-                    self.next_sequence,
-                    record,
-                )))
+                PmJournalPendingReceipt::Durable(reservation.commit(
+                    PmJournalLineV1::new_for_scope(&self.scope, self.next_sequence, record),
+                ))
             }
             PmJournalRuntime::SealedEvidence(ledger) => {
                 let validated = PmValidatedJournalRecord::try_new(&self.scope, &record)?;

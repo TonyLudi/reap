@@ -7,7 +7,7 @@ use reap_pm_core::{
     PmQuantity, PmSign, PmSignedUnits, PmVenueOrderKey, SnapshotRevision, U256,
     exact_order_amounts,
 };
-use reap_pm_live_contracts::PmConnectivityConfig;
+use reap_pm_live_contracts::{PmAccountSignatureProfile, PmConnectivityConfig};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -20,6 +20,11 @@ pub use authenticated::{
 
 pub const PM_MUTATION_JOURNAL_FAMILY: &str = "reap-pm-mutation-journal";
 pub const PM_MUTATION_JOURNAL_VERSION: u16 = 1;
+// Offline/loopback evidence only. This domain deliberately cannot carry a
+// reviewed live-authorization/preflight digest and must never be promoted to
+// a production PM-T2 journal. A future live trial requires a new version or
+// dedicated controlled-trial family that binds take-once authorization.
+pub const PM_T2_PROXY_MUTATION_JOURNAL_VERSION: u16 = 2;
 pub const MAX_PM_JOURNAL_LINE_BYTES: usize = 64 * 1_024;
 pub const MAX_PM_JOURNAL_BYTES: u64 = 512 * 1_024 * 1_024;
 pub const MAX_PM_JOURNAL_RECORDS: usize = 262_144;
@@ -33,8 +38,11 @@ const PM_ACKNOWLEDGEMENT_FILL_CHUNK: usize = 32;
 const PM_ACKNOWLEDGEMENT_FILL_CHUNKS: usize =
     MAX_PM_ACKNOWLEDGEMENT_FILL_LEGS / PM_ACKNOWLEDGEMENT_FILL_CHUNK;
 
-const SCOPE_HASH_PREFIX: &[u8] = b"reap.pm.mutation-journal.scope.v1\0";
-const CLIENT_ORDER_HASH_PREFIX: &[u8] = b"reap.pm.mutation-journal.client-order.v1\0";
+const SCOPE_HASH_PREFIX_V1: &[u8] = b"reap.pm.mutation-journal.scope.v1\0";
+const SCOPE_HASH_PREFIX_V2: &[u8] = b"reap.pm.mutation-journal.scope.v2.proxy-type-1\0";
+const CLIENT_ORDER_HASH_PREFIX_V1: &[u8] = b"reap.pm.mutation-journal.client-order.v1\0";
+const CLIENT_ORDER_HASH_PREFIX_V2: &[u8] =
+    b"reap.pm.mutation-journal.client-order.v2.proxy-type-1\0";
 const ZERO_HASH: [u8; 32] = [0; 32];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -121,9 +129,56 @@ const fn decode_hex(byte: u8) -> Option<u8> {
 }
 
 /// Exact non-secret lease scope for one Goal-F PM product journal.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PmJournalScopeV1 {
+    product: String,
+    schema_family: String,
+    schema_version: u16,
+    account_scope: PmAccountScope,
+    configured_instruments: [PmInstrumentId; 1],
+    configuration_fingerprint: PmJournalFingerprintV1,
+    authentication_enabled: bool,
+    production_authorized: bool,
+    account_signature_profile: PmAccountSignatureProfile,
+    scope_fingerprint: PmJournalFingerprintV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum PmProxySignatureProfileV2 {
+    #[serde(rename = "proxy_type_1")]
+    ProxyType1,
+}
+
+#[derive(Serialize)]
+struct ScopeWireV1Ref<'a> {
+    product: &'a str,
+    schema_family: &'a str,
+    schema_version: u16,
+    account_scope: PmAccountScope,
+    configured_instruments: [PmInstrumentId; 1],
+    configuration_fingerprint: PmJournalFingerprintV1,
+    authentication_enabled: bool,
+    production_authorized: bool,
+    scope_fingerprint: PmJournalFingerprintV1,
+}
+
+#[derive(Serialize)]
+struct ScopeWireV2Ref<'a> {
+    product: &'a str,
+    schema_family: &'a str,
+    schema_version: u16,
+    account_scope: PmAccountScope,
+    configured_instruments: [PmInstrumentId; 1],
+    configuration_fingerprint: PmJournalFingerprintV1,
+    authentication_enabled: bool,
+    production_authorized: bool,
+    account_signature_profile: PmProxySignatureProfileV2,
+    scope_fingerprint: PmJournalFingerprintV1,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScopeWireV1 {
     product: String,
     schema_family: String,
     schema_version: u16,
@@ -135,13 +190,178 @@ pub struct PmJournalScopeV1 {
     scope_fingerprint: PmJournalFingerprintV1,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScopeWireV2 {
+    product: String,
+    schema_family: String,
+    schema_version: u16,
+    account_scope: PmAccountScope,
+    configured_instruments: [PmInstrumentId; 1],
+    configuration_fingerprint: PmJournalFingerprintV1,
+    authentication_enabled: bool,
+    production_authorized: bool,
+    account_signature_profile: PmProxySignatureProfileV2,
+    scope_fingerprint: PmJournalFingerprintV1,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ScopeWire {
+    V1(ScopeWireV1),
+    V2(ScopeWireV2),
+}
+
+#[derive(Serialize)]
+struct ScopeFingerprintBasisV1<'a> {
+    product: &'a str,
+    schema_family: &'a str,
+    schema_version: u16,
+    account_scope: PmAccountScope,
+    configured_instruments: [PmInstrumentId; 1],
+    configuration_fingerprint: PmJournalFingerprintV1,
+    authentication_enabled: bool,
+    production_authorized: bool,
+}
+
+#[derive(Serialize)]
+struct ScopeFingerprintBasisV2<'a> {
+    product: &'a str,
+    schema_family: &'a str,
+    schema_version: u16,
+    account_scope: PmAccountScope,
+    configured_instruments: [PmInstrumentId; 1],
+    configuration_fingerprint: PmJournalFingerprintV1,
+    authentication_enabled: bool,
+    production_authorized: bool,
+    account_signature_profile: PmProxySignatureProfileV2,
+}
+
+impl<'a> From<&'a PmJournalScopeV1> for ScopeWireV1Ref<'a> {
+    fn from(scope: &'a PmJournalScopeV1) -> Self {
+        Self {
+            product: &scope.product,
+            schema_family: &scope.schema_family,
+            schema_version: scope.schema_version,
+            account_scope: scope.account_scope,
+            configured_instruments: scope.configured_instruments,
+            configuration_fingerprint: scope.configuration_fingerprint,
+            authentication_enabled: scope.authentication_enabled,
+            production_authorized: scope.production_authorized,
+            scope_fingerprint: scope.scope_fingerprint,
+        }
+    }
+}
+
+impl<'a> From<&'a PmJournalScopeV1> for ScopeWireV2Ref<'a> {
+    fn from(scope: &'a PmJournalScopeV1) -> Self {
+        Self {
+            product: &scope.product,
+            schema_family: &scope.schema_family,
+            schema_version: scope.schema_version,
+            account_scope: scope.account_scope,
+            configured_instruments: scope.configured_instruments,
+            configuration_fingerprint: scope.configuration_fingerprint,
+            authentication_enabled: scope.authentication_enabled,
+            production_authorized: scope.production_authorized,
+            account_signature_profile: PmProxySignatureProfileV2::ProxyType1,
+            scope_fingerprint: scope.scope_fingerprint,
+        }
+    }
+}
+
+impl<'a> From<&'a PmJournalScopeV1> for ScopeFingerprintBasisV1<'a> {
+    fn from(scope: &'a PmJournalScopeV1) -> Self {
+        Self {
+            product: &scope.product,
+            schema_family: &scope.schema_family,
+            schema_version: scope.schema_version,
+            account_scope: scope.account_scope,
+            configured_instruments: scope.configured_instruments,
+            configuration_fingerprint: scope.configuration_fingerprint,
+            authentication_enabled: scope.authentication_enabled,
+            production_authorized: scope.production_authorized,
+        }
+    }
+}
+
+impl<'a> From<&'a PmJournalScopeV1> for ScopeFingerprintBasisV2<'a> {
+    fn from(scope: &'a PmJournalScopeV1) -> Self {
+        Self {
+            product: &scope.product,
+            schema_family: &scope.schema_family,
+            schema_version: scope.schema_version,
+            account_scope: scope.account_scope,
+            configured_instruments: scope.configured_instruments,
+            configuration_fingerprint: scope.configuration_fingerprint,
+            authentication_enabled: scope.authentication_enabled,
+            production_authorized: scope.production_authorized,
+            account_signature_profile: PmProxySignatureProfileV2::ProxyType1,
+        }
+    }
+}
+
+impl Serialize for PmJournalScopeV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self.account_signature_profile {
+            PmAccountSignatureProfile::EoaType0 => ScopeWireV1Ref::from(self).serialize(serializer),
+            PmAccountSignatureProfile::ProxyType1 => {
+                ScopeWireV2Ref::from(self).serialize(serializer)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PmJournalScopeV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match ScopeWire::deserialize(deserializer)? {
+            ScopeWire::V1(scope) => Self {
+                product: scope.product,
+                schema_family: scope.schema_family,
+                schema_version: scope.schema_version,
+                account_scope: scope.account_scope,
+                configured_instruments: scope.configured_instruments,
+                configuration_fingerprint: scope.configuration_fingerprint,
+                authentication_enabled: scope.authentication_enabled,
+                production_authorized: scope.production_authorized,
+                account_signature_profile: PmAccountSignatureProfile::EoaType0,
+                scope_fingerprint: scope.scope_fingerprint,
+            },
+            ScopeWire::V2(scope) => {
+                let PmProxySignatureProfileV2::ProxyType1 = scope.account_signature_profile;
+                Self {
+                    product: scope.product,
+                    schema_family: scope.schema_family,
+                    schema_version: scope.schema_version,
+                    account_scope: scope.account_scope,
+                    configured_instruments: scope.configured_instruments,
+                    configuration_fingerprint: scope.configuration_fingerprint,
+                    authentication_enabled: scope.authentication_enabled,
+                    production_authorized: scope.production_authorized,
+                    account_signature_profile: PmAccountSignatureProfile::ProxyType1,
+                    scope_fingerprint: scope.scope_fingerprint,
+                }
+            }
+        })
+    }
+}
+
 impl PmJournalScopeV1 {
     pub fn from_config(config: &PmConnectivityConfig) -> Result<Self, PmJournalSchemaError> {
         let account = config.account().account_scope();
         let mut scope = Self {
             product: "reap-pm".to_owned(),
             schema_family: PM_MUTATION_JOURNAL_FAMILY.to_owned(),
-            schema_version: PM_MUTATION_JOURNAL_VERSION,
+            schema_version: match config.account().signature_profile() {
+                PmAccountSignatureProfile::EoaType0 => PM_MUTATION_JOURNAL_VERSION,
+                PmAccountSignatureProfile::ProxyType1 => PM_T2_PROXY_MUTATION_JOURNAL_VERSION,
+            },
             account_scope: account,
             configured_instruments: [config.account().instrument_id()],
             configuration_fingerprint: PmJournalFingerprintV1::from_bytes(
@@ -149,6 +369,7 @@ impl PmJournalScopeV1 {
             ),
             authentication_enabled: false,
             production_authorized: false,
+            account_signature_profile: config.account().signature_profile(),
             scope_fingerprint: PmJournalFingerprintV1::from_bytes(ZERO_HASH),
         };
         scope.scope_fingerprint = scope.calculate_fingerprint()?;
@@ -181,6 +402,15 @@ impl PmJournalScopeV1 {
         self.configuration_fingerprint
     }
 
+    #[must_use]
+    pub const fn account_signature_profile(&self) -> PmAccountSignatureProfile {
+        self.account_signature_profile
+    }
+
+    pub(crate) const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
     pub fn client_order_for_intent(
         &self,
         intent_id: u64,
@@ -199,14 +429,26 @@ impl PmJournalScopeV1 {
     }
 
     pub(crate) fn validate(&self) -> Result<(), PmJournalSchemaError> {
+        let expected_version = match self.account_signature_profile {
+            PmAccountSignatureProfile::EoaType0 => PM_MUTATION_JOURNAL_VERSION,
+            PmAccountSignatureProfile::ProxyType1 => PM_T2_PROXY_MUTATION_JOURNAL_VERSION,
+        };
         if self.product != "reap-pm"
             || self.schema_family != PM_MUTATION_JOURNAL_FAMILY
-            || self.schema_version != PM_MUTATION_JOURNAL_VERSION
+            || self.schema_version != expected_version
         {
             return Err(PmJournalSchemaError::WrongScopeDomain);
         }
         if self.authentication_enabled || self.production_authorized {
             return Err(PmJournalSchemaError::ForbiddenLiveAuthority);
+        }
+        if !self
+            .account_signature_profile
+            .matches_account_scope(self.account_scope)
+            || (self.account_signature_profile == PmAccountSignatureProfile::ProxyType1
+                && self.account_scope.chain().value() != 137)
+        {
+            return Err(PmJournalSchemaError::AccountIdentityMismatch);
         }
         if self.calculate_fingerprint()? != self.scope_fingerprint {
             return Err(PmJournalSchemaError::ScopeFingerprintMismatch);
@@ -215,31 +457,23 @@ impl PmJournalScopeV1 {
     }
 
     fn calculate_fingerprint(&self) -> Result<PmJournalFingerprintV1, PmJournalSchemaError> {
-        #[derive(Serialize)]
-        struct FingerprintBasis<'a> {
-            product: &'a str,
-            schema_family: &'a str,
-            schema_version: u16,
-            account_scope: PmAccountScope,
-            configured_instruments: [PmInstrumentId; 1],
-            configuration_fingerprint: PmJournalFingerprintV1,
-            authentication_enabled: bool,
-            production_authorized: bool,
-        }
-
-        let basis = FingerprintBasis {
-            product: &self.product,
-            schema_family: &self.schema_family,
-            schema_version: self.schema_version,
-            account_scope: self.account_scope,
-            configured_instruments: self.configured_instruments,
-            configuration_fingerprint: self.configuration_fingerprint,
-            authentication_enabled: self.authentication_enabled,
-            production_authorized: self.production_authorized,
-        };
         let mut hasher = Sha256::new();
-        hasher.update(SCOPE_HASH_PREFIX);
-        serde_json::to_writer(HashWriter(&mut hasher), &basis)?;
+        match self.account_signature_profile {
+            PmAccountSignatureProfile::EoaType0 => {
+                hasher.update(SCOPE_HASH_PREFIX_V1);
+                serde_json::to_writer(
+                    HashWriter(&mut hasher),
+                    &ScopeFingerprintBasisV1::from(self),
+                )?;
+            }
+            PmAccountSignatureProfile::ProxyType1 => {
+                hasher.update(SCOPE_HASH_PREFIX_V2);
+                serde_json::to_writer(
+                    HashWriter(&mut hasher),
+                    &ScopeFingerprintBasisV2::from(self),
+                )?;
+            }
+        }
         Ok(PmJournalFingerprintV1::from_bytes(hasher.finalize().into()))
     }
 }
@@ -253,10 +487,37 @@ pub fn derive_pm_journal_client_order(
     scope: &PmJournalScopeV1,
     intent_id: u64,
 ) -> Result<PmClientOrderKey, PmJournalSchemaError> {
-    derive_pm_journal_client_order_from_fingerprint(scope.account(), scope.fingerprint(), intent_id)
+    let prefix = match scope.account_signature_profile() {
+        PmAccountSignatureProfile::EoaType0 => CLIENT_ORDER_HASH_PREFIX_V1,
+        PmAccountSignatureProfile::ProxyType1 => CLIENT_ORDER_HASH_PREFIX_V2,
+    };
+    derive_pm_journal_client_order_with_prefix(
+        prefix,
+        scope.account(),
+        scope.fingerprint(),
+        intent_id,
+    )
 }
 
-pub(crate) fn derive_pm_journal_client_order_from_fingerprint(
+/// Legacy V1-only derivation retained for the sealed type-0 workload
+/// projection, which carries only a fingerprint rather than a versioned
+/// journal scope. Proxy V2 callers must use [`derive_pm_journal_client_order`]
+/// so the profile-specific domain cannot be omitted.
+pub(crate) fn derive_pm_journal_v1_client_order_from_fingerprint(
+    account: PmAccountHandle,
+    fingerprint: PmJournalFingerprintV1,
+    intent_id: u64,
+) -> Result<PmClientOrderKey, PmJournalSchemaError> {
+    derive_pm_journal_client_order_with_prefix(
+        CLIENT_ORDER_HASH_PREFIX_V1,
+        account,
+        fingerprint,
+        intent_id,
+    )
+}
+
+fn derive_pm_journal_client_order_with_prefix(
+    prefix: &[u8],
     account: PmAccountHandle,
     fingerprint: PmJournalFingerprintV1,
     intent_id: u64,
@@ -265,7 +526,7 @@ pub(crate) fn derive_pm_journal_client_order_from_fingerprint(
         return Err(PmJournalSchemaError::ZeroIntentId);
     }
     let mut hasher = Sha256::new();
-    hasher.update(CLIENT_ORDER_HASH_PREFIX);
+    hasher.update(prefix);
     hasher.update(fingerprint.bytes());
     hasher.update(intent_id.to_be_bytes());
     let digest: [u8; 32] = hasher.finalize().into();
@@ -341,6 +602,9 @@ impl From<PmJournalSideV1> for PmOrderSide {
 #[serde(rename_all = "snake_case")]
 pub enum PmJournalQuoteProfileV1 {
     PassiveGtcPostOnlyEoa,
+    // Append-only. Proxy scopes use the separate V2 journal domain, while
+    // retaining the common record carrier for bounded recovery.
+    PassiveGtcPostOnlyProxyType1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -397,9 +661,19 @@ impl PmJournalQuoteIntentV1 {
             return Err(PmJournalSchemaError::WrongReservationKind);
         }
         let account_scope = scope.account_scope();
+        let profile_matches = matches!(
+            (scope.account_signature_profile(), self.profile),
+            (
+                PmAccountSignatureProfile::EoaType0,
+                PmJournalQuoteProfileV1::PassiveGtcPostOnlyEoa
+            ) | (
+                PmAccountSignatureProfile::ProxyType1,
+                PmJournalQuoteProfileV1::PassiveGtcPostOnlyProxyType1
+            )
+        );
         if self.maker != account_scope.funder().address()
             || self.signer != account_scope.signer().address()
-            || self.maker != self.signer
+            || !profile_matches
         {
             return Err(PmJournalSchemaError::UnsignedIdentityMismatch);
         }
@@ -1049,16 +1323,44 @@ pub(crate) struct PmJournalLineV1(
 );
 
 impl PmJournalLineV1 {
+    /// Legacy V1 test constructor for frozen-byte and negative-envelope
+    /// coverage. Production writers must select the line domain from a fully
+    /// validated scope through [`Self::new_for_scope`].
+    #[cfg(test)]
     pub(crate) const fn new(
         scope: PmJournalFingerprintV1,
         sequence: u64,
         record: PmJournalRecordV1,
     ) -> Self {
-        Self(PmJournalFamily, PmJournalVersion, scope, sequence, record)
+        Self(
+            PmJournalFamily,
+            PmJournalVersion(PM_MUTATION_JOURNAL_VERSION),
+            scope,
+            sequence,
+            record,
+        )
+    }
+
+    pub(crate) const fn new_for_scope(
+        scope: &PmJournalScopeV1,
+        sequence: u64,
+        record: PmJournalRecordV1,
+    ) -> Self {
+        Self(
+            PmJournalFamily,
+            PmJournalVersion(scope.schema_version()),
+            scope.fingerprint(),
+            sequence,
+            record,
+        )
     }
 
     pub(crate) const fn scope(&self) -> PmJournalFingerprintV1 {
         self.2
+    }
+
+    pub(crate) const fn schema_version(&self) -> u16 {
+        self.1.0
     }
 
     pub(crate) const fn sequence(&self) -> u64 {
@@ -1097,14 +1399,14 @@ impl<'de> Deserialize<'de> for PmJournalFamily {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PmJournalVersion;
+struct PmJournalVersion(u16);
 
 impl Serialize for PmJournalVersion {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        serializer.serialize_u16(PM_MUTATION_JOURNAL_VERSION)
+        serializer.serialize_u16(self.0)
     }
 }
 
@@ -1113,10 +1415,10 @@ impl<'de> Deserialize<'de> for PmJournalVersion {
     where
         D: Deserializer<'de>,
     {
-        if u16::deserialize(deserializer)? == PM_MUTATION_JOURNAL_VERSION {
-            Ok(Self)
-        } else {
-            Err(de::Error::custom("unsupported PM mutation journal version"))
+        match u16::deserialize(deserializer)? {
+            PM_MUTATION_JOURNAL_VERSION => Ok(Self(PM_MUTATION_JOURNAL_VERSION)),
+            PM_T2_PROXY_MUTATION_JOURNAL_VERSION => Ok(Self(PM_T2_PROXY_MUTATION_JOURNAL_VERSION)),
+            _ => Err(de::Error::custom("unsupported PM mutation journal version")),
         }
     }
 }
@@ -1135,6 +1437,8 @@ pub enum PmJournalSchemaError {
     WrongScopeDomain,
     #[error("PM journal scope cannot carry authentication or production authority")]
     ForbiddenLiveAuthority,
+    #[error("PM journal account identities contradict its signature profile")]
+    AccountIdentityMismatch,
     #[error("PM journal scope fingerprint does not match its exact descriptor")]
     ScopeFingerprintMismatch,
     #[error("PM journal line scope differs from the expected lease scope")]
@@ -1212,6 +1516,7 @@ pub(super) fn test_scope() -> PmJournalScopeV1 {
         configuration_fingerprint: PmJournalFingerprintV1::from_bytes([0x33; 32]),
         authentication_enabled: false,
         production_authorized: false,
+        account_signature_profile: PmAccountSignatureProfile::EoaType0,
         scope_fingerprint: PmJournalFingerprintV1::from_bytes(ZERO_HASH),
     };
     scope.scope_fingerprint = scope.calculate_fingerprint().expect("test fingerprint");
@@ -1220,10 +1525,141 @@ pub(super) fn test_scope() -> PmJournalScopeV1 {
 }
 
 #[cfg(test)]
+pub(super) fn test_proxy_scope() -> PmJournalScopeV1 {
+    let signer = EvmAddress::from_bytes([0x11; 20]).expect("test signer");
+    let funder = EvmAddress::from_bytes([0x44; 20]).expect("test proxy funder");
+    let mut scope = test_scope();
+    scope.schema_version = PM_T2_PROXY_MUTATION_JOURNAL_VERSION;
+    scope.account_scope = PmAccountScope::new(
+        scope.account_scope.environment(),
+        scope.account_scope.chain(),
+        reap_pm_core::PmSignerId::new(signer),
+        reap_pm_core::PmFunderId::new(funder),
+        scope.account_scope.handle(),
+    );
+    scope.account_signature_profile = PmAccountSignatureProfile::ProxyType1;
+    scope.scope_fingerprint = scope.calculate_fingerprint().expect("proxy fingerprint");
+    scope.validate().expect("valid proxy test scope");
+    scope
+}
+
+#[cfg(test)]
 mod tests {
     use reap_pm_core::{PmFillId, PmVenueOrderId, PmVenueOrderKey};
 
     use super::*;
+
+    const LEGACY_V1_HEADER_LINE: &str = r#"["reap-pm-mutation-journal",1,"81dd970cea931912b109d39f22d5958667e9ea8040ef0cca2ef0d710309e2ab9",0,{"kind":"header","body":{"scope":{"product":"reap-pm","schema_family":"reap-pm-mutation-journal","schema_version":1,"account_scope":{"environment":"journal-test","chain":137,"signer":"0x1111111111111111111111111111111111111111","funder":"0x1111111111111111111111111111111111111111","handle":7},"configured_instruments":[{"market":"0x2222222222222222222222222222222222222222222222222222222222222222","token":"42"}],"configuration_fingerprint":"3333333333333333333333333333333333333333333333333333333333333333","authentication_enabled":false,"production_authorized":false,"scope_fingerprint":"81dd970cea931912b109d39f22d5958667e9ea8040ef0cca2ef0d710309e2ab9"}}}]"#;
+
+    #[test]
+    fn legacy_v1_scope_fingerprint_and_full_header_line_bytes_are_frozen() {
+        let scope = test_scope();
+        assert_eq!(
+            scope.fingerprint().to_string(),
+            "81dd970cea931912b109d39f22d5958667e9ea8040ef0cca2ef0d710309e2ab9"
+        );
+        let line = PmJournalLineV1::new_for_scope(
+            &scope,
+            0,
+            PmJournalRecordV1::Header(PmJournalHeaderV1::new(scope.clone())),
+        );
+        assert_eq!(serde_json::to_string(&line).unwrap(), LEGACY_V1_HEADER_LINE);
+        let decoded: PmJournalLineV1 = serde_json::from_str(LEGACY_V1_HEADER_LINE).unwrap();
+        assert_eq!(decoded.schema_version(), PM_MUTATION_JOURNAL_VERSION);
+        assert_eq!(decoded.scope(), scope.fingerprint());
+        decoded.record().validate(&scope).unwrap();
+    }
+
+    #[test]
+    fn proxy_scope_uses_the_truthful_v2_profile_domain() {
+        let scope = test_proxy_scope();
+        assert_eq!(scope.schema_version(), PM_T2_PROXY_MUTATION_JOURNAL_VERSION);
+        assert_eq!(
+            scope.account_signature_profile(),
+            PmAccountSignatureProfile::ProxyType1
+        );
+        assert!(!scope.authentication_enabled());
+        assert!(!scope.production_authorized());
+        let line = PmJournalLineV1::new_for_scope(
+            &scope,
+            0,
+            PmJournalRecordV1::Header(PmJournalHeaderV1::new(scope.clone())),
+        );
+        let value = serde_json::to_value(&line).unwrap();
+        assert_eq!(value[1], PM_T2_PROXY_MUTATION_JOURNAL_VERSION);
+        assert_eq!(
+            value[4]["body"]["scope"]["account_signature_profile"],
+            "proxy_type_1"
+        );
+
+        let mut intent = quote(&scope, 1);
+        intent.profile = PmJournalQuoteProfileV1::PassiveGtcPostOnlyProxyType1;
+        intent.validate(&scope).unwrap();
+        intent.profile = PmJournalQuoteProfileV1::PassiveGtcPostOnlyEoa;
+        assert!(matches!(
+            intent.validate(&scope),
+            Err(PmJournalSchemaError::UnsignedIdentityMismatch)
+        ));
+    }
+
+    #[test]
+    fn proxy_v2_truthful_scope_mismatches_do_not_cross_validate() {
+        let expected = test_proxy_scope();
+
+        let mut other_config = expected.clone();
+        other_config.configuration_fingerprint = PmJournalFingerprintV1::from_bytes([0x66; 32]);
+        other_config.scope_fingerprint = other_config.calculate_fingerprint().unwrap();
+        other_config.validate().unwrap();
+
+        let mut other_signer = expected.clone();
+        other_signer.account_scope = PmAccountScope::new(
+            other_signer.account_scope.environment(),
+            other_signer.account_scope.chain(),
+            reap_pm_core::PmSignerId::new(
+                EvmAddress::from_bytes([0x55; 20]).expect("other signer"),
+            ),
+            other_signer.account_scope.funder(),
+            other_signer.account_scope.handle(),
+        );
+        other_signer.scope_fingerprint = other_signer.calculate_fingerprint().unwrap();
+        other_signer.validate().unwrap();
+
+        let mut other_funder = expected.clone();
+        other_funder.account_scope = PmAccountScope::new(
+            other_funder.account_scope.environment(),
+            other_funder.account_scope.chain(),
+            other_funder.account_scope.signer(),
+            reap_pm_core::PmFunderId::new(
+                EvmAddress::from_bytes([0x77; 20]).expect("other funder"),
+            ),
+            other_funder.account_scope.handle(),
+        );
+        other_funder.scope_fingerprint = other_funder.calculate_fingerprint().unwrap();
+        other_funder.validate().unwrap();
+
+        for mismatched in [other_config, other_signer, other_funder] {
+            let header = PmJournalRecordV1::Header(PmJournalHeaderV1::new(mismatched));
+            assert!(matches!(
+                header.validate(&expected),
+                Err(PmJournalSchemaError::ScopeMismatch)
+            ));
+        }
+
+        let mut wrong_version = expected.clone();
+        wrong_version.schema_version = PM_MUTATION_JOURNAL_VERSION;
+        assert!(matches!(
+            wrong_version.validate(),
+            Err(PmJournalSchemaError::WrongScopeDomain)
+        ));
+
+        let mut wrong_profile = expected;
+        wrong_profile.account_signature_profile = PmAccountSignatureProfile::EoaType0;
+        assert!(matches!(
+            wrong_profile.validate(),
+            Err(PmJournalSchemaError::WrongScopeDomain)
+                | Err(PmJournalSchemaError::AccountIdentityMismatch)
+        ));
+    }
 
     #[test]
     fn fill_settlement_v1_is_append_only_and_preserves_existing_spellings() {

@@ -8,7 +8,7 @@ use crate::coordinator::{
     PmHealthMetricKind, PmProductEffect, PmRefreshEffectKind,
 };
 use crate::evidence::PmEvidenceError;
-use crate::journal::{PmJournalFingerprintV1, derive_pm_journal_client_order_from_fingerprint};
+use crate::journal::{PmJournalFingerprintV1, derive_pm_journal_v1_client_order_from_fingerprint};
 
 const VENUE_PREFIX: &str = "phase6-venue-";
 
@@ -170,7 +170,7 @@ impl EffectProjection {
             .first_intent_id
             .saturating_add(self.quote_ordinal.saturating_sub(1));
         self.valid &= correlation == expected_intent;
-        let expected = derive_pm_journal_client_order_from_fingerprint(
+        let expected = derive_pm_journal_v1_client_order_from_fingerprint(
             self.account,
             self.scope_fingerprint,
             expected_intent,

@@ -61,6 +61,13 @@ impl<M> PmAuthenticatedLoopbackProduct<M> {
             schedule,
         } = product;
         let (preparation, _) = fake_effect.split();
+        let expected_account_profile = plan
+            .account_config()
+            .expect("product plan carries account config")
+            .signature_profile();
+        if preparation.account_signature_profile() != expected_account_profile {
+            return Err(PmAuthenticatedLoopbackCompositionError::AccountSignatureProfileMismatch);
+        }
         let expected = plan
             .public_config()
             .expect("product plan carries public config")
@@ -112,4 +119,6 @@ impl<M> PmAuthenticatedLoopbackProduct<M> {
 pub(super) enum PmAuthenticatedLoopbackCompositionError {
     #[error("authenticated loopback public roles do not match the exact product wire scope")]
     PublicScopeMismatch,
+    #[error("authenticated loopback preparation does not match the config-proven account profile")]
+    AccountSignatureProfileMismatch,
 }

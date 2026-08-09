@@ -484,6 +484,7 @@ fn hash_side(hasher: &mut Sha256, value: PmJournalSideV1) {
 fn hash_profile(hasher: &mut Sha256, value: PmJournalQuoteProfileV1) {
     hasher.update([match value {
         PmJournalQuoteProfileV1::PassiveGtcPostOnlyEoa => 0,
+        PmJournalQuoteProfileV1::PassiveGtcPostOnlyProxyType1 => 1,
     }]);
 }
 

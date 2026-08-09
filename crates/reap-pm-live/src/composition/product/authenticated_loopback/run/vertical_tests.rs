@@ -11,7 +11,8 @@ use reap_pm_core::{
     PmQuantity, PmSignedUnits, PmSignerId, PmVenueOrderId, PmVenueOrderKey, U256,
 };
 use reap_pm_live_contracts::{
-    PmAccountConnectivityConfig, PmConnectivityConfig, PmFixedExecutionProfile,
+    PmAccountConnectivityConfig, PmAccountSignatureProfile, PmConnectivityConfig,
+    PmFixedExecutionProfile,
 };
 use reap_pm_state::{
     PmBookFreshness, PmFillFeeState, PmObservedAmount, PmOrderOwnership, PmPositionKnowledge,
@@ -32,7 +33,7 @@ use reap_polymarket_wire::{PmBookParserConfig, PmWireScope};
 use super::super::root::PmAuthenticatedLoopbackProduct;
 use super::super::startup::PmAuthenticatedLoopbackReady;
 use super::loopback_fixture_tests::{
-    ADDRESS, API_KEY, API_SECRET, LoopbackVenue, PASSPHRASE, TEST_KEY,
+    ADDRESS, API_KEY, API_SECRET, LoopbackVenue, PASSPHRASE, PROXY_FUNDER, TEST_KEY,
 };
 use super::{PmAuthenticatedLoopbackRun, PmMutationFinishOutcome, PmMutationStartOutcome};
 use crate::coordinator::PmPreparedMutationKind;
@@ -60,6 +61,28 @@ fn authenticated_config() -> PmConnectivityConfig {
     )
     .expect("vertical account connectivity");
     PmConnectivityConfig::new(public, account).expect("vertical connectivity")
+}
+
+fn proxy_authenticated_config() -> PmConnectivityConfig {
+    let base = crate::evidence::connectivity_config();
+    let base_scope = base.account().account_scope();
+    let signer = EvmAddress::parse(ADDRESS).expect("vertical proxy signer");
+    let funder = EvmAddress::parse(PROXY_FUNDER).expect("vertical proxy funder");
+    let account_scope = PmAccountScope::new(
+        base_scope.environment(),
+        base_scope.chain(),
+        PmSignerId::new(signer),
+        PmFunderId::new(funder),
+        base_scope.handle(),
+    );
+    let public = base.public().clone();
+    let account = PmAccountConnectivityConfig::derive_pm_t2_proxy(
+        &public,
+        account_scope,
+        base.account().account_route(),
+    )
+    .expect("vertical proxy account connectivity");
+    PmConnectivityConfig::new(public, account).expect("vertical proxy connectivity")
 }
 
 fn model(config: &PmConnectivityConfig) -> PmFixtureQuoteModel {
@@ -195,28 +218,61 @@ fn authenticated_root(
         private_epoch,
     )
     .expect("vertical user WS");
-    let preparation = PmFixedMutationPreparation::new(
-        config.account().account_scope(),
-        config.public().instrument(),
-    );
-    let private = PmLoopbackMutationConnectivityOwner::new(
-        private_http,
-        user_ws,
-        config.account().account_scope(),
-        config.public().instrument(),
-        config.account().trading_domain(),
-        preparation.place_profile(),
-        preparation.cancel_purpose(),
-        crate::evidence::loopback_public_observation_grant(config),
-        CredentialSlotId::new("pm-t1-vertical-slot".into()).expect("vertical credential slot"),
-        FixedEoaSigner::bind(EoaPrivateKeyInput::new(TEST_KEY.into()), ADDRESS)
-            .expect("vertical signer"),
-        L2Credentials::bind(
-            ADDRESS,
-            L2CredentialInput::new(API_KEY.into(), API_SECRET.into(), PASSPHRASE.into()),
-        )
-        .expect("vertical credentials"),
+    let account_scope = config.account().account_scope();
+    let instrument = config.public().instrument();
+    let preparation = match config.account().signature_profile() {
+        PmAccountSignatureProfile::EoaType0 => {
+            PmFixedMutationPreparation::new(account_scope, instrument)
+        }
+        PmAccountSignatureProfile::ProxyType1 => {
+            PmFixedMutationPreparation::new_pm_t2_proxy(account_scope, instrument)
+        }
+    };
+    let credential_slot = CredentialSlotId::new(
+        match config.account().signature_profile() {
+            PmAccountSignatureProfile::EoaType0 => "pm-t1-vertical-slot",
+            PmAccountSignatureProfile::ProxyType1 => "pm-t2-proxy-vertical-slot",
+        }
+        .into(),
     )
+    .expect("vertical credential slot");
+    let signer = FixedEoaSigner::bind(EoaPrivateKeyInput::new(TEST_KEY.into()), ADDRESS)
+        .expect("vertical signer");
+    let credentials = L2Credentials::bind(
+        ADDRESS,
+        L2CredentialInput::new(API_KEY.into(), API_SECRET.into(), PASSPHRASE.into()),
+    )
+    .expect("vertical credentials");
+    let private = match config.account().signature_profile() {
+        PmAccountSignatureProfile::EoaType0 => PmLoopbackMutationConnectivityOwner::new(
+            private_http,
+            user_ws,
+            account_scope,
+            instrument,
+            config.account().trading_domain(),
+            preparation.place_profile(),
+            preparation.cancel_purpose(),
+            crate::evidence::loopback_public_observation_grant(config),
+            credential_slot,
+            signer,
+            credentials,
+        ),
+        PmAccountSignatureProfile::ProxyType1 => {
+            PmLoopbackMutationConnectivityOwner::new_pm_t2_proxy(
+                private_http,
+                user_ws,
+                account_scope,
+                instrument,
+                config.account().trading_domain(),
+                preparation.place_profile(),
+                preparation.cancel_purpose(),
+                crate::evidence::loopback_public_observation_grant(config),
+                credential_slot,
+                signer,
+                credentials,
+            )
+        }
+    }
     .expect("vertical mutation connectivity");
     let transport = PmLoopbackMutationConfig::loopback_evidence(
         venue.http_origin(),
@@ -244,7 +300,17 @@ async fn start_authenticated(
     private_epoch: ConnectionEpoch,
 ) -> PmAuthenticatedLoopbackReady<PmFixtureQuoteModel> {
     let config = authenticated_config();
-    authenticated_root(venue, &config, private_epoch)
+    start_authenticated_with_config(venue, directory, capture_name, private_epoch, &config).await
+}
+
+async fn start_authenticated_with_config(
+    venue: &LoopbackVenue,
+    directory: &tempfile::TempDir,
+    capture_name: &str,
+    private_epoch: ConnectionEpoch,
+    config: &PmConnectivityConfig,
+) -> PmAuthenticatedLoopbackReady<PmFixtureQuoteModel> {
+    authenticated_root(venue, config, private_epoch)
         .start(
             directory.path().join(capture_name),
             directory.path().join("goal-f.jsonl"),
@@ -579,9 +645,9 @@ async fn execute_prepared_place(run: &mut PmAuthenticatedLoopbackRun<PmFixtureQu
     }
 }
 
-fn exact_venue_order(order_id: &str) -> PmVenueOrderKey {
+fn exact_venue_order(config: &PmConnectivityConfig, order_id: &str) -> PmVenueOrderKey {
     PmVenueOrderKey::new(
-        authenticated_config().account().account(),
+        config.account().account(),
         PmVenueOrderId::new(order_id).expect("vertical venue order id"),
     )
 }
@@ -740,6 +806,49 @@ fn assert_journals_are_secret_free(directory: &tempfile::TempDir) {
     }
 }
 
+fn assert_journal_profile_domain(
+    directory: &tempfile::TempDir,
+    profile: PmAccountSignatureProfile,
+) {
+    let expected_version = match profile {
+        PmAccountSignatureProfile::EoaType0 => 1,
+        PmAccountSignatureProfile::ProxyType1 => 2,
+    };
+    for (name, scope_path, production_field) in [
+        ("goal-f.jsonl", ["body", "scope"], "production_authorized"),
+        (
+            "authenticated.jsonl",
+            ["header", "scope"],
+            "production_order_entry_authorized",
+        ),
+    ] {
+        let journal =
+            std::fs::read_to_string(directory.path().join(name)).expect("vertical journal text");
+        let header: serde_json::Value = serde_json::from_str(
+            journal
+                .lines()
+                .next()
+                .expect("vertical journal header line"),
+        )
+        .expect("vertical journal header JSON");
+        assert_eq!(header[1], expected_version);
+        let scope = &header[4][scope_path[0]][scope_path[1]];
+        assert!(
+            !scope[production_field]
+                .as_bool()
+                .expect("vertical production-authority flag")
+        );
+        match profile {
+            PmAccountSignatureProfile::EoaType0 => {
+                assert!(scope.get("account_signature_profile").is_none());
+            }
+            PmAccountSignatureProfile::ProxyType1 => {
+                assert_eq!(scope["account_signature_profile"], "proxy_type_1");
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn combined_loopback_fixture_serves_all_fixed_route_families() {
     let venue = LoopbackVenue::start().await;
@@ -816,118 +925,134 @@ fn authenticated_live_cuts_reach_one_goal_f_durable_place_dispatch() {
     });
 }
 
+async fn place_fill_exact_cancel_and_restart_vertical(config: PmConnectivityConfig) {
+    let profile = config.account().signature_profile();
+    let venue = LoopbackVenue::start().await;
+    let directory = tempfile::tempdir().expect("vertical temporary directory");
+    let ready = start_authenticated_with_config(
+        &venue,
+        &directory,
+        "capture-first.jsonl",
+        ConnectionEpoch::new(1),
+        &config,
+    )
+    .await;
+    let mut run = ready.into_run();
+    prepare_live_dependencies(&mut run, &venue, INITIAL_LIVE_DEPENDENCIES).await;
+    let initial_cursor = run
+        .ready
+        .coordinator
+        .current_fill_query_cursor()
+        .expect("initial complete trade cut establishes a cursor");
+
+    schedule_quote(&mut run).await;
+    assert_eq!(venue.request_count("POST /order"), 0);
+    execute_prepared_place(&mut run).await;
+    assert_eq!(venue.request_count("POST /order"), 1);
+    let placed_order = venue.placed_order().expect("accepted place identity");
+    let exact_order = exact_venue_order(&config, &placed_order);
+    {
+        let projection = run.ready.coordinator.private_projection_for_test();
+        let order = projection
+            .orders()
+            .find(|order| order.identity().venue_order_key() == Some(exact_order))
+            .expect("accepted place enters the sole canonical order store");
+        // The authenticated bridge proves local resting ownership and
+        // exact venue identity, but it is not a private order event. The
+        // remote-status projection remains unobserved until WS/REST.
+        assert_eq!(order.status(), None);
+        assert_eq!(order.ownership(), PmOrderOwnership::ProvenOwned);
+    }
+
+    wait_for_partial_fill_and_account_cut(&mut run, &venue, exact_order, initial_cursor).await;
+    let filled_cursor = run
+        .ready
+        .coordinator
+        .current_fill_query_cursor()
+        .expect("post-fill complete cut advances the causal cursor");
+    assert_ne!(filled_cursor, initial_cursor);
+
+    run.drive_controlled_shutdown_safety()
+        .await
+        .expect("controlled shutdown proves exact owned-order safety");
+    assert_eq!(venue.request_count("DELETE /order"), 1);
+    assert_eq!(
+        venue.cancelled_order().as_deref(),
+        Some(placed_order.as_str())
+    );
+    assert_eq!(
+        venue.request_count(&format!("GET /data/order/{placed_order}")),
+        1,
+        "a partially filled accepted cancel is settled only by its exact terminal detail"
+    );
+    let runtime_terminal_order = assert_terminal_semantics(&run, exact_order);
+
+    let stopped = run.shutdown().await.expect("vertical clean shutdown");
+    assert_eq!(stopped.shutdown_effect_counts()[0], 0);
+    assert_journals_are_secret_free(&directory);
+    assert_journal_profile_domain(&directory, profile);
+    let mutation_counts = (
+        venue.request_count("POST /order"),
+        venue.request_count("DELETE /order"),
+    );
+
+    let restarted = start_authenticated_with_config(
+        &venue,
+        &directory,
+        "capture-restart.jsonl",
+        ConnectionEpoch::new(2),
+        &config,
+    )
+    .await;
+    assert_eq!(
+        restarted.goal_f_recovery.authenticated_results().count(),
+        2,
+        "Goal-F restart cross-validates one place and one cancel bridge"
+    );
+    assert_eq!(
+        restarted.authenticated_recovery.classified_results().len(),
+        2,
+        "authenticated restart retains the exact two classified results"
+    );
+    assert_eq!(
+        restarted.coordinator.current_fill_query_cursor(),
+        Some(filled_cursor),
+        "restart seeds the exact causal fill watermark before new reads"
+    );
+    let mut restarted = restarted.into_run();
+    prepare_live_dependencies(&mut restarted, &venue, RESTARTED_LIVE_DEPENDENCIES).await;
+    assert_eq!(
+        assert_terminal_semantics(&restarted, exact_order),
+        runtime_terminal_order,
+        "runtime and restart retain the same optional compacted order projection"
+    );
+    assert_eq!(
+        (
+            venue.request_count("POST /order"),
+            venue.request_count("DELETE /order"),
+        ),
+        mutation_counts,
+        "restart and fresh private cuts never resend either mutation"
+    );
+    restarted
+        .shutdown()
+        .await
+        .expect("restarted vertical closes without mutation resend");
+    assert_journals_are_secret_free(&directory);
+    assert_journal_profile_domain(&directory, profile);
+    venue.shutdown().await;
+}
+
 #[test]
 fn authenticated_place_fill_exact_cancel_and_restart_converge_without_resend() {
     run_large_vertical_test(|| async {
-        let venue = LoopbackVenue::start().await;
-        let directory = tempfile::tempdir().expect("vertical temporary directory");
-        let ready = start_authenticated(
-            &venue,
-            &directory,
-            "capture-first.jsonl",
-            ConnectionEpoch::new(1),
-        )
-        .await;
-        let mut run = ready.into_run();
-        prepare_live_dependencies(&mut run, &venue, INITIAL_LIVE_DEPENDENCIES).await;
-        let initial_cursor = run
-            .ready
-            .coordinator
-            .current_fill_query_cursor()
-            .expect("initial complete trade cut establishes a cursor");
+        place_fill_exact_cancel_and_restart_vertical(authenticated_config()).await;
+    });
+}
 
-        schedule_quote(&mut run).await;
-        assert_eq!(venue.request_count("POST /order"), 0);
-        execute_prepared_place(&mut run).await;
-        assert_eq!(venue.request_count("POST /order"), 1);
-        let placed_order = venue.placed_order().expect("accepted place identity");
-        let exact_order = exact_venue_order(&placed_order);
-        {
-            let projection = run.ready.coordinator.private_projection_for_test();
-            let order = projection
-                .orders()
-                .find(|order| order.identity().venue_order_key() == Some(exact_order))
-                .expect("accepted place enters the sole canonical order store");
-            // The authenticated bridge proves local resting ownership and
-            // exact venue identity, but it is not a private order event. The
-            // remote-status projection remains unobserved until WS/REST.
-            assert_eq!(order.status(), None);
-            assert_eq!(order.ownership(), PmOrderOwnership::ProvenOwned);
-        }
-
-        wait_for_partial_fill_and_account_cut(&mut run, &venue, exact_order, initial_cursor).await;
-        let filled_cursor = run
-            .ready
-            .coordinator
-            .current_fill_query_cursor()
-            .expect("post-fill complete cut advances the causal cursor");
-        assert_ne!(filled_cursor, initial_cursor);
-
-        run.drive_controlled_shutdown_safety()
-            .await
-            .expect("controlled shutdown proves exact owned-order safety");
-        assert_eq!(venue.request_count("DELETE /order"), 1);
-        assert_eq!(
-            venue.cancelled_order().as_deref(),
-            Some(placed_order.as_str())
-        );
-        assert_eq!(
-            venue.request_count(&format!("GET /data/order/{placed_order}")),
-            1,
-            "a partially filled accepted cancel is settled only by its exact terminal detail"
-        );
-        let runtime_terminal_order = assert_terminal_semantics(&run, exact_order);
-
-        let stopped = run.shutdown().await.expect("vertical clean shutdown");
-        assert_eq!(stopped.shutdown_effect_counts()[0], 0);
-        assert_journals_are_secret_free(&directory);
-        let mutation_counts = (
-            venue.request_count("POST /order"),
-            venue.request_count("DELETE /order"),
-        );
-
-        let restarted = start_authenticated(
-            &venue,
-            &directory,
-            "capture-restart.jsonl",
-            ConnectionEpoch::new(2),
-        )
-        .await;
-        assert_eq!(
-            restarted.goal_f_recovery.authenticated_results().count(),
-            2,
-            "Goal-F restart cross-validates one place and one cancel bridge"
-        );
-        assert_eq!(
-            restarted.authenticated_recovery.classified_results().len(),
-            2,
-            "authenticated restart retains the exact two classified results"
-        );
-        assert_eq!(
-            restarted.coordinator.current_fill_query_cursor(),
-            Some(filled_cursor),
-            "restart seeds the exact causal fill watermark before new reads"
-        );
-        let mut restarted = restarted.into_run();
-        prepare_live_dependencies(&mut restarted, &venue, RESTARTED_LIVE_DEPENDENCIES).await;
-        assert_eq!(
-            assert_terminal_semantics(&restarted, exact_order),
-            runtime_terminal_order,
-            "runtime and restart retain the same optional compacted order projection"
-        );
-        assert_eq!(
-            (
-                venue.request_count("POST /order"),
-                venue.request_count("DELETE /order"),
-            ),
-            mutation_counts,
-            "restart and fresh private cuts never resend either mutation"
-        );
-        restarted
-            .shutdown()
-            .await
-            .expect("restarted vertical closes without mutation resend");
-        assert_journals_are_secret_free(&directory);
-        venue.shutdown().await;
+#[test]
+fn pm_t2_proxy_place_fill_exact_cancel_and_restart_converge_without_resend() {
+    run_large_vertical_test(|| async {
+        place_fill_exact_cancel_and_restart_vertical(proxy_authenticated_config()).await;
     });
 }

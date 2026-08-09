@@ -264,6 +264,8 @@ fn validate_connectivity_binding(
     if binding.account() != config.account().account_scope()
         || binding.instrument() != config.account().instrument()
         || binding.trading_domain() != config.account().trading_domain()
+        || binding.signature_profile().value()
+            != config.account().signature_profile().signature_type()
         || wire_scope.condition() != expected.condition()
         || wire_scope.market() != expected.market()
         || wire_scope.token() != expected.outcome().token()

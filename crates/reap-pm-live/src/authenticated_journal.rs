@@ -348,8 +348,8 @@ impl PmAuthenticatedMutationJournal {
             .await
             .map_err(map_writer_error)?;
         if empty {
-            let header = PmAuthenticatedJournalLineV1::new(
-                expected_scope.fingerprint(),
+            let header = PmAuthenticatedJournalLineV1::new_for_scope(
+                &expected_scope,
                 0,
                 PmAuthenticatedJournalRecordV1::Header(PmAuthenticatedJournalHeaderV1::new(
                     expected_scope.clone(),
@@ -584,8 +584,8 @@ impl PmAuthenticatedMutationJournal {
             .sink()
             .try_reserve_durable()
             .map_err(map_enqueue_error)?;
-        let receipt = reservation.commit(PmAuthenticatedJournalLineV1::new(
-            self.scope.fingerprint(),
+        let receipt = reservation.commit(PmAuthenticatedJournalLineV1::new_for_scope(
+            &self.scope,
             sequence,
             record,
         ));

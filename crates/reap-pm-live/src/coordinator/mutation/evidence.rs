@@ -36,6 +36,7 @@ impl PmMutationOwner {
             config.account().expected_metadata(),
         )?;
         let instrument_id = config.account().instrument_id();
+        let account_signature_profile = config.account().signature_profile();
         if private.account_scope() != scope.account_scope()
             || private.instrument() != config.account().instrument()
             || preparation.account_scope() != scope.account_scope()
@@ -47,6 +48,7 @@ impl PmMutationOwner {
         Ok((
             Self {
                 scope: scope.clone(),
+                account_signature_profile,
                 instrument_scope,
                 instrument_id,
                 private,

@@ -12,7 +12,7 @@ use crate::journal::schema::{
     PmJournalFillOccurrenceV1, PmJournalFillRoleV1, PmJournalFillSettlementV1,
     PmJournalFillSourceV1, PmJournalFillV1, PmJournalFillWatermarkV1, PmJournalFingerprintV1,
     PmJournalHeaderV1, PmJournalPlaceRejectReasonV1, PmJournalPlaceResultV1,
-    PmJournalQuoteProfileV1, derive_pm_journal_client_order, test_scope,
+    PmJournalQuoteProfileV1, derive_pm_journal_client_order, test_proxy_scope, test_scope,
 };
 
 mod negative;
@@ -46,7 +46,14 @@ fn quote(
         quantity,
         reserved_collateral,
         reserved_outcome,
-        profile: PmJournalQuoteProfileV1::PassiveGtcPostOnlyEoa,
+        profile: match scope.account_signature_profile() {
+            reap_pm_live_contracts::PmAccountSignatureProfile::EoaType0 => {
+                PmJournalQuoteProfileV1::PassiveGtcPostOnlyEoa
+            }
+            reap_pm_live_contracts::PmAccountSignatureProfile::ProxyType1 => {
+                PmJournalQuoteProfileV1::PassiveGtcPostOnlyProxyType1
+            }
+        },
         metadata_revision: 1,
         book_revision: 2,
         model_revision: 3,
@@ -205,7 +212,7 @@ fn append_line(
 ) {
     serde_json::to_writer(
         &mut *bytes,
-        &PmJournalLineV1::new(scope.fingerprint(), sequence, record),
+        &PmJournalLineV1::new_for_scope(scope, sequence, record),
     )
     .expect("encode journal line");
     bytes.push(b'\n');
@@ -217,6 +224,63 @@ fn acknowledgement_fill_bound_matches_the_adapter_contract() {
         MAX_PM_ACKNOWLEDGEMENT_FILL_LEGS,
         reap_polymarket_adapter::MAX_PM_FAKE_ACK_FILL_LEGS
     );
+}
+
+#[test]
+fn proxy_v2_place_and_exact_cancel_records_recover_in_their_own_domain() {
+    let scope = test_proxy_scope();
+    let intent = quote(&scope, 1, PmOrderSide::Buy, "1");
+    let venue = venue_order(&scope, "proxy-order");
+    let mut bytes = Vec::new();
+    append_line(
+        &mut bytes,
+        &scope,
+        0,
+        PmJournalRecordV1::Header(PmJournalHeaderV1::new(scope.clone())),
+    );
+    append_line(
+        &mut bytes,
+        &scope,
+        1,
+        PmJournalRecordV1::QuoteIntent(intent),
+    );
+    append_line(
+        &mut bytes,
+        &scope,
+        2,
+        PmJournalRecordV1::PlaceResult(resting(intent, venue)),
+    );
+    append_line(
+        &mut bytes,
+        &scope,
+        3,
+        PmJournalRecordV1::CancelIntent(PmJournalCancelIntentV1 {
+            client_order: intent.client_order,
+            venue_order: venue,
+            reason: PmJournalCancelReasonV1::SafetyHalt,
+        }),
+    );
+    append_line(
+        &mut bytes,
+        &scope,
+        4,
+        PmJournalRecordV1::CancelResult(PmJournalCancelResultV1 {
+            client_order: intent.client_order,
+            venue_order: venue,
+            outcome: PmJournalCancelOutcomeV1::Accepted,
+            reject_reason: None,
+        }),
+    );
+
+    let recovery = recover_lines(&mut Cursor::new(bytes), &scope).expect("recover proxy v2");
+    assert_eq!(recovery.record_count(), 5);
+    assert_eq!(recovery.last_sequence(), 4);
+    assert_eq!(
+        recovery.scope().account_signature_profile(),
+        reap_pm_live_contracts::PmAccountSignatureProfile::ProxyType1
+    );
+    assert!(!recovery.scope().authentication_enabled());
+    assert!(!recovery.scope().production_authorized());
 }
 
 #[test]

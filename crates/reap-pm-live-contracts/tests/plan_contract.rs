@@ -7,11 +7,12 @@ use reap_pm_core::{
     PmSpenderRequirement, PmTick, PmTokenHandle, PmTokenId, U256,
 };
 use reap_pm_live_contracts::{
-    ConstructedRoleBinding, PmAccountConnectivityConfig, PmCapabilityLane,
-    PmCapabilityRequirementId, PmCompositionRoot, PmConnectionRoute, PmConnectivityConfig,
-    PmConnectivityConfigError, PmConnectivityPlan, PmFixedExecutionProfile, PmPlanError,
-    PmPlanOwner, PmPlanRequirementId, PmPublicConnectivityConfig, PmReadinessDependency,
-    PmRequirementConsumer, PmRequirementOrigin, PmRequirementScope, PmRoleKind,
+    ConstructedRoleBinding, PmAccountConnectivityConfig, PmAccountSignatureProfile,
+    PmCapabilityLane, PmCapabilityRequirementId, PmCompositionRoot, PmConnectionRoute,
+    PmConnectivityConfig, PmConnectivityConfigError, PmConnectivityPlan, PmFixedExecutionProfile,
+    PmPlanError, PmPlanOwner, PmPlanRequirementId, PmPublicConnectivityConfig,
+    PmReadinessDependency, PmRequirementConsumer, PmRequirementOrigin, PmRequirementScope,
+    PmRoleKind,
 };
 use reap_pm_strategy::PmModelInputRequirements;
 
@@ -814,6 +815,85 @@ fn fixed_account_profile_rejects_wrong_chain_and_split_signer_funder() {
     assert_eq!(
         PmAccountConnectivityConfig::derive_goal_f(config.public(), split, account.account_route(),),
         Err(PmConnectivityConfigError::SignerFunderMismatch)
+    );
+}
+
+#[test]
+fn pm_t2_proxy_profile_is_explicit_and_preserves_the_checked_public_contract() {
+    let (goal_f, _, _) = fixture();
+    let goal_f_account = goal_f.account();
+    let signer = EvmAddress::from_bytes([5; 20]).unwrap();
+    let funder = EvmAddress::from_bytes([6; 20]).unwrap();
+    let proxy_scope = PmAccountScope::new(
+        goal_f_account.account_scope().environment(),
+        PmChainId::new(137).unwrap(),
+        PmSignerId::new(signer),
+        PmFunderId::new(funder),
+        goal_f_account.account(),
+    );
+    let proxy = PmAccountConnectivityConfig::derive_pm_t2_proxy(
+        goal_f.public(),
+        proxy_scope,
+        goal_f_account.account_route(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        goal_f_account.signature_profile(),
+        PmAccountSignatureProfile::EoaType0
+    );
+    assert_eq!(goal_f_account.signature_profile().signature_type(), 0);
+    assert_eq!(
+        proxy.signature_profile(),
+        PmAccountSignatureProfile::ProxyType1
+    );
+    assert_eq!(proxy.signature_profile().signature_type(), 1);
+    assert_eq!(proxy.account_scope(), proxy_scope);
+    assert_eq!(proxy.instrument(), goal_f_account.instrument());
+    assert_eq!(proxy.instrument_id(), goal_f_account.instrument_id());
+    assert_eq!(
+        proxy.expected_metadata(),
+        goal_f_account.expected_metadata()
+    );
+    assert_eq!(proxy.trading_domain(), goal_f_account.trading_domain());
+    assert_eq!(
+        proxy.required_spenders(),
+        goal_f_account.required_spenders()
+    );
+    assert_eq!(proxy.account_route(), goal_f_account.account_route());
+    PmConnectivityConfig::new(goal_f.public().clone(), proxy).unwrap();
+}
+
+#[test]
+fn pm_t2_proxy_profile_rejects_eoa_identity_and_non_polygon_scope() {
+    let (config, _, _) = fixture();
+    let account = config.account();
+
+    assert_eq!(
+        PmAccountConnectivityConfig::derive_pm_t2_proxy(
+            config.public(),
+            account.account_scope(),
+            account.account_route(),
+        ),
+        Err(PmConnectivityConfigError::ProxySignerFunderMatch)
+    );
+
+    let signer = EvmAddress::from_bytes([5; 20]).unwrap();
+    let funder = EvmAddress::from_bytes([6; 20]).unwrap();
+    let wrong_chain = PmAccountScope::new(
+        account.account_scope().environment(),
+        PmChainId::new(1).unwrap(),
+        PmSignerId::new(signer),
+        PmFunderId::new(funder),
+        account.account(),
+    );
+    assert_eq!(
+        PmAccountConnectivityConfig::derive_pm_t2_proxy(
+            config.public(),
+            wrong_chain,
+            account.account_route(),
+        ),
+        Err(PmConnectivityConfigError::WrongGoalFChain)
     );
 }
 

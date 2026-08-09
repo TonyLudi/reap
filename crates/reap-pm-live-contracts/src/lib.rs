@@ -5,8 +5,8 @@ mod plan;
 mod requirements;
 
 pub use config::{
-    PmAccountConnectivityConfig, PmConnectionRoute, PmConnectivityConfig,
-    PmConnectivityConfigError, PmPublicConnectivityConfig,
+    PmAccountConnectivityConfig, PmAccountSignatureProfile, PmConnectionRoute,
+    PmConnectivityConfig, PmConnectivityConfigError, PmPublicConnectivityConfig,
 };
 pub use plan::{
     ConstructedRoleBinding, PmCompositionRoot, PmConnectivityPlan, PmFakeExecutionProfile,

@@ -63,6 +63,7 @@ impl PmMutationOwner {
         Ok(take_prepared_place_dispatch(
             authority,
             self.scope.account_scope(),
+            self.account_signature_profile,
             self.private.instrument(),
             self.instrument_id,
         )?)
@@ -94,6 +95,7 @@ impl PmMutationOwner {
         let dispatch = take_prepared_cancel_dispatch(
             authority,
             self.scope.account_scope(),
+            self.account_signature_profile,
             self.private.instrument(),
             self.instrument_id,
         )?;

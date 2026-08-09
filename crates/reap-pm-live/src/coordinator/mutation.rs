@@ -12,7 +12,7 @@ use reap_pm_core::{
     PmCompleteFillQuery, PmConnectionId, PmEventError, PmFillEvent, PmInstrumentId, PmNumericError,
     PmOrderSalt, PmProductSource, PmVenueOrderKey,
 };
-use reap_pm_live_contracts::PmConnectivityConfig;
+use reap_pm_live_contracts::{PmAccountSignatureProfile, PmConnectivityConfig};
 use reap_pm_state::{
     PmExactReservation, PmOwnedCancelIntent, PmOwnedIntentId, PmOwnedQuoteAdmission,
     PmOwnedQuoteIntent, PmOwnedQuoteSlotKey, PmPreparedFillCompaction, PmPrivateQuoteEvaluation,
@@ -376,6 +376,7 @@ pub enum PmMutationHalt {
 /// prepared dispatch authority.
 pub(crate) struct PmMutationOwner {
     scope: PmJournalScopeV1,
+    account_signature_profile: PmAccountSignatureProfile,
     instrument_scope: PmFixtureInstrumentScope,
     instrument_id: PmInstrumentId,
     private: Box<PmPrivateMonitorRuntime>,
@@ -409,11 +410,13 @@ impl PmMutationOwner {
             config.account().expected_metadata(),
         )?;
         let instrument_id = config.account().instrument_id();
+        let account_signature_profile = config.account().signature_profile();
         if private.account_scope() != scope.account_scope()
             || private.instrument() != config.account().instrument()
             || preparation.account_scope() != scope.account_scope()
             || preparation.instrument() != config.account().instrument()
             || preparation.instrument_id() != instrument_id
+            || preparation.account_signature_profile() != account_signature_profile
         {
             return Err(PmMutationError::CompositionScopeMismatch);
         }
@@ -443,6 +446,7 @@ impl PmMutationOwner {
         Ok((
             Self {
                 scope,
+                account_signature_profile,
                 instrument_scope,
                 instrument_id,
                 private,
@@ -543,6 +547,7 @@ impl PmMutationOwner {
         let client_order = self.scope.client_order_for_intent(intent.value())?;
         let approved = approve_pm_quote(
             self.scope.account_scope(),
+            self.account_signature_profile,
             self.instrument_id,
             intent,
             client_order,
@@ -665,6 +670,7 @@ impl PmMutationOwner {
             .ok_or(PmMutationError::UnknownOwnedOrder)?;
         let approved = approve_pm_cancel(
             self.scope.account_scope(),
+            self.account_signature_profile,
             self.instrument_id,
             order,
             self.preparation.place_profile(),

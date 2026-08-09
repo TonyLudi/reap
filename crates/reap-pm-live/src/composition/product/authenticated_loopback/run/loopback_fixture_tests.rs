@@ -18,6 +18,7 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 pub(super) const TEST_KEY: &str =
     "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 pub(super) const ADDRESS: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+pub(super) const PROXY_FUNDER: &str = "0x4444444444444444444444444444444444444444";
 pub(super) const API_KEY: &str = "00000000-0000-4000-8000-000000000001";
 pub(super) const API_SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 pub(super) const PASSPHRASE: &str = "pm-t1-vertical";
@@ -43,6 +44,7 @@ struct VenueState {
     request_counts: Mutex<BTreeMap<String, usize>>,
     placed_order: Mutex<Option<String>>,
     cancelled_order: Mutex<Option<String>>,
+    maker_address: Mutex<String>,
     partial_fill: Mutex<bool>,
     place_mode: Mutex<Option<MutationFaultMode>>,
     cancel_mode: Mutex<Option<MutationFaultMode>>,
@@ -83,6 +85,7 @@ impl LoopbackVenue {
         let state = Arc::new(VenueState {
             place_mode: Mutex::new(Some(MutationFaultMode::Accepted)),
             cancel_mode: Mutex::new(Some(MutationFaultMode::Accepted)),
+            maker_address: Mutex::new(ADDRESS.to_owned()),
             ..VenueState::default()
         });
         let (shutdown, shutdown_rx) = watch::channel(false);
@@ -161,9 +164,15 @@ impl LoopbackVenue {
         let order = self
             .placed_order()
             .expect("place must precede private fill");
+        let maker = self
+            .state
+            .maker_address
+            .lock()
+            .expect("maker-address lock")
+            .clone();
         *self.state.partial_fill.lock().expect("partial-fill lock") = true;
         self.user_frames
-            .send(user_fill_frame(&order).to_string())
+            .send(user_fill_frame(&order, &maker).to_string())
             .await
             .expect("user WS fixture remains live");
     }
@@ -172,8 +181,14 @@ impl LoopbackVenue {
         let order = self
             .placed_order()
             .expect("place must precede private cancellation");
+        let maker = self
+            .state
+            .maker_address
+            .lock()
+            .expect("maker-address lock")
+            .clone();
         self.user_frames
-            .send(user_cancel_frame(&order).to_string())
+            .send(user_cancel_frame(&order, &maker).to_string())
             .await
             .expect("user WS fixture remains live");
     }
@@ -259,7 +274,12 @@ async fn handle_http(mut stream: TcpStream, state: Arc<VenueState>) {
                     .expect("placed-order lock")
                     .clone()
                     .expect("partial fill retains placed order");
-                trade_page(&order)
+                let maker = state
+                    .maker_address
+                    .lock()
+                    .expect("maker-address lock")
+                    .clone();
+                trade_page(&order, &maker)
             } else {
                 empty_page()
             };
@@ -281,10 +301,15 @@ async fn handle_http(mut stream: TcpStream, state: Arc<VenueState>) {
                 .clone();
             if cancelled.as_deref() == Some(requested) {
                 let partially_filled = *state.partial_fill.lock().expect("partial-fill lock");
+                let maker = state
+                    .maker_address
+                    .lock()
+                    .expect("maker-address lock")
+                    .clone();
                 respond_json(
                     &mut stream,
                     200,
-                    cancelled_order_detail(requested, partially_filled),
+                    cancelled_order_detail(requested, partially_filled, &maker),
                 )
                 .await;
             } else {
@@ -345,6 +370,10 @@ async fn respond_place(
         .await;
         return;
     }
+    *state.maker_address.lock().expect("maker-address lock") = parsed["order"]["maker"]
+        .as_str()
+        .expect("fixed maker address")
+        .to_owned();
     let expected = expected_order_id(&parsed);
     let observed = if mode == MutationFaultMode::ForeignIdentity {
         format!("0x{}", "ef".repeat(32))
@@ -415,14 +444,12 @@ fn expected_order_id(body: &Value) -> String {
     assert_eq!(body["orderType"], "GTC");
     assert_eq!(body["owner"], API_KEY);
     assert_eq!(body["postOnly"], true);
-    assert_eq!(order["maker"], ADDRESS);
     assert_eq!(order["signer"], ADDRESS);
     assert_eq!(order["tokenId"], "123");
     assert_eq!(order["side"], "BUY");
     assert_eq!(order["makerAmount"], "2000000");
     assert_eq!(order["takerAmount"], "5000000");
     assert_eq!(order["expiration"], "0");
-    assert_eq!(order["signatureType"], 0);
     assert!(
         order["signature"]
             .as_str()
@@ -430,7 +457,8 @@ fn expected_order_id(body: &Value) -> String {
         "fixed place must carry one canonical EOA signature"
     );
     let maker_text = order["maker"].as_str().expect("maker text");
-    let maker = EvmAddress::parse(maker_text).expect("maker EOA");
+    let maker = EvmAddress::parse(maker_text).expect("maker address");
+    let signer_address = EvmAddress::parse(ADDRESS).expect("signer EOA");
     let salt = PmOrderSalt::from_u64(order["salt"].as_u64().expect("salt")).expect("valid salt");
     let token = PmTokenId::new(
         U256::from_str(order["tokenId"].as_str().expect("token text")).expect("token U256"),
@@ -446,18 +474,43 @@ fn expected_order_id(body: &Value) -> String {
         .expect("timestamp text")
         .parse::<u64>()
         .expect("timestamp integer");
-    let unsigned = PmUnsignedClobV2Order::new_goal_f(
-        salt,
-        maker,
-        maker,
-        token,
-        side,
-        PmPrice::parse_decimal("0.40").expect("fixed price"),
-        PmQuantity::parse_decimal("5").expect("fixed quantity"),
-        PmTick::parse_decimal("0.01").expect("fixed tick"),
-        PmQuantity::parse_decimal("5").expect("fixed minimum"),
-        timestamp,
-    )
+    let price = PmPrice::parse_decimal("0.40").expect("fixed price");
+    let quantity = PmQuantity::parse_decimal("5").expect("fixed quantity");
+    let tick = PmTick::parse_decimal("0.01").expect("fixed tick");
+    let minimum = PmQuantity::parse_decimal("5").expect("fixed minimum");
+    let unsigned = match order["signatureType"].as_u64().expect("signature type") {
+        0 => {
+            assert_eq!(maker_text, ADDRESS);
+            PmUnsignedClobV2Order::new_goal_f(
+                salt,
+                maker,
+                signer_address,
+                token,
+                side,
+                price,
+                quantity,
+                tick,
+                minimum,
+                timestamp,
+            )
+        }
+        1 => {
+            assert_eq!(maker_text, PROXY_FUNDER);
+            PmUnsignedClobV2Order::new_pm_t2_proxy(
+                salt,
+                maker,
+                signer_address,
+                token,
+                side,
+                price,
+                quantity,
+                tick,
+                minimum,
+                timestamp,
+            )
+        }
+        profile => panic!("unexpected fixed signature profile {profile}"),
+    }
     .expect("fixed unsigned order");
     let signer = FixedEoaSigner::bind(EoaPrivateKeyInput::new(TEST_KEY.into()), ADDRESS)
         .expect("fixture signer");
@@ -637,7 +690,7 @@ fn short_market() -> Value {
         "mts": 0.01,
         "mos": 5,
         "r": {"rates":null},
-        "fd": {"maker":0,"taker":0},
+        "fd": {"r":0.02,"e":2,"to":true},
         "mbf": 0,
         "tbf": 0,
         "ao": true,
@@ -648,7 +701,7 @@ fn short_market() -> Value {
         "rfqe": false,
         "itode": false,
         "ibce": true,
-        "oas": "open",
+        "oas": 0,
         "c": CONDITION,
         "nr": false
     })
@@ -690,7 +743,7 @@ fn balance_allowance(conditional: bool, filled: bool) -> Value {
     })
 }
 
-fn trade_page(order: &str) -> Value {
+fn trade_page(order: &str, maker: &str) -> Value {
     json!({
         "data": [{
             "id": "pm-t1-fill-1",
@@ -704,7 +757,7 @@ fn trade_page(order: &str) -> Value {
             "fee_rate_bps": "0",
             "order_id": order,
             "maker_orders": [],
-            "maker_address": ADDRESS,
+            "maker_address": maker,
             "owner": API_KEY,
             "match_time": "1780449126001",
             "last_update": "1780449126002"
@@ -715,7 +768,7 @@ fn trade_page(order: &str) -> Value {
     })
 }
 
-fn cancelled_order_detail(order: &str, partially_filled: bool) -> Value {
+fn cancelled_order_detail(order: &str, partially_filled: bool, maker: &str) -> Value {
     let size_matched = if partially_filled { "2.5" } else { "0" };
     json!({
         "id": order,
@@ -726,7 +779,7 @@ fn cancelled_order_detail(order: &str, partially_filled: bool) -> Value {
         "size_matched": size_matched,
         "price": "0.40",
         "status": "CANCELED",
-        "maker_address": ADDRESS,
+        "maker_address": maker,
         "owner": API_KEY,
         "expiration": "0",
         "created_at": 1780449126,
@@ -735,7 +788,7 @@ fn cancelled_order_detail(order: &str, partially_filled: bool) -> Value {
     })
 }
 
-fn user_fill_frame(order: &str) -> Value {
+fn user_fill_frame(order: &str, maker: &str) -> Value {
     json!([
             {
                 "event_type": "order",
@@ -747,7 +800,7 @@ fn user_fill_frame(order: &str) -> Value {
                 "size_matched": "2.5",
                 "price": "0.40",
                 "type": "UPDATE",
-                "maker_address": ADDRESS,
+                "maker_address": maker,
                 "expiration": "0",
                 "order_type": "GTC",
                 "outcome": "Yes",
@@ -779,7 +832,7 @@ fn user_fill_frame(order: &str) -> Value {
     ])
 }
 
-fn user_cancel_frame(order: &str) -> Value {
+fn user_cancel_frame(order: &str, maker: &str) -> Value {
     json!({
         "event_type": "order",
         "id": order,
@@ -790,7 +843,7 @@ fn user_cancel_frame(order: &str) -> Value {
         "size_matched": "2.5",
         "price": "0.40",
         "type": "CANCELLATION",
-        "maker_address": ADDRESS,
+        "maker_address": maker,
         "expiration": "0",
         "order_type": "GTC",
         "outcome": "Yes",

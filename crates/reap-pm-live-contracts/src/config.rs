@@ -18,6 +18,8 @@ pub enum PmConnectivityConfigError {
     WrongGoalFChain,
     #[error("the fixed PM profile requires the EOA signer and funder to match")]
     SignerFunderMismatch,
+    #[error("the PM-T2 proxy profile requires distinct signer and funder addresses")]
+    ProxySignerFunderMatch,
     #[error("configured required spender belongs to another chain")]
     SpenderChainMismatch,
     #[error("public and account scopes name different PM instruments")]
@@ -36,6 +38,38 @@ pub enum PmConnectivityConfigError {
     AccountMarketChainMismatch,
     #[error("account allowance spenders differ from the authoritative exact market spender set")]
     RequiredSpenderSetMismatch,
+}
+
+/// Closed Polymarket order-signature identity profile proven by account
+/// connectivity construction.
+///
+/// This is public, non-secret configuration evidence. It does not contain a
+/// signer, credential, or production-order-entry authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PmAccountSignatureProfile {
+    /// The signer is also the order maker/funder (`signatureType = 0`).
+    EoaType0,
+    /// A distinct EOA signs for the proxy maker/funder (`signatureType = 1`).
+    ProxyType1,
+}
+
+impl PmAccountSignatureProfile {
+    #[must_use]
+    pub const fn signature_type(self) -> u8 {
+        match self {
+            Self::EoaType0 => 0,
+            Self::ProxyType1 => 1,
+        }
+    }
+
+    #[must_use]
+    pub fn matches_account_scope(self, account_scope: PmAccountScope) -> bool {
+        let identities_match = account_scope.signer().address() == account_scope.funder().address();
+        match self {
+            Self::EoaType0 => identities_match,
+            Self::ProxyType1 => !identities_match,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -220,6 +254,7 @@ pub struct PmAccountConnectivityConfig {
     instrument_id: PmInstrumentId,
     expected_metadata: PmMarketMetadata,
     trading_domain: PmGoalFTradingDomain,
+    signature_profile: PmAccountSignatureProfile,
     account_scope: PmAccountScope,
     account_route: PmConnectionRoute,
     required_spenders: [PmSpenderId; 2],
@@ -234,11 +269,51 @@ impl PmAccountConnectivityConfig {
         account_scope: PmAccountScope,
         account_route: PmConnectionRoute,
     ) -> Result<Self, PmConnectivityConfigError> {
+        Self::derive_checked(
+            public,
+            account_scope,
+            account_route,
+            PmAccountSignatureProfile::EoaType0,
+        )
+    }
+
+    /// Derives the PM-T2 legacy proxy account profile from the same checked
+    /// public market contract as Goal F.
+    ///
+    /// `PmAccountScope` already makes both EVM identities nonzero. This
+    /// constructor additionally requires Polygon and a distinct EOA signer
+    /// and proxy maker/funder, closing the account to `signatureType = 1`.
+    pub fn derive_pm_t2_proxy(
+        public: &PmPublicConnectivityConfig,
+        account_scope: PmAccountScope,
+        account_route: PmConnectionRoute,
+    ) -> Result<Self, PmConnectivityConfigError> {
+        Self::derive_checked(
+            public,
+            account_scope,
+            account_route,
+            PmAccountSignatureProfile::ProxyType1,
+        )
+    }
+
+    fn derive_checked(
+        public: &PmPublicConnectivityConfig,
+        account_scope: PmAccountScope,
+        account_route: PmConnectionRoute,
+        signature_profile: PmAccountSignatureProfile,
+    ) -> Result<Self, PmConnectivityConfigError> {
         if account_scope.chain().value() != 137 {
             return Err(PmConnectivityConfigError::WrongGoalFChain);
         }
-        if account_scope.signer().address() != account_scope.funder().address() {
-            return Err(PmConnectivityConfigError::SignerFunderMismatch);
+        if !signature_profile.matches_account_scope(account_scope) {
+            return Err(match signature_profile {
+                PmAccountSignatureProfile::EoaType0 => {
+                    PmConnectivityConfigError::SignerFunderMismatch
+                }
+                PmAccountSignatureProfile::ProxyType1 => {
+                    PmConnectivityConfigError::ProxySignerFunderMatch
+                }
+            });
         }
         if !matches!(
             account_route.source(),
@@ -260,6 +335,7 @@ impl PmAccountConnectivityConfig {
             instrument_id: public.polymarket_instrument_id(),
             expected_metadata: public.expected_metadata(),
             trading_domain: public.trading_domain(),
+            signature_profile,
             account_scope,
             account_route,
             required_spenders,
@@ -284,6 +360,11 @@ impl PmAccountConnectivityConfig {
     #[must_use]
     pub const fn trading_domain(&self) -> PmGoalFTradingDomain {
         self.trading_domain
+    }
+
+    #[must_use]
+    pub const fn signature_profile(&self) -> PmAccountSignatureProfile {
+        self.signature_profile
     }
 
     #[must_use]

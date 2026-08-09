@@ -1,22 +1,53 @@
 use std::io::Cursor;
 
-use reap_pm_core::{PmClientOrderId, PmClientOrderKey, PmVenueOrderId, PmVenueOrderKey};
+use reap_pm_core::{
+    EvmAddress, PmAccountScope, PmClientOrderId, PmClientOrderKey, PmFunderId, PmVenueOrderId,
+    PmVenueOrderKey,
+};
+use reap_pm_live_contracts::{
+    PmAccountConnectivityConfig, PmAccountSignatureProfile, PmConnectivityConfig,
+};
 
 use super::*;
 use crate::authenticated_journal::recovery::{
     PmAuthenticatedJournalRecoveryError, recover_lines, recover_pm_authenticated_journal,
 };
 use crate::authenticated_journal::schema::{
-    PM_AUTHENTICATED_JOURNAL_FAMILY, PmAuthenticatedCancelPreparedV1,
+    PM_AUTHENTICATED_JOURNAL_FAMILY, PM_AUTHENTICATED_JOURNAL_VERSION,
+    PM_T2_PROXY_AUTHENTICATED_JOURNAL_VERSION, PmAuthenticatedCancelPreparedV1,
     PmAuthenticatedCancelResultKindV1, PmAuthenticatedCancelResultV1, PmAuthenticatedCommitmentV1,
     PmAuthenticatedCoordinatorIdentityV1, PmAuthenticatedJournalHeaderV1,
     PmAuthenticatedJournalLineV1, PmAuthenticatedPlacePreparedV1, PmAuthenticatedPlaceResultKindV1,
-    PmAuthenticatedPlaceResultV1, test_scope, test_scope_with_credential_slot,
+    PmAuthenticatedPlaceResultV1, test_proxy_scope, test_proxy_scope_with_identities, test_scope,
+    test_scope_with_credential_slot,
 };
 
 const EXPECTED_ORDER_ID: &str =
     "0x5555555555555555555555555555555555555555555555555555555555555555";
 const L2_TIMESTAMP: u64 = 1_760_000_000;
+const FROZEN_PRE_PM_T2_V1_HEADER_LINE: &str = concat!(
+    r#"["reap-pm-authenticated-mutation-journal",1,"1ffc7aed927722e9192043ba31bb3f3dbd77154790543c26e2c40ac8f7b43ff4",0,{"header":{"scope":{"product":"reap-pm","schema_family":"reap-pm-authenticated-mutation-journal","schema_version":1,"account_scope":{"environment":"authenticated-journal-test","chain":137,"signer":"0x1111111111111111111111111111111111111111","funder":"0x1111111111111111111111111111111111111111","handle":9},"configured_instrument":{"market":"0x2222222222222222222222222222222222222222222222222222222222222222","token":"42"},"configuration_fingerprint":"3333333333333333333333333333333333333333333333333333333333333333","credential_slot_fingerprint":"4444444444444444444444444444444444444444444444444444444444444444","production_order_entry_authorized":false,"scope_fingerprint":"1ffc7aed927722e9192043ba31bb3f3dbd77154790543c26e2c40ac8f7b43ff4"}}}]"#,
+    "\n",
+);
+
+fn proxy_connectivity_config() -> PmConnectivityConfig {
+    let eoa = crate::evidence::connectivity_config();
+    let eoa_scope = eoa.account().account_scope();
+    let proxy_scope = PmAccountScope::new(
+        eoa_scope.environment(),
+        eoa_scope.chain(),
+        eoa_scope.signer(),
+        PmFunderId::new(EvmAddress::from_bytes([0x77; 20]).expect("proxy funder")),
+        eoa_scope.handle(),
+    );
+    let proxy = PmAccountConnectivityConfig::derive_pm_t2_proxy(
+        eoa.public(),
+        proxy_scope,
+        eoa.account().account_route(),
+    )
+    .expect("PM-T2 proxy account config");
+    PmConnectivityConfig::new(eoa.public().clone(), proxy).expect("PM-T2 proxy product config")
+}
 
 fn coordinator(scope: &PmAuthenticatedJournalScopeV1) -> PmAuthenticatedCoordinatorIdentityV1 {
     PmAuthenticatedCoordinatorIdentityV1::new(
@@ -66,7 +97,7 @@ fn append(
 ) {
     serde_json::to_writer(
         &mut *bytes,
-        &PmAuthenticatedJournalLineV1::new(scope.fingerprint(), sequence, record),
+        &PmAuthenticatedJournalLineV1::new_for_scope(scope, sequence, record),
     )
     .expect("encode journal line");
     bytes.push(b'\n');
@@ -935,6 +966,11 @@ fn v1_scope_bytes_roundtrip_and_bind_the_explicit_credential_slot() {
     assert_eq!(reencoded, exact);
 
     let text = String::from_utf8(exact.clone()).expect("header UTF-8");
+    assert_eq!(text, FROZEN_PRE_PM_T2_V1_HEADER_LINE);
+    assert!(text.starts_with(&format!(
+        "[\"{PM_AUTHENTICATED_JOURNAL_FAMILY}\",{PM_AUTHENTICATED_JOURNAL_VERSION},"
+    )));
+    assert!(!text.contains("account_signature_profile"));
     assert!(text.contains(&format!(
         "\"credential_slot_fingerprint\":\"{}\"",
         "44".repeat(32)
@@ -945,6 +981,193 @@ fn v1_scope_bytes_roundtrip_and_bind_the_explicit_credential_slot() {
     assert!(matches!(
         recover_lines(&mut Cursor::new(exact), &changed_scope),
         Err(PmAuthenticatedJournalRecoveryError::ScopeMismatch)
+    ));
+}
+
+#[test]
+fn authenticated_scope_version_and_profile_are_derived_only_from_checked_config() {
+    let eoa_config = crate::evidence::connectivity_config();
+    let proxy_config = proxy_connectivity_config();
+    let eoa = PmAuthenticatedJournalScopeV1::from_config(&eoa_config, [0x44; 32])
+        .expect("EOA authenticated scope");
+    let proxy = PmAuthenticatedJournalScopeV1::from_config(&proxy_config, [0x44; 32])
+        .expect("proxy authenticated scope");
+
+    assert_eq!(eoa.schema_version(), PM_AUTHENTICATED_JOURNAL_VERSION);
+    assert_eq!(
+        eoa.account_signature_profile(),
+        PmAccountSignatureProfile::EoaType0
+    );
+    assert_eq!(
+        proxy.schema_version(),
+        PM_T2_PROXY_AUTHENTICATED_JOURNAL_VERSION
+    );
+    assert_eq!(
+        proxy.account_signature_profile(),
+        PmAccountSignatureProfile::ProxyType1
+    );
+    assert_eq!(
+        eoa.configuration_fingerprint(),
+        proxy.configuration_fingerprint(),
+        "the public market/config identity is intentionally shared"
+    );
+    assert_ne!(eoa.fingerprint(), proxy.fingerprint());
+}
+
+#[test]
+fn proxy_scope_uses_truthful_v2_domain_and_roundtrips_exactly() {
+    let scope = test_proxy_scope();
+    assert_eq!(
+        scope.account_signature_profile(),
+        PmAccountSignatureProfile::ProxyType1
+    );
+    assert_ne!(
+        scope.account_scope().signer().address(),
+        scope.account_scope().funder().address()
+    );
+
+    let mut bytes = Vec::new();
+    header(&mut bytes, &scope);
+    append(
+        &mut bytes,
+        &scope,
+        1,
+        PmAuthenticatedJournalRecordV1::PlacePrepared(place_prepared(&scope)),
+    );
+    append(
+        &mut bytes,
+        &scope,
+        2,
+        PmAuthenticatedJournalRecordV1::CancelPrepared(cancel_prepared(&scope)),
+    );
+    let exact = bytes.clone();
+    let text = String::from_utf8(exact.clone()).expect("proxy journal UTF-8");
+    assert!(text.starts_with(&format!(
+        "[\"{PM_AUTHENTICATED_JOURNAL_FAMILY}\",{PM_T2_PROXY_AUTHENTICATED_JOURNAL_VERSION},"
+    )));
+    assert!(text.contains("\"account_signature_profile\":\"proxy_type_1\""));
+    assert!(text.contains("\"production_order_entry_authorized\":false"));
+
+    let recovery = recover_lines(&mut Cursor::new(exact.clone()), &scope)
+        .expect("recover proxy v2 prepared tail");
+    assert_eq!(recovery.prepared_count(), 2);
+    assert_eq!(recovery.prepared_without_authorization_count(), 2);
+
+    let mut reencoded = Vec::new();
+    for line in exact.split_inclusive(|byte| *byte == b'\n') {
+        let decoded: PmAuthenticatedJournalLineV1 =
+            serde_json::from_slice(&line[..line.len() - 1]).expect("decode proxy v2 line");
+        serde_json::to_writer(&mut reencoded, &decoded).expect("re-encode proxy v2 line");
+        reencoded.push(b'\n');
+    }
+    assert_eq!(reencoded, exact);
+}
+
+#[test]
+fn proxy_v2_line_version_and_profile_mismatches_reject() {
+    let scope = test_proxy_scope();
+    let mut bytes = Vec::new();
+    header(&mut bytes, &scope);
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes[..bytes.len() - 1]).expect("proxy header JSON");
+
+    let mut wrong_line_version = value.clone();
+    wrong_line_version[1] = serde_json::json!(PM_AUTHENTICATED_JOURNAL_VERSION);
+    let mut wrong_line_version =
+        serde_json::to_vec(&wrong_line_version).expect("wrong line version JSON");
+    wrong_line_version.push(b'\n');
+    assert!(matches!(
+        recover_lines(&mut Cursor::new(wrong_line_version), &scope),
+        Err(PmAuthenticatedJournalRecoveryError::ScopeMismatch)
+    ));
+
+    let mut wrong_scope_version = value.clone();
+    wrong_scope_version[4]["header"]["scope"]["schema_version"] =
+        serde_json::json!(PM_AUTHENTICATED_JOURNAL_VERSION);
+    let mut wrong_scope_version =
+        serde_json::to_vec(&wrong_scope_version).expect("wrong scope version JSON");
+    wrong_scope_version.push(b'\n');
+    assert!(matches!(
+        recover_lines(&mut Cursor::new(wrong_scope_version), &scope),
+        Err(PmAuthenticatedJournalRecoveryError::Schema(
+            PmAuthenticatedJournalSchemaError::WrongScopeDomain
+        ))
+    ));
+
+    let mut wrong_profile = value;
+    wrong_profile[4]["header"]["scope"]["account_signature_profile"] =
+        serde_json::json!("eoa_type_0");
+    let mut wrong_profile = serde_json::to_vec(&wrong_profile).expect("wrong profile JSON");
+    wrong_profile.push(b'\n');
+    assert!(matches!(
+        recover_lines(&mut Cursor::new(wrong_profile), &scope),
+        Err(PmAuthenticatedJournalRecoveryError::Json(_))
+    ));
+}
+
+#[test]
+fn recovery_rejects_cross_profile_signer_funder_and_configuration_scopes() {
+    let scope = test_proxy_scope();
+    let mut bytes = Vec::new();
+    header(&mut bytes, &scope);
+
+    for mismatched in [
+        test_scope(),
+        test_proxy_scope_with_identities([0x13; 20], [0x12; 20], [0x33; 32]),
+        test_proxy_scope_with_identities([0x11; 20], [0x13; 20], [0x33; 32]),
+        test_proxy_scope_with_identities([0x11; 20], [0x12; 20], [0x34; 32]),
+    ] {
+        assert!(matches!(
+            recover_lines(&mut Cursor::new(bytes.clone()), &mismatched),
+            Err(PmAuthenticatedJournalRecoveryError::ScopeMismatch)
+        ));
+    }
+}
+
+#[test]
+fn proxy_scope_profile_and_split_identities_are_fingerprint_bound() {
+    let scope = test_proxy_scope();
+    let mut bytes = Vec::new();
+    header(&mut bytes, &scope);
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes[..bytes.len() - 1]).expect("proxy header JSON");
+
+    for field in ["account_scope", "configuration_fingerprint"] {
+        let mut changed = value.clone();
+        let header_scope = changed[4]["header"]["scope"]
+            .as_object_mut()
+            .expect("proxy scope object");
+        match field {
+            "account_scope" => {
+                header_scope["account_scope"]["funder"] =
+                    serde_json::json!("0x1313131313131313131313131313131313131313");
+            }
+            "configuration_fingerprint" => {
+                header_scope["configuration_fingerprint"] =
+                    serde_json::Value::String("34".repeat(32));
+            }
+            _ => unreachable!(),
+        }
+        let mut changed_bytes = serde_json::to_vec(&changed).expect("changed proxy header");
+        changed_bytes.push(b'\n');
+        assert!(matches!(
+            recover_lines(&mut Cursor::new(changed_bytes), &scope),
+            Err(PmAuthenticatedJournalRecoveryError::Schema(
+                PmAuthenticatedJournalSchemaError::ScopeFingerprintMismatch
+            ))
+        ));
+    }
+
+    let mut production = serde_json::from_slice::<serde_json::Value>(&bytes[..bytes.len() - 1])
+        .expect("proxy header JSON");
+    production[4]["header"]["scope"]["production_order_entry_authorized"] = serde_json::json!(true);
+    let mut production = serde_json::to_vec(&production).expect("production header JSON");
+    production.push(b'\n');
+    assert!(matches!(
+        recover_lines(&mut Cursor::new(production), &scope),
+        Err(PmAuthenticatedJournalRecoveryError::Schema(
+            PmAuthenticatedJournalSchemaError::ProductionAuthorityForbidden
+        ))
     ));
 }
 

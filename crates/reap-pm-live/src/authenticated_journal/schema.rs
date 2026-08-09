@@ -3,7 +3,7 @@ use std::fmt;
 use reap_pm_core::{
     PmAccountHandle, PmAccountScope, PmClientOrderKey, PmInstrumentId, PmVenueOrderKey,
 };
-use reap_pm_live_contracts::PmConnectivityConfig;
+use reap_pm_live_contracts::{PmAccountSignatureProfile, PmConnectivityConfig};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -14,15 +14,22 @@ pub(super) const PM_AUTHENTICATED_JOURNAL_FAMILY: &str = "reap-pm-authenticated-
 // digest. Ambiguous/out-of-profile results may carry no observed identity or
 // the exact contradictory identity returned by the venue. Conclusive
 // place/cancel outcomes bind the observed identity to the signed/fixed
-// expected identity. No deployed v1 artifact exists and no migration is
-// required; pre-freeze local records fail closed through deny_unknown_fields.
+// expected identity. V1 remains the frozen EOA domain and is accepted without
+// migration; PM-T2 proxy scopes use the separately fingerprinted V2 domain.
 pub(super) const PM_AUTHENTICATED_JOURNAL_VERSION: u16 = 1;
+// Offline/loopback PM-T2 evidence only. V2 intentionally has no reviewed
+// live-authorization or take-once preflight digest. A future live trial must
+// use a new version/domain (or a dedicated controlled-trial family) rather
+// than reinterpreting these records as production authority.
+pub(super) const PM_T2_PROXY_AUTHENTICATED_JOURNAL_VERSION: u16 = 2;
 pub(super) const MAX_PM_AUTHENTICATED_JOURNAL_LINE_BYTES: usize = 4 * 1_024;
 pub(super) const MAX_PM_AUTHENTICATED_JOURNAL_BYTES: u64 = 64 * 1_024 * 1_024;
 pub(super) const MAX_PM_AUTHENTICATED_JOURNAL_RECORDS: usize = 65_536;
 
-const SCOPE_HASH_PREFIX: &[u8] = b"reap.pm.authenticated-journal.scope.v1\0";
-const REQUEST_HASH_PREFIX: &[u8] = b"reap.pm.authenticated-request.v1\0";
+const SCOPE_HASH_PREFIX_V1: &[u8] = b"reap.pm.authenticated-journal.scope.v1\0";
+const SCOPE_HASH_PREFIX_V2: &[u8] = b"reap.pm.authenticated-journal.scope.v2.proxy-type-1\0";
+const REQUEST_HASH_PREFIX_V1: &[u8] = b"reap.pm.authenticated-request.v1\0";
+const REQUEST_HASH_PREFIX_V2: &[u8] = b"reap.pm.authenticated-request.v2.proxy-type-1\0";
 const ZERO_HASH: [u8; 32] = [0; 32];
 const MIN_L2_TIMESTAMP: u64 = 1_000_000_000;
 const MAX_L2_TIMESTAMP: u64 = 9_999_999_999;
@@ -189,9 +196,56 @@ const fn decode_nibble(byte: u8) -> Option<u8> {
 }
 
 /// Exact, secret-free lease scope for one authenticated-dispatch journal.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PmAuthenticatedJournalScopeV1 {
+    product: String,
+    schema_family: String,
+    schema_version: u16,
+    account_scope: PmAccountScope,
+    configured_instrument: PmInstrumentId,
+    configuration_fingerprint: PmAuthenticatedJournalFingerprintV1,
+    credential_slot_fingerprint: PmAuthenticatedCredentialSlotFingerprintV1,
+    production_order_entry_authorized: bool,
+    account_signature_profile: PmAccountSignatureProfile,
+    scope_fingerprint: PmAuthenticatedJournalFingerprintV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum PmAuthenticatedProxySignatureProfileV2 {
+    #[serde(rename = "proxy_type_1")]
+    ProxyType1,
+}
+
+#[derive(Serialize)]
+struct ScopeWireV1Ref<'a> {
+    product: &'a str,
+    schema_family: &'a str,
+    schema_version: u16,
+    account_scope: PmAccountScope,
+    configured_instrument: PmInstrumentId,
+    configuration_fingerprint: PmAuthenticatedJournalFingerprintV1,
+    credential_slot_fingerprint: PmAuthenticatedCredentialSlotFingerprintV1,
+    production_order_entry_authorized: bool,
+    scope_fingerprint: PmAuthenticatedJournalFingerprintV1,
+}
+
+#[derive(Serialize)]
+struct ScopeWireV2Ref<'a> {
+    product: &'a str,
+    schema_family: &'a str,
+    schema_version: u16,
+    account_scope: PmAccountScope,
+    configured_instrument: PmInstrumentId,
+    configuration_fingerprint: PmAuthenticatedJournalFingerprintV1,
+    credential_slot_fingerprint: PmAuthenticatedCredentialSlotFingerprintV1,
+    production_order_entry_authorized: bool,
+    account_signature_profile: PmAuthenticatedProxySignatureProfileV2,
+    scope_fingerprint: PmAuthenticatedJournalFingerprintV1,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScopeWireV1 {
     product: String,
     schema_family: String,
     schema_version: u16,
@@ -203,6 +257,170 @@ pub(crate) struct PmAuthenticatedJournalScopeV1 {
     scope_fingerprint: PmAuthenticatedJournalFingerprintV1,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScopeWireV2 {
+    product: String,
+    schema_family: String,
+    schema_version: u16,
+    account_scope: PmAccountScope,
+    configured_instrument: PmInstrumentId,
+    configuration_fingerprint: PmAuthenticatedJournalFingerprintV1,
+    credential_slot_fingerprint: PmAuthenticatedCredentialSlotFingerprintV1,
+    production_order_entry_authorized: bool,
+    account_signature_profile: PmAuthenticatedProxySignatureProfileV2,
+    scope_fingerprint: PmAuthenticatedJournalFingerprintV1,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ScopeWire {
+    V1(ScopeWireV1),
+    V2(ScopeWireV2),
+}
+
+#[derive(Serialize)]
+struct ScopeFingerprintBasisV1<'a> {
+    product: &'a str,
+    schema_family: &'a str,
+    schema_version: u16,
+    account_scope: PmAccountScope,
+    configured_instrument: PmInstrumentId,
+    configuration_fingerprint: PmAuthenticatedJournalFingerprintV1,
+    credential_slot_fingerprint: PmAuthenticatedCredentialSlotFingerprintV1,
+    production_order_entry_authorized: bool,
+}
+
+#[derive(Serialize)]
+struct ScopeFingerprintBasisV2<'a> {
+    product: &'a str,
+    schema_family: &'a str,
+    schema_version: u16,
+    account_scope: PmAccountScope,
+    configured_instrument: PmInstrumentId,
+    configuration_fingerprint: PmAuthenticatedJournalFingerprintV1,
+    credential_slot_fingerprint: PmAuthenticatedCredentialSlotFingerprintV1,
+    production_order_entry_authorized: bool,
+    account_signature_profile: PmAuthenticatedProxySignatureProfileV2,
+}
+
+impl<'a> From<&'a PmAuthenticatedJournalScopeV1> for ScopeWireV1Ref<'a> {
+    fn from(scope: &'a PmAuthenticatedJournalScopeV1) -> Self {
+        Self {
+            product: &scope.product,
+            schema_family: &scope.schema_family,
+            schema_version: scope.schema_version,
+            account_scope: scope.account_scope,
+            configured_instrument: scope.configured_instrument,
+            configuration_fingerprint: scope.configuration_fingerprint,
+            credential_slot_fingerprint: scope.credential_slot_fingerprint,
+            production_order_entry_authorized: scope.production_order_entry_authorized,
+            scope_fingerprint: scope.scope_fingerprint,
+        }
+    }
+}
+
+impl<'a> From<&'a PmAuthenticatedJournalScopeV1> for ScopeWireV2Ref<'a> {
+    fn from(scope: &'a PmAuthenticatedJournalScopeV1) -> Self {
+        Self {
+            product: &scope.product,
+            schema_family: &scope.schema_family,
+            schema_version: scope.schema_version,
+            account_scope: scope.account_scope,
+            configured_instrument: scope.configured_instrument,
+            configuration_fingerprint: scope.configuration_fingerprint,
+            credential_slot_fingerprint: scope.credential_slot_fingerprint,
+            production_order_entry_authorized: scope.production_order_entry_authorized,
+            account_signature_profile: PmAuthenticatedProxySignatureProfileV2::ProxyType1,
+            scope_fingerprint: scope.scope_fingerprint,
+        }
+    }
+}
+
+impl<'a> From<&'a PmAuthenticatedJournalScopeV1> for ScopeFingerprintBasisV1<'a> {
+    fn from(scope: &'a PmAuthenticatedJournalScopeV1) -> Self {
+        Self {
+            product: &scope.product,
+            schema_family: &scope.schema_family,
+            schema_version: scope.schema_version,
+            account_scope: scope.account_scope,
+            configured_instrument: scope.configured_instrument,
+            configuration_fingerprint: scope.configuration_fingerprint,
+            credential_slot_fingerprint: scope.credential_slot_fingerprint,
+            production_order_entry_authorized: scope.production_order_entry_authorized,
+        }
+    }
+}
+
+impl<'a> From<&'a PmAuthenticatedJournalScopeV1> for ScopeFingerprintBasisV2<'a> {
+    fn from(scope: &'a PmAuthenticatedJournalScopeV1) -> Self {
+        Self {
+            product: &scope.product,
+            schema_family: &scope.schema_family,
+            schema_version: scope.schema_version,
+            account_scope: scope.account_scope,
+            configured_instrument: scope.configured_instrument,
+            configuration_fingerprint: scope.configuration_fingerprint,
+            credential_slot_fingerprint: scope.credential_slot_fingerprint,
+            production_order_entry_authorized: scope.production_order_entry_authorized,
+            account_signature_profile: PmAuthenticatedProxySignatureProfileV2::ProxyType1,
+        }
+    }
+}
+
+impl Serialize for PmAuthenticatedJournalScopeV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self.account_signature_profile {
+            PmAccountSignatureProfile::EoaType0 => ScopeWireV1Ref::from(self).serialize(serializer),
+            PmAccountSignatureProfile::ProxyType1 => {
+                ScopeWireV2Ref::from(self).serialize(serializer)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PmAuthenticatedJournalScopeV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let scope = match ScopeWire::deserialize(deserializer)? {
+            ScopeWire::V1(scope) => Self {
+                product: scope.product,
+                schema_family: scope.schema_family,
+                schema_version: scope.schema_version,
+                account_scope: scope.account_scope,
+                configured_instrument: scope.configured_instrument,
+                configuration_fingerprint: scope.configuration_fingerprint,
+                credential_slot_fingerprint: scope.credential_slot_fingerprint,
+                production_order_entry_authorized: scope.production_order_entry_authorized,
+                account_signature_profile: PmAccountSignatureProfile::EoaType0,
+                scope_fingerprint: scope.scope_fingerprint,
+            },
+            ScopeWire::V2(scope) => {
+                let PmAuthenticatedProxySignatureProfileV2::ProxyType1 =
+                    scope.account_signature_profile;
+                Self {
+                    product: scope.product,
+                    schema_family: scope.schema_family,
+                    schema_version: scope.schema_version,
+                    account_scope: scope.account_scope,
+                    configured_instrument: scope.configured_instrument,
+                    configuration_fingerprint: scope.configuration_fingerprint,
+                    credential_slot_fingerprint: scope.credential_slot_fingerprint,
+                    production_order_entry_authorized: scope.production_order_entry_authorized,
+                    account_signature_profile: PmAccountSignatureProfile::ProxyType1,
+                    scope_fingerprint: scope.scope_fingerprint,
+                }
+            }
+        };
+        Ok(scope)
+    }
+}
+
 impl PmAuthenticatedJournalScopeV1 {
     pub(crate) fn from_config(
         config: &PmConnectivityConfig,
@@ -211,7 +429,10 @@ impl PmAuthenticatedJournalScopeV1 {
         let mut scope = Self {
             product: "reap-pm".to_owned(),
             schema_family: PM_AUTHENTICATED_JOURNAL_FAMILY.to_owned(),
-            schema_version: PM_AUTHENTICATED_JOURNAL_VERSION,
+            schema_version: match config.account().signature_profile() {
+                PmAccountSignatureProfile::EoaType0 => PM_AUTHENTICATED_JOURNAL_VERSION,
+                PmAccountSignatureProfile::ProxyType1 => PM_T2_PROXY_AUTHENTICATED_JOURNAL_VERSION,
+            },
             account_scope: config.account().account_scope(),
             configured_instrument: config.account().instrument_id(),
             configuration_fingerprint: PmAuthenticatedJournalFingerprintV1::from_bytes(
@@ -222,6 +443,7 @@ impl PmAuthenticatedJournalScopeV1 {
                     credential_slot_fingerprint,
                 ),
             production_order_entry_authorized: false,
+            account_signature_profile: config.account().signature_profile(),
             scope_fingerprint: PmAuthenticatedJournalFingerprintV1::from_bytes(ZERO_HASH),
         };
         scope.scope_fingerprint = scope.calculate_fingerprint()?;
@@ -235,6 +457,14 @@ impl PmAuthenticatedJournalScopeV1 {
 
     pub(crate) const fn account_scope(&self) -> PmAccountScope {
         self.account_scope
+    }
+
+    pub(crate) const fn account_signature_profile(&self) -> PmAccountSignatureProfile {
+        self.account_signature_profile
+    }
+
+    pub(super) const fn schema_version(&self) -> u16 {
+        self.schema_version
     }
 
     pub(crate) const fn account(&self) -> PmAccountHandle {
@@ -252,9 +482,13 @@ impl PmAuthenticatedJournalScopeV1 {
     }
 
     pub(super) fn validate(&self) -> Result<(), PmAuthenticatedJournalSchemaError> {
+        let expected_version = match self.account_signature_profile {
+            PmAccountSignatureProfile::EoaType0 => PM_AUTHENTICATED_JOURNAL_VERSION,
+            PmAccountSignatureProfile::ProxyType1 => PM_T2_PROXY_AUTHENTICATED_JOURNAL_VERSION,
+        };
         if self.product != "reap-pm"
             || self.schema_family != PM_AUTHENTICATED_JOURNAL_FAMILY
-            || self.schema_version != PM_AUTHENTICATED_JOURNAL_VERSION
+            || self.schema_version != expected_version
         {
             return Err(PmAuthenticatedJournalSchemaError::WrongScopeDomain);
         }
@@ -264,7 +498,15 @@ impl PmAuthenticatedJournalScopeV1 {
         if self.credential_slot_fingerprint.0 == ZERO_HASH {
             return Err(PmAuthenticatedJournalSchemaError::MissingCredentialSlotFingerprint);
         }
-        if self.account_scope.signer().address() != self.account_scope.funder().address() {
+        if !self
+            .account_signature_profile
+            .matches_account_scope(self.account_scope)
+        {
+            return Err(PmAuthenticatedJournalSchemaError::AccountIdentityMismatch);
+        }
+        if self.account_signature_profile == PmAccountSignatureProfile::ProxyType1
+            && self.account_scope.chain().value() != 137
+        {
             return Err(PmAuthenticatedJournalSchemaError::AccountIdentityMismatch);
         }
         if self.calculate_fingerprint()? != self.scope_fingerprint {
@@ -276,31 +518,23 @@ impl PmAuthenticatedJournalScopeV1 {
     fn calculate_fingerprint(
         &self,
     ) -> Result<PmAuthenticatedJournalFingerprintV1, PmAuthenticatedJournalSchemaError> {
-        #[derive(Serialize)]
-        struct FingerprintBasis<'a> {
-            product: &'a str,
-            schema_family: &'a str,
-            schema_version: u16,
-            account_scope: PmAccountScope,
-            configured_instrument: PmInstrumentId,
-            configuration_fingerprint: PmAuthenticatedJournalFingerprintV1,
-            credential_slot_fingerprint: PmAuthenticatedCredentialSlotFingerprintV1,
-            production_order_entry_authorized: bool,
-        }
-
-        let basis = FingerprintBasis {
-            product: &self.product,
-            schema_family: &self.schema_family,
-            schema_version: self.schema_version,
-            account_scope: self.account_scope,
-            configured_instrument: self.configured_instrument,
-            configuration_fingerprint: self.configuration_fingerprint,
-            credential_slot_fingerprint: self.credential_slot_fingerprint,
-            production_order_entry_authorized: self.production_order_entry_authorized,
-        };
         let mut hasher = Sha256::new();
-        hasher.update(SCOPE_HASH_PREFIX);
-        serde_json::to_writer(HashWriter(&mut hasher), &basis)?;
+        match self.account_signature_profile {
+            PmAccountSignatureProfile::EoaType0 => {
+                hasher.update(SCOPE_HASH_PREFIX_V1);
+                serde_json::to_writer(
+                    HashWriter(&mut hasher),
+                    &ScopeFingerprintBasisV1::from(self),
+                )?;
+            }
+            PmAccountSignatureProfile::ProxyType1 => {
+                hasher.update(SCOPE_HASH_PREFIX_V2);
+                serde_json::to_writer(
+                    HashWriter(&mut hasher),
+                    &ScopeFingerprintBasisV2::from(self),
+                )?;
+            }
+        }
         Ok(PmAuthenticatedJournalFingerprintV1::from_bytes(
             hasher.finalize().into(),
         ))
@@ -463,16 +697,19 @@ impl PmAuthenticatedPlacePreparedV1 {
             expected_order_id: PmAuthenticatedCommitmentV1,
             l2_timestamp_seconds: u64,
         }
-        request_hash(&Basis {
-            scope: scope.fingerprint(),
-            method: "POST",
-            route: "/order",
-            operation: self.operation,
-            prior_intent_sequence: self.prior_intent_sequence,
-            semantic_request_commitment: self.semantic_request_commitment,
-            expected_order_id: self.expected_order_id,
-            l2_timestamp_seconds: self.l2_timestamp_seconds,
-        })
+        request_hash(
+            scope,
+            &Basis {
+                scope: scope.fingerprint(),
+                method: "POST",
+                route: "/order",
+                operation: self.operation,
+                prior_intent_sequence: self.prior_intent_sequence,
+                semantic_request_commitment: self.semantic_request_commitment,
+                expected_order_id: self.expected_order_id,
+                l2_timestamp_seconds: self.l2_timestamp_seconds,
+            },
+        )
     }
 
     fn validate(
@@ -549,16 +786,19 @@ impl PmAuthenticatedCancelPreparedV1 {
             fixed_order_id: PmAuthenticatedCommitmentV1,
             l2_timestamp_seconds: u64,
         }
-        request_hash(&Basis {
-            scope: scope.fingerprint(),
-            method: "DELETE",
-            route: "/order",
-            operation: self.operation,
-            prior_cancel_sequence: self.prior_cancel_sequence,
-            semantic_request_commitment: self.semantic_request_commitment,
-            fixed_order_id: self.fixed_order_id,
-            l2_timestamp_seconds: self.l2_timestamp_seconds,
-        })
+        request_hash(
+            scope,
+            &Basis {
+                scope: scope.fingerprint(),
+                method: "DELETE",
+                route: "/order",
+                operation: self.operation,
+                prior_cancel_sequence: self.prior_cancel_sequence,
+                semantic_request_commitment: self.semantic_request_commitment,
+                fixed_order_id: self.fixed_order_id,
+                l2_timestamp_seconds: self.l2_timestamp_seconds,
+            },
+        )
     }
 
     fn validate(
@@ -600,10 +840,14 @@ fn decode_prefixed_hex32(input: &str) -> Option<[u8; 32]> {
 }
 
 fn request_hash(
+    scope: &PmAuthenticatedJournalScopeV1,
     basis: &impl Serialize,
 ) -> Result<PmAuthenticatedCommitmentV1, PmAuthenticatedJournalSchemaError> {
     let mut hasher = Sha256::new();
-    hasher.update(REQUEST_HASH_PREFIX);
+    hasher.update(match scope.account_signature_profile() {
+        PmAccountSignatureProfile::EoaType0 => REQUEST_HASH_PREFIX_V1,
+        PmAccountSignatureProfile::ProxyType1 => REQUEST_HASH_PREFIX_V2,
+    });
     serde_json::to_writer(HashWriter(&mut hasher), basis)?;
     Ok(PmAuthenticatedCommitmentV1::from_bytes(
         hasher.finalize().into(),
@@ -993,6 +1237,9 @@ pub(super) struct PmAuthenticatedJournalLineV1(
 );
 
 impl PmAuthenticatedJournalLineV1 {
+    /// Constructs the frozen version-1 EOA envelope for golden/negative tests.
+    /// Runtime writers must derive the version from a validated scope.
+    #[cfg(test)]
     pub(super) const fn new(
         scope: PmAuthenticatedJournalFingerprintV1,
         sequence: u64,
@@ -1000,11 +1247,29 @@ impl PmAuthenticatedJournalLineV1 {
     ) -> Self {
         Self(
             PmAuthenticatedJournalFamily,
-            PmAuthenticatedJournalVersion,
+            PmAuthenticatedJournalVersion(PM_AUTHENTICATED_JOURNAL_VERSION),
             scope,
             sequence,
             record,
         )
+    }
+
+    pub(super) const fn new_for_scope(
+        scope: &PmAuthenticatedJournalScopeV1,
+        sequence: u64,
+        record: PmAuthenticatedJournalRecordV1,
+    ) -> Self {
+        Self(
+            PmAuthenticatedJournalFamily,
+            PmAuthenticatedJournalVersion(scope.schema_version()),
+            scope.fingerprint(),
+            sequence,
+            record,
+        )
+    }
+
+    pub(super) const fn schema_version(&self) -> u16 {
+        self.1.0
     }
 
     pub(super) const fn scope(&self) -> PmAuthenticatedJournalFingerprintV1 {
@@ -1046,14 +1311,14 @@ impl<'de> Deserialize<'de> for PmAuthenticatedJournalFamily {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PmAuthenticatedJournalVersion;
+struct PmAuthenticatedJournalVersion(u16);
 
 impl Serialize for PmAuthenticatedJournalVersion {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        serializer.serialize_u16(PM_AUTHENTICATED_JOURNAL_VERSION)
+        serializer.serialize_u16(self.0)
     }
 }
 
@@ -1062,8 +1327,12 @@ impl<'de> Deserialize<'de> for PmAuthenticatedJournalVersion {
     where
         D: Deserializer<'de>,
     {
-        if u16::deserialize(deserializer)? == PM_AUTHENTICATED_JOURNAL_VERSION {
-            Ok(Self)
+        let version = u16::deserialize(deserializer)?;
+        if matches!(
+            version,
+            PM_AUTHENTICATED_JOURNAL_VERSION | PM_T2_PROXY_AUTHENTICATED_JOURNAL_VERSION
+        ) {
+            Ok(Self(version))
         } else {
             Err(de::Error::custom(
                 "unsupported PM authenticated journal version",
@@ -1088,7 +1357,7 @@ pub(crate) enum PmAuthenticatedJournalSchemaError {
     ProductionAuthorityForbidden,
     #[error("PM authenticated journal requires a bound credential-slot fingerprint")]
     MissingCredentialSlotFingerprint,
-    #[error("PM authenticated journal requires one EOA maker/signer/funder identity")]
+    #[error("PM authenticated journal account identities do not match its signature profile")]
     AccountIdentityMismatch,
     #[error("PM authenticated journal scope fingerprint does not match its descriptor")]
     ScopeFingerprintMismatch,
@@ -1127,17 +1396,55 @@ pub(super) fn test_scope() -> PmAuthenticatedJournalScopeV1 {
 pub(super) fn test_scope_with_credential_slot(
     credential_slot_fingerprint: [u8; 32],
 ) -> PmAuthenticatedJournalScopeV1 {
+    test_scope_with_profile_and_identities(
+        PmAccountSignatureProfile::EoaType0,
+        [0x11; 20],
+        [0x11; 20],
+        [0x33; 32],
+        credential_slot_fingerprint,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn test_proxy_scope() -> PmAuthenticatedJournalScopeV1 {
+    test_proxy_scope_with_identities([0x11; 20], [0x12; 20], [0x33; 32])
+}
+
+#[cfg(test)]
+pub(super) fn test_proxy_scope_with_identities(
+    signer: [u8; 20],
+    funder: [u8; 20],
+    configuration_fingerprint: [u8; 32],
+) -> PmAuthenticatedJournalScopeV1 {
+    test_scope_with_profile_and_identities(
+        PmAccountSignatureProfile::ProxyType1,
+        signer,
+        funder,
+        configuration_fingerprint,
+        [0x44; 32],
+    )
+}
+
+#[cfg(test)]
+fn test_scope_with_profile_and_identities(
+    account_signature_profile: PmAccountSignatureProfile,
+    signer: [u8; 20],
+    funder: [u8; 20],
+    configuration_fingerprint: [u8; 32],
+    credential_slot_fingerprint: [u8; 32],
+) -> PmAuthenticatedJournalScopeV1 {
     use reap_pm_core::{
         EvmAddress, PmAccountHandle, PmChainId, PmEnvironmentId, PmFunderId, PmMarketId,
         PmSignerId, PmTokenId, U256,
     };
 
-    let address = EvmAddress::from_bytes([0x11; 20]).expect("test EOA");
+    let signer = EvmAddress::from_bytes(signer).expect("test signer");
+    let funder = EvmAddress::from_bytes(funder).expect("test funder");
     let account_scope = PmAccountScope::new(
         PmEnvironmentId::new("authenticated-journal-test").expect("environment"),
         PmChainId::new(137).expect("chain"),
-        PmSignerId::new(address),
-        PmFunderId::new(address),
+        PmSignerId::new(signer),
+        PmFunderId::new(funder),
         PmAccountHandle::from_ordinal(9),
     );
     let configured_instrument = PmInstrumentId::new(
@@ -1147,15 +1454,21 @@ pub(super) fn test_scope_with_credential_slot(
     let mut scope = PmAuthenticatedJournalScopeV1 {
         product: "reap-pm".to_owned(),
         schema_family: PM_AUTHENTICATED_JOURNAL_FAMILY.to_owned(),
-        schema_version: PM_AUTHENTICATED_JOURNAL_VERSION,
+        schema_version: match account_signature_profile {
+            PmAccountSignatureProfile::EoaType0 => PM_AUTHENTICATED_JOURNAL_VERSION,
+            PmAccountSignatureProfile::ProxyType1 => PM_T2_PROXY_AUTHENTICATED_JOURNAL_VERSION,
+        },
         account_scope,
         configured_instrument,
-        configuration_fingerprint: PmAuthenticatedJournalFingerprintV1::from_bytes([0x33; 32]),
+        configuration_fingerprint: PmAuthenticatedJournalFingerprintV1::from_bytes(
+            configuration_fingerprint,
+        ),
         credential_slot_fingerprint:
             PmAuthenticatedCredentialSlotFingerprintV1::from_authenticated_journal_scope_bytes(
                 credential_slot_fingerprint,
             ),
         production_order_entry_authorized: false,
+        account_signature_profile,
         scope_fingerprint: PmAuthenticatedJournalFingerprintV1::from_bytes(ZERO_HASH),
     };
     scope.scope_fingerprint = scope.calculate_fingerprint().expect("fingerprint");
