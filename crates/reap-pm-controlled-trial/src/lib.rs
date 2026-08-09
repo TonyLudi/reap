@@ -13,11 +13,13 @@ mod protected_file;
 
 pub use config::{
     AuthorizationApproval, AuthorizationBuildBinding, AuthorizationHostBinding,
-    AuthorizationVerification, CanonicalAuthorization, CanonicalTrialConfig, PlanVerification,
-    PmTrialConfigError, TrialAccount, TrialAuthorization, TrialConfig, TrialCredentialSlot,
-    TrialDomain, TrialJournalBinding, TrialMarket, TrialOrder, TrialOrderType, TrialPhase,
-    TrialSide, TrialTimeLimits, load_canonical_authorization, load_canonical_trial_config,
-    verify_authorization, verify_plan,
+    AuthorizationVerification, CanonicalAuthorization, CanonicalTrialConfig,
+    PM_T2_AUTHORIZATION_CONSUMPTION_CLAIM_FILE_V1, PM_T2_AUTHORIZATION_CONSUMPTION_LEDGER_FILE_V1,
+    PM_T2_JOURNAL_FAMILY_V1, PM_T2_JOURNAL_VERSION_V1, PM_T2_LIVE_DISPATCH_JOURNAL_FILE_V1,
+    PM_T2_LIVE_INTENT_JOURNAL_FILE_V1, PlanVerification, PmTrialConfigError, TrialAccount,
+    TrialAuthorization, TrialConfig, TrialCredentialSlot, TrialDomain, TrialJournalBinding,
+    TrialMarket, TrialOrder, TrialOrderType, TrialPhase, TrialSide, TrialTimeLimits,
+    load_canonical_authorization, load_canonical_trial_config, verify_authorization, verify_plan,
 };
 pub use consumption::{
     AuthorizationConsumptionBindingEvidence, AuthorizationConsumptionEvidence,
@@ -40,6 +42,11 @@ pub use preflight::{
     TrialPreflightEvidence, TrialPreflightWindow, TrialPrivateAccountCut,
     TrialReconciliationPreflight, TrialRiskPreflight, TrialServerTimeEvidence,
     TrialUserStreamPreflight, validate_canonical_trial_preflight,
+};
+pub use reap_polymarket_auth::{
+    ExpectedOrderId, FixedOrderId, OwnedCancelSemanticRequestCommitment,
+    PlacePublicRequestIdentity, PlaceSemanticRequestCommitment,
+    derive_owned_cancel_semantic_request_commitment,
 };
 
 /// Hard offline outcome of every command in this A0 executable.

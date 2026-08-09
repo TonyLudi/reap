@@ -16,6 +16,7 @@ members = [
     "crates/reap-pm-live",
     "crates/reap-pm-readiness",
     "crates/reap-pm-controlled-trial",
+    "crates/reap-pm-controlled-trial-live",
     "crates/reap-polymarket-public-source",
     "crates/reap-polymarket-chain-source",
     "crates/reap-okx-public-source",
@@ -87,6 +88,7 @@ reap-pm-live = { path = "crates/reap-pm-live" }
 reap-pm-live-contracts = { path = "crates/reap-pm-live-contracts" }
 reap-pm-readiness = { path = "crates/reap-pm-readiness" }
 reap-pm-controlled-trial = { path = "crates/reap-pm-controlled-trial" }
+reap-pm-controlled-trial-live = { path = "crates/reap-pm-controlled-trial-live" }
 reap-polymarket-public-source = { path = "crates/reap-polymarket-public-source" }
 reap-polymarket-chain-source = { path = "crates/reap-polymarket-chain-source" }
 reap-pm-strategy = { path = "crates/reap-pm-strategy" }

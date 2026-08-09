@@ -4,7 +4,9 @@ use chrono::{DateTime, Utc};
 use reap_pm_core::{
     EvmAddress, PmOrderSalt, PmOrderSide, PmPrice, PmQuantity, PmTick, PmTokenId, U256,
 };
-use reap_polymarket_auth::EoaAddress;
+use reap_polymarket_auth::{
+    EoaAddress, PlacePublicRequestIdentity, PmClobDomain, derive_place_public_request_identity,
+};
 use reap_polymarket_wire::{PM_CLOB_V2_EMPTY_BYTES32, PmUnsignedClobV2Order};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest as _, Sha256};
@@ -17,6 +19,13 @@ use crate::{
 
 pub const TRIAL_CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const TRIAL_AUTHORIZATION_SCHEMA_VERSION: u32 = 1;
+pub const PM_T2_JOURNAL_FAMILY_V1: &str = "pm-t2-controlled-trial";
+pub const PM_T2_JOURNAL_VERSION_V1: u32 = 1;
+pub const PM_T2_AUTHORIZATION_CONSUMPTION_LEDGER_FILE_V1: &str = "authorization-consumption.jsonl";
+pub const PM_T2_AUTHORIZATION_CONSUMPTION_CLAIM_FILE_V1: &str = "authorization-consumed.claim";
+pub const PM_T2_LIVE_INTENT_JOURNAL_FILE_V1: &str = "pm-t2-controlled-trial-live-intent-v1.jsonl";
+pub const PM_T2_LIVE_DISPATCH_JOURNAL_FILE_V1: &str =
+    "pm-t2-controlled-trial-live-dispatch-v1.jsonl";
 const MAX_CANONICAL_RECORD_BYTES: usize = 128 * 1024;
 const MAX_AUTHORIZATION_LIFETIME_SECONDS: i64 = 15 * 60;
 const CONFIG_FINGERPRINT_DOMAIN: &[u8] = b"reap.pm-t2.controlled-trial.config.v1\0";
@@ -197,13 +206,16 @@ impl TrialConfig {
             "signer-to-proxy evidence reference is invalid",
         )?;
         validate_absolute_path(&self.journal.artifact_directory)?;
-        validate_token(
-            &self.journal.journal_family,
-            128,
-            "journal family is invalid",
-        )?;
-        if self.journal.journal_version == 0 {
-            return Err(invalid("journal version must be positive"));
+        if self.journal.journal_family != PM_T2_JOURNAL_FAMILY_V1
+            || self.journal.journal_version != PM_T2_JOURNAL_VERSION_V1
+            || self.journal.authorization_consumption_ledger_file
+                != PM_T2_AUTHORIZATION_CONSUMPTION_LEDGER_FILE_V1
+            || self.journal.authorization_consumption_claim_file
+                != PM_T2_AUTHORIZATION_CONSUMPTION_CLAIM_FILE_V1
+        {
+            return Err(invalid(
+                "journal family, version, or fixed filenames drifted",
+            ));
         }
         validate_direct_entry(
             &self.journal.authorization_consumption_ledger_file,
@@ -213,13 +225,6 @@ impl TrialConfig {
             &self.journal.authorization_consumption_claim_file,
             "authorization-consumption claim filename is invalid",
         )?;
-        if self.journal.authorization_consumption_ledger_file
-            == self.journal.authorization_consumption_claim_file
-        {
-            return Err(invalid(
-                "authorization-consumption ledger and claim filenames must differ",
-            ));
-        }
         Ok(())
     }
 
@@ -554,6 +559,22 @@ impl CanonicalTrialConfig {
     #[must_use]
     pub fn canonical_length(&self) -> u64 {
         self.canonical_bytes.len() as u64
+    }
+
+    /// Exact no-secret place identity derived from the already validated
+    /// domain and unsigned PM-T2 order. This is journal-safe public identity,
+    /// never an authenticated-body commitment or mutation grant.
+    #[must_use]
+    pub fn exact_place_public_request_identity(&self) -> PlacePublicRequestIdentity {
+        let domain = match self.value.market.domain {
+            TrialDomain::Standard => PmClobDomain::Standard,
+            TrialDomain::NegativeRisk => PmClobDomain::NegativeRisk,
+        };
+        let unsigned = self
+            .value
+            .validate_market_and_order()
+            .expect("canonical config already validated exact unsigned order");
+        derive_place_public_request_identity(domain, unsigned)
     }
 }
 

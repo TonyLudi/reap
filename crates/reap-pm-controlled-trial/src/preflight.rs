@@ -1096,12 +1096,16 @@ impl TrialJournalLeaseEvidence {
             || self.artifact_directory != journal.artifact_directory
             || !self.artifact_directory_exclusive
             || product_path == authenticated_path
+            || product_name != Some(crate::PM_T2_LIVE_INTENT_JOURNAL_FILE_V1)
+            || authenticated_name != Some(crate::PM_T2_LIVE_DISPATCH_JOURNAL_FILE_V1)
             || product_name == Some(&journal.authorization_consumption_ledger_file)
             || product_name == Some(&journal.authorization_consumption_claim_file)
             || authenticated_name == Some(&journal.authorization_consumption_ledger_file)
             || authenticated_name == Some(&journal.authorization_consumption_claim_file)
-            || self.product_journal_schema_version == 0
-            || self.authenticated_journal_schema_version == 0
+            || self.product_journal_schema_version != crate::PM_T2_JOURNAL_VERSION_V1
+            || self.authenticated_journal_schema_version != crate::PM_T2_JOURNAL_VERSION_V1
+            || self.product_journal_scope_fingerprint
+                != self.authenticated_journal_scope_fingerprint
             || !self.product_journal_exclusive
             || !self.authenticated_journal_exclusive
             || !self.leases_held_continuously
@@ -1706,18 +1710,20 @@ mod tests {
                     artifact_directory_lease_fingerprint: hex(0x01),
                     artifact_directory_exclusive: true,
                     product_journal_path: format!(
-                        "{}/product-journal.jsonl",
-                        value.journal.artifact_directory
+                        "{}/{}",
+                        value.journal.artifact_directory,
+                        crate::PM_T2_LIVE_INTENT_JOURNAL_FILE_V1,
                     ),
                     product_journal_schema_version: 1,
                     product_journal_scope_fingerprint: hex(0x02),
                     product_journal_exclusive: true,
                     authenticated_journal_path: format!(
-                        "{}/authenticated-journal.jsonl",
-                        value.journal.artifact_directory
+                        "{}/{}",
+                        value.journal.artifact_directory,
+                        crate::PM_T2_LIVE_DISPATCH_JOURNAL_FILE_V1,
                     ),
-                    authenticated_journal_schema_version: 2,
-                    authenticated_journal_scope_fingerprint: hex(0x03),
+                    authenticated_journal_schema_version: 1,
+                    authenticated_journal_scope_fingerprint: hex(0x02),
                     authenticated_journal_exclusive: true,
                     leases_held_continuously: true,
                     recovery_state_unambiguous: true,

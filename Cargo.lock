@@ -1498,6 +1498,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "reap-pm-controlled-trial-live"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "libc",
+ "reap-pm-controlled-trial",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "reap-pm-core"
 version = "0.1.0"
 dependencies = [

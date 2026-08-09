@@ -162,6 +162,22 @@ fn order_profile_rejects_type_zero_equal_identity_wrong_amount_and_phase_b_sell(
 }
 
 #[test]
+fn canonical_config_derives_one_exact_no_secret_public_place_identity() {
+    let directory = protected_dir();
+    let path = directory.path().join("identity-config.json");
+    write_0600(&path, &serde_json::to_vec(&trial_config()).unwrap());
+    let config = load_canonical_trial_config(&path).unwrap();
+    let first = config.exact_place_public_request_identity();
+    let second = config.exact_place_public_request_identity();
+    assert_eq!(first, second);
+    assert_ne!(
+        first.expected_order_id().bytes(),
+        first.semantic_request_commitment().bytes()
+    );
+    assert_eq!(first.expected_order_id().to_string().len(), 66);
+}
+
+#[test]
 fn custody_is_four_file_pinned_redacted_and_signer_bound() {
     let directory = protected_dir();
     let config_path = directory.path().join("config.json");
@@ -470,13 +486,18 @@ fn expiry_boundary_rejects_consumption_without_claim_and_terminal_requires_consu
 }
 
 #[test]
-fn canonical_config_binds_one_absolute_parent_and_two_distinct_direct_filenames() {
-    let mutations: [fn(&mut TrialConfig); 3] = [
+fn canonical_config_binds_one_absolute_parent_and_the_closed_journal_profile() {
+    let mutations: [fn(&mut TrialConfig); 6] = [
         |config| config.journal.artifact_directory = "relative/artifacts".into(),
         |config| config.journal.authorization_consumption_ledger_file = "nested/ledger".into(),
         |config| {
             config.journal.authorization_consumption_claim_file =
                 config.journal.authorization_consumption_ledger_file.clone();
+        },
+        |config| config.journal.journal_family = "foreign-family".into(),
+        |config| config.journal.journal_version = 2,
+        |config| {
+            config.journal.authorization_consumption_claim_file = "foreign.claim".into();
         },
     ];
     for mutate in mutations {
