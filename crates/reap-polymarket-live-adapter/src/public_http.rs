@@ -2,15 +2,178 @@ use reap_polymarket_auth::L2Timestamp;
 use reap_polymarket_wire::{
     MAX_PUBLIC_REST_BODY_BYTES, PmBookMarketBinding, PmBookParserConfig, parse_server_time,
 };
+use sha2::{Digest as _, Sha256};
 
 use crate::{
-    PmLiveAdapterError, PmMutationServerTimeProductClock, PmPendingMutationServerTime,
-    PmProductClockError, PmPublicHttpConfig, PmPublicHttpProductClock, PmReadServerTime,
-    PmReadServerTimeProductClock, PmRestBookDeliveryError, PmRestResponseClock,
+    PM_CLOB_PRODUCTION_ORIGIN, PmLiveAdapterError, PmMutationServerTimeProductClock,
+    PmPendingMutationServerTime, PmProductClockError, PmPublicHttpConfig, PmPublicHttpProductClock,
+    PmReadServerTime, PmReadServerTimeProductClock, PmRestBookDeliveryError, PmRestResponseClock,
+    config::OriginMode,
     http_transport::{PmHttpTransport, PmPublicRoute},
 };
 
 const MAX_SERVER_TIME_BODY_BYTES: usize = 64;
+const READ_SERVER_TIME_OBSERVATION_COMMITMENT_DOMAIN: &[u8] =
+    b"reap.pm.live-adapter.read-server-time-observation.v1\0";
+const MUTATION_SERVER_TIME_OBSERVATION_COMMITMENT_DOMAIN: &[u8] =
+    b"reap.pm.live-adapter.mutation-server-time-observation.v1\0";
+
+/// SHA-256 commitment to one fixed `/time` response used for an authenticated
+/// read. Construction is private to the source role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PmReadServerTimeObservationCommitment([u8; 32]);
+
+impl PmReadServerTimeObservationCommitment {
+    const fn from_source_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+/// SHA-256 commitment to one fixed `/time` response reserved for mutation
+/// admission. Its distinct type/domain prevents read-time substitution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PmMutationServerTimeObservationCommitment([u8; 32]);
+
+impl PmMutationServerTimeObservationCommitment {
+    const fn from_source_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+/// Sealed source observation for an authenticated-read server time.
+///
+/// The parsed value and receive edge are inspectable, but the underlying
+/// proof remains move-only. Consumers must call [`Self::into_read_server_time`]
+/// and remain subject to the existing freshness check at authentication.
+pub struct PmReadServerTimeObservation {
+    parsed_l2_timestamp: L2Timestamp,
+    receive_clock: PmRestResponseClock,
+    commitment: PmReadServerTimeObservationCommitment,
+    proof: PmReadServerTime,
+}
+
+impl PmReadServerTimeObservation {
+    fn from_source(
+        parsed_l2_timestamp: L2Timestamp,
+        receive_clock: PmRestResponseClock,
+        commitment: PmReadServerTimeObservationCommitment,
+        proof: PmReadServerTime,
+    ) -> Self {
+        Self {
+            parsed_l2_timestamp,
+            receive_clock,
+            commitment,
+            proof,
+        }
+    }
+
+    #[must_use]
+    pub const fn parsed_l2_timestamp(&self) -> L2Timestamp {
+        self.parsed_l2_timestamp
+    }
+
+    #[must_use]
+    pub const fn receive_clock(&self) -> PmRestResponseClock {
+        self.receive_clock
+    }
+
+    #[must_use]
+    pub const fn commitment(&self) -> PmReadServerTimeObservationCommitment {
+        self.commitment
+    }
+
+    #[must_use]
+    pub fn into_read_server_time(self) -> PmReadServerTime {
+        self.proof
+    }
+}
+
+impl std::fmt::Debug for PmReadServerTimeObservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PmReadServerTimeObservation")
+            .field("parsed_l2_timestamp", &self.parsed_l2_timestamp)
+            .field("receive_clock", &self.receive_clock)
+            .field("commitment", &self.commitment)
+            .field("proof", &"<opaque>")
+            .finish()
+    }
+}
+
+/// Sealed source observation for one pending mutation server time.
+///
+/// Consuming this carrier yields only the existing pending proof, which must
+/// still pass the same-domain freshness validator before mutation admission.
+pub struct PmMutationServerTimeObservation {
+    parsed_l2_timestamp: L2Timestamp,
+    receive_clock: PmRestResponseClock,
+    commitment: PmMutationServerTimeObservationCommitment,
+    proof: PmPendingMutationServerTime,
+}
+
+impl PmMutationServerTimeObservation {
+    fn from_source(
+        parsed_l2_timestamp: L2Timestamp,
+        receive_clock: PmRestResponseClock,
+        commitment: PmMutationServerTimeObservationCommitment,
+        proof: PmPendingMutationServerTime,
+    ) -> Self {
+        Self {
+            parsed_l2_timestamp,
+            receive_clock,
+            commitment,
+            proof,
+        }
+    }
+
+    #[must_use]
+    pub const fn parsed_l2_timestamp(&self) -> L2Timestamp {
+        self.parsed_l2_timestamp
+    }
+
+    #[must_use]
+    pub const fn receive_clock(&self) -> PmRestResponseClock {
+        self.receive_clock
+    }
+
+    #[must_use]
+    pub const fn commitment(&self) -> PmMutationServerTimeObservationCommitment {
+        self.commitment
+    }
+
+    #[must_use]
+    pub fn into_pending_mutation_server_time(self) -> PmPendingMutationServerTime {
+        self.proof
+    }
+}
+
+impl std::fmt::Debug for PmMutationServerTimeObservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PmMutationServerTimeObservation")
+            .field("parsed_l2_timestamp", &self.parsed_l2_timestamp)
+            .field("receive_clock", &self.receive_clock)
+            .field("commitment", &self.commitment)
+            .field("proof", &"<opaque>")
+            .finish()
+    }
+}
+
+struct FetchedServerTime {
+    raw_response: Vec<u8>,
+    parsed_l2_timestamp: L2Timestamp,
+    receive_clock: PmRestResponseClock,
+}
 
 /// Exact `/time` capability for authenticated read requests.
 ///
@@ -18,6 +181,7 @@ const MAX_SERVER_TIME_BODY_BYTES: usize = 64;
 pub struct PmReadServerTimeHttpRole {
     transport: PmHttpTransport,
     clock: PmReadServerTimeProductClock,
+    mode: OriginMode,
 }
 
 impl PmReadServerTimeHttpRole {
@@ -34,16 +198,41 @@ impl PmReadServerTimeHttpRole {
         config: PmPublicHttpConfig,
         clock: PmReadServerTimeProductClock,
     ) -> Result<Self, PmLiveAdapterError> {
+        let mode = config.mode();
         Ok(Self {
             transport: PmHttpTransport::new(&config)?,
             clock,
+            mode,
         })
     }
 
     pub async fn fresh_read_server_time(&self) -> Result<PmReadServerTime, PmLiveAdapterError> {
-        let (timestamp, received) =
-            fetch_server_time(&self.transport, || self.clock.observe_rest_edge()).await?;
-        Ok(self.clock.read_time(timestamp, received))
+        Ok(self
+            .fresh_read_server_time_observation()
+            .await?
+            .into_read_server_time())
+    }
+
+    pub async fn fresh_read_server_time_observation(
+        &self,
+    ) -> Result<PmReadServerTimeObservation, PmLiveAdapterError> {
+        let fetched = fetch_server_time(&self.transport, || self.clock.observe_rest_edge()).await?;
+        let commitment = PmReadServerTimeObservationCommitment::from_source_bytes(
+            server_time_observation_commitment(
+                READ_SERVER_TIME_OBSERVATION_COMMITMENT_DOMAIN,
+                self.mode,
+                &fetched,
+            ),
+        );
+        let proof = self
+            .clock
+            .read_time(fetched.parsed_l2_timestamp, fetched.receive_clock);
+        Ok(PmReadServerTimeObservation::from_source(
+            fetched.parsed_l2_timestamp,
+            fetched.receive_clock,
+            commitment,
+            proof,
+        ))
     }
 }
 
@@ -54,6 +243,7 @@ impl PmReadServerTimeHttpRole {
 pub struct PmMutationServerTimeHttpRole {
     transport: PmHttpTransport,
     clock: PmMutationServerTimeProductClock,
+    mode: OriginMode,
 }
 
 impl PmMutationServerTimeHttpRole {
@@ -61,25 +251,50 @@ impl PmMutationServerTimeHttpRole {
         config: PmPublicHttpConfig,
         clock: PmMutationServerTimeProductClock,
     ) -> Result<Self, PmLiveAdapterError> {
+        let mode = config.mode();
         Ok(Self {
             transport: PmHttpTransport::new(&config)?,
             clock,
+            mode,
         })
     }
 
     pub async fn fresh_mutation_server_time(
         &self,
     ) -> Result<PmPendingMutationServerTime, PmLiveAdapterError> {
-        let (timestamp, received) =
-            fetch_server_time(&self.transport, || self.clock.observe_rest_edge()).await?;
-        Ok(self.clock.pending_mutation_time(timestamp, received))
+        Ok(self
+            .fresh_mutation_server_time_observation()
+            .await?
+            .into_pending_mutation_server_time())
+    }
+
+    pub async fn fresh_mutation_server_time_observation(
+        &self,
+    ) -> Result<PmMutationServerTimeObservation, PmLiveAdapterError> {
+        let fetched = fetch_server_time(&self.transport, || self.clock.observe_rest_edge()).await?;
+        let commitment = PmMutationServerTimeObservationCommitment::from_source_bytes(
+            server_time_observation_commitment(
+                MUTATION_SERVER_TIME_OBSERVATION_COMMITMENT_DOMAIN,
+                self.mode,
+                &fetched,
+            ),
+        );
+        let proof = self
+            .clock
+            .pending_mutation_time(fetched.parsed_l2_timestamp, fetched.receive_clock);
+        Ok(PmMutationServerTimeObservation::from_source(
+            fetched.parsed_l2_timestamp,
+            fetched.receive_clock,
+            commitment,
+            proof,
+        ))
     }
 }
 
 async fn fetch_server_time<F>(
     transport: &PmHttpTransport,
     observe_rest_edge: F,
-) -> Result<(L2Timestamp, PmRestResponseClock), PmLiveAdapterError>
+) -> Result<FetchedServerTime, PmLiveAdapterError>
 where
     F: FnOnce() -> Result<PmRestResponseClock, PmProductClockError>,
 {
@@ -91,7 +306,46 @@ where
     let received = observe_rest_edge().map_err(|_| PmLiveAdapterError::ProductClock)?;
     let seconds = parse_server_time(&body).map_err(PmLiveAdapterError::Wire)?;
     let timestamp = L2Timestamp::from_unix_seconds(seconds)?;
-    Ok((timestamp, received))
+    Ok(FetchedServerTime {
+        raw_response: body,
+        parsed_l2_timestamp: timestamp,
+        receive_clock: received,
+    })
+}
+
+fn server_time_observation_commitment(
+    domain: &'static [u8],
+    mode: OriginMode,
+    fetched: &FetchedServerTime,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    encode_server_time_bytes(&mut digest, domain);
+    encode_server_time_bytes(&mut digest, origin_mode_name(mode));
+    encode_server_time_bytes(&mut digest, PM_CLOB_PRODUCTION_ORIGIN.as_bytes());
+    encode_server_time_bytes(&mut digest, b"GET");
+    encode_server_time_bytes(&mut digest, b"/time");
+    encode_server_time_bytes(&mut digest, &fetched.raw_response);
+    digest.update(fetched.parsed_l2_timestamp.unix_seconds().to_be_bytes());
+    digest.update(fetched.receive_clock.local_wall_receive_ns().to_be_bytes());
+    digest.update(fetched.receive_clock.monotonic_receive_ns().to_be_bytes());
+    digest.finalize().into()
+}
+
+fn encode_server_time_bytes(digest: &mut Sha256, value: &[u8]) {
+    digest.update(
+        u64::try_from(value.len())
+            .expect("bounded server-time commitment field length fits u64")
+            .to_be_bytes(),
+    );
+    digest.update(value);
+}
+
+const fn origin_mode_name(mode: OriginMode) -> &'static [u8] {
+    match mode {
+        OriginMode::Production => b"production",
+        #[cfg(any(test, feature = "loopback-evidence", feature = "read-only-evidence"))]
+        OriginMode::LocalEvidence => b"local-evidence",
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +371,7 @@ pub struct PmPublicHttpRole {
     transport: PmHttpTransport,
     parser_config: PmBookParserConfig,
     clock: PmPublicHttpProductClock,
+    mode: OriginMode,
 }
 
 impl PmPublicHttpRole {
@@ -146,11 +401,13 @@ impl PmPublicHttpRole {
                 "live public books require condition-bound market identity",
             ));
         }
+        let mode = config.mode();
         let transport = PmHttpTransport::new(&config)?;
         Ok(Self {
             transport,
             parser_config,
             clock,
+            mode,
         })
     }
 
@@ -165,11 +422,34 @@ impl PmPublicHttpRole {
     }
 
     /// Fetch one exact CLOB server time for one authenticated read request.
-    /// The proof is move-only and exposes neither raw seconds nor an
-    /// `L2Timestamp` constructor/getter.
+    /// The proof remains move-only and freshness checked when consumed.
     pub async fn fresh_read_server_time(&self) -> Result<PmReadServerTime, PmLiveAdapterError> {
-        let (timestamp, received) = self.fresh_server_time().await?;
-        Ok(self.clock.read_time(timestamp, received))
+        Ok(self
+            .fresh_read_server_time_observation()
+            .await?
+            .into_read_server_time())
+    }
+
+    pub async fn fresh_read_server_time_observation(
+        &self,
+    ) -> Result<PmReadServerTimeObservation, PmLiveAdapterError> {
+        let fetched = self.fresh_server_time_observation_basis().await?;
+        let commitment = PmReadServerTimeObservationCommitment::from_source_bytes(
+            server_time_observation_commitment(
+                READ_SERVER_TIME_OBSERVATION_COMMITMENT_DOMAIN,
+                self.mode,
+                &fetched,
+            ),
+        );
+        let proof = self
+            .clock
+            .read_time(fetched.parsed_l2_timestamp, fetched.receive_clock);
+        Ok(PmReadServerTimeObservation::from_source(
+            fetched.parsed_l2_timestamp,
+            fetched.receive_clock,
+            commitment,
+            proof,
+        ))
     }
 
     /// Fetch one pending CLOB server time for mutation admission.
@@ -181,13 +461,37 @@ impl PmPublicHttpRole {
     pub async fn fresh_mutation_server_time(
         &self,
     ) -> Result<PmPendingMutationServerTime, PmLiveAdapterError> {
-        let (timestamp, received) = self.fresh_server_time().await?;
-        Ok(self.clock.pending_mutation_time(timestamp, received))
+        Ok(self
+            .fresh_mutation_server_time_observation()
+            .await?
+            .into_pending_mutation_server_time())
     }
 
-    async fn fresh_server_time(
+    pub async fn fresh_mutation_server_time_observation(
         &self,
-    ) -> Result<(L2Timestamp, PmRestResponseClock), PmLiveAdapterError> {
+    ) -> Result<PmMutationServerTimeObservation, PmLiveAdapterError> {
+        let fetched = self.fresh_server_time_observation_basis().await?;
+        let commitment = PmMutationServerTimeObservationCommitment::from_source_bytes(
+            server_time_observation_commitment(
+                MUTATION_SERVER_TIME_OBSERVATION_COMMITMENT_DOMAIN,
+                self.mode,
+                &fetched,
+            ),
+        );
+        let proof = self
+            .clock
+            .pending_mutation_time(fetched.parsed_l2_timestamp, fetched.receive_clock);
+        Ok(PmMutationServerTimeObservation::from_source(
+            fetched.parsed_l2_timestamp,
+            fetched.receive_clock,
+            commitment,
+            proof,
+        ))
+    }
+
+    async fn fresh_server_time_observation_basis(
+        &self,
+    ) -> Result<FetchedServerTime, PmLiveAdapterError> {
         fetch_server_time(&self.transport, || self.clock.observe_rest_edge()).await
     }
 
@@ -550,6 +854,140 @@ mod tests {
             1_234_567_892
         );
         for _ in 0..3 {
+            assert_eq!(requests.recv().await.unwrap(), "GET /time HTTP/1.1");
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn loopback_server_time_observations_bind_every_source_input_and_preserve_proofs() {
+        let (origin, mut requests, server) = mock_server(vec![
+            MockResponse::ok(b"1234567890".to_vec()),
+            MockResponse::ok(b"1234567891".to_vec()),
+        ])
+        .await;
+        let config = PmPublicHttpConfig::local_evidence(
+            &origin,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let clock = crate::PmProductClockOwner::test_support_scripted(&[
+            (1_000, 10),
+            (1_001, 11),
+            (1_002, 12),
+            (1_003, 13),
+        ])
+        .unwrap();
+        let (_, _, _, read_clock, _, mutation_clock, _, _, _, mut validator) =
+            clock.split().into_views();
+        let read =
+            PmReadServerTimeHttpRole::with_product_clock(config.clone(), read_clock).unwrap();
+        let mutation =
+            PmMutationServerTimeHttpRole::with_product_clock(config, mutation_clock).unwrap();
+
+        let read_observation = read.fresh_read_server_time_observation().await.unwrap();
+        assert_eq!(
+            read_observation.parsed_l2_timestamp().unix_seconds(),
+            1_234_567_890
+        );
+        assert_eq!(read_observation.receive_clock().monotonic_receive_ns(), 10);
+        let read_basis = FetchedServerTime {
+            raw_response: b"1234567890".to_vec(),
+            parsed_l2_timestamp: read_observation.parsed_l2_timestamp(),
+            receive_clock: read_observation.receive_clock(),
+        };
+        let base = server_time_observation_commitment(
+            READ_SERVER_TIME_OBSERVATION_COMMITMENT_DOMAIN,
+            OriginMode::LocalEvidence,
+            &read_basis,
+        );
+        assert_eq!(base, read_observation.commitment().bytes());
+        assert_ne!(
+            base,
+            server_time_observation_commitment(
+                READ_SERVER_TIME_OBSERVATION_COMMITMENT_DOMAIN,
+                OriginMode::Production,
+                &read_basis,
+            )
+        );
+        let raw_mutation = FetchedServerTime {
+            raw_response: b"{\"timestamp\":1234567890}".to_vec(),
+            parsed_l2_timestamp: read_basis.parsed_l2_timestamp,
+            receive_clock: read_basis.receive_clock,
+        };
+        assert_ne!(
+            base,
+            server_time_observation_commitment(
+                READ_SERVER_TIME_OBSERVATION_COMMITMENT_DOMAIN,
+                OriginMode::LocalEvidence,
+                &raw_mutation,
+            )
+        );
+        let parsed_mutation = FetchedServerTime {
+            raw_response: read_basis.raw_response.clone(),
+            parsed_l2_timestamp: L2Timestamp::from_unix_seconds(1_234_567_899).unwrap(),
+            receive_clock: read_basis.receive_clock,
+        };
+        assert_ne!(
+            base,
+            server_time_observation_commitment(
+                READ_SERVER_TIME_OBSERVATION_COMMITMENT_DOMAIN,
+                OriginMode::LocalEvidence,
+                &parsed_mutation,
+            )
+        );
+        assert_ne!(
+            base,
+            server_time_observation_commitment(
+                MUTATION_SERVER_TIME_OBSERVATION_COMMITMENT_DOMAIN,
+                OriginMode::LocalEvidence,
+                &read_basis,
+            )
+        );
+        assert_eq!(
+            read_observation
+                .into_read_server_time()
+                .into_l2_timestamp()
+                .unwrap()
+                .unix_seconds(),
+            1_234_567_890
+        );
+
+        let mutation_observation = mutation
+            .fresh_mutation_server_time_observation()
+            .await
+            .unwrap();
+        assert_eq!(
+            mutation_observation.parsed_l2_timestamp().unix_seconds(),
+            1_234_567_891
+        );
+        assert_eq!(
+            mutation_observation.receive_clock().monotonic_receive_ns(),
+            12
+        );
+        let clock_mutation = FetchedServerTime {
+            raw_response: read_basis.raw_response,
+            parsed_l2_timestamp: read_basis.parsed_l2_timestamp,
+            receive_clock: mutation_observation.receive_clock(),
+        };
+        assert_ne!(
+            base,
+            server_time_observation_commitment(
+                READ_SERVER_TIME_OBSERVATION_COMMITMENT_DOMAIN,
+                OriginMode::LocalEvidence,
+                &clock_mutation,
+            )
+        );
+        assert_eq!(
+            validator
+                .authorize(mutation_observation.into_pending_mutation_server_time())
+                .unwrap()
+                .into_l2_timestamp()
+                .unix_seconds(),
+            1_234_567_891
+        );
+        for _ in 0..2 {
             assert_eq!(requests.recv().await.unwrap(), "GET /time HTTP/1.1");
         }
         server.await.unwrap();

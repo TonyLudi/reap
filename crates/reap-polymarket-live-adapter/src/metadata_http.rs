@@ -2,7 +2,8 @@ use std::fmt;
 
 use reap_polymarket_wire::{
     MAX_PUBLIC_REST_BODY_BYTES, PmClobV2Metadata, PmClobV2RequestScope, PmLifecycleMetadata,
-    PmWireScope, parse_live_clob_market_lifecycle, parse_live_clob_v2_metadata,
+    PmLiveClobMarketLifecycle, PmLongMarketLifecycleDetails, PmWireScope,
+    parse_live_clob_market_lifecycle_details, parse_live_clob_v2_metadata,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -15,7 +16,7 @@ use crate::{
 };
 
 const LIVE_METADATA_OBSERVATION_COMMITMENT_DOMAIN: &[u8] =
-    b"reap.pm.live-adapter.public-metadata-observation.v1\0";
+    b"reap.pm.live-adapter.public-metadata-observation.v2\0";
 
 /// The two native public metadata bodies bound to one configured scope.
 /// Neither constituent body is delivered independently.
@@ -68,14 +69,19 @@ pub trait PmLiveMetadataPairSink {
 /// against the same configured condition/question/token scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PmTypedLiveMarketDetails {
-    lifecycle: PmLifecycleMetadata,
+    long_market: PmLiveClobMarketLifecycle,
     clob: PmClobV2Metadata,
 }
 
 impl PmTypedLiveMarketDetails {
     #[must_use]
     pub const fn lifecycle(&self) -> &PmLifecycleMetadata {
-        &self.lifecycle
+        self.long_market.metadata()
+    }
+
+    #[must_use]
+    pub const fn lifecycle_details(&self) -> &PmLongMarketLifecycleDetails {
+        self.long_market.details()
     }
 
     #[must_use]
@@ -132,6 +138,11 @@ impl PmLiveMetadataObservation {
     #[must_use]
     pub const fn lifecycle(&self) -> &PmLifecycleMetadata {
         self.details.lifecycle()
+    }
+
+    #[must_use]
+    pub const fn lifecycle_details(&self) -> &PmLongMarketLifecycleDetails {
+        self.details.lifecycle_details()
     }
 
     #[must_use]
@@ -216,12 +227,12 @@ impl PmPublicMetadataHttpRole {
     ) -> Result<PmLiveMetadataObservation, PmLiveAdapterError> {
         let (market_bytes, clob_v2_bytes) = self.fetch_pair().await?;
         let receive_clock = self.clock.observe()?;
-        let lifecycle = parse_live_clob_market_lifecycle(&market_bytes, self.scope)?;
+        let long_market = parse_live_clob_market_lifecycle_details(&market_bytes, self.scope)?;
         let clob = parse_live_clob_v2_metadata(
             &clob_v2_bytes,
             PmClobV2RequestScope::new(self.scope.condition(), self.scope.token()),
         )?;
-        let details = PmTypedLiveMarketDetails { lifecycle, clob };
+        let details = PmTypedLiveMarketDetails { long_market, clob };
         let commitment = live_metadata_observation_commitment(
             self.mode,
             self.scope,
@@ -295,6 +306,24 @@ fn live_metadata_observation_commitment(
         u8::from(state.accepting_orders()),
         u8::from(state.order_book_enabled()),
     ]);
+    let lifecycle_details = details.lifecycle_details();
+    encode_optional_metadata_ascii(
+        &mut digest,
+        lifecycle_details
+            .accepting_order_timestamp()
+            .map(|value| value.as_str()),
+    );
+    encode_metadata_bytes(
+        &mut digest,
+        lifecycle_details.end_date_iso().as_str().as_bytes(),
+    );
+    encode_optional_metadata_ascii(
+        &mut digest,
+        lifecycle_details
+            .game_start_time()
+            .map(|value| value.as_str()),
+    );
+    digest.update(lifecycle_details.seconds_delay().to_be_bytes());
 
     let clob = details.clob();
     digest.update(clob.requested_condition().bytes());
@@ -374,7 +403,8 @@ mod tests {
     use reap_pm_core::{PmConditionId, PmMarketId, PmQuantity, PmTokenId, U256};
     use reap_polymarket_wire::{
         PmBookMarketBinding, PmBookParserConfig, PmClobV2RequestScope, PmWireError,
-        parse_live_clob_market_lifecycle, parse_live_clob_v2_metadata,
+        parse_live_clob_market_lifecycle, parse_live_clob_market_lifecycle_details,
+        parse_live_clob_v2_metadata,
     };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -474,7 +504,7 @@ mod tests {
 
     fn long_market() -> String {
         format!(
-            r#"{{"condition_id":"{CONDITION}","question_id":"{MARKET}","active":true,"closed":false,"archived":false,"accepting_orders":true,"enable_order_book":true}}"#
+            r#"{{"condition_id":"{CONDITION}","question_id":"{MARKET}","active":true,"closed":false,"archived":false,"accepting_orders":true,"enable_order_book":true,"accepting_order_timestamp":"2026-08-08T00:00:00Z","end_date_iso":"2027-01-01T00:00:00Z","game_start_time":null,"seconds_delay":0}}"#
         )
     }
 
@@ -563,6 +593,20 @@ mod tests {
 
         assert_eq!(observation.lifecycle().condition(), scope().condition());
         assert_eq!(observation.lifecycle().market(), scope().market());
+        assert_eq!(
+            observation
+                .lifecycle_details()
+                .accepting_order_timestamp()
+                .unwrap()
+                .as_str(),
+            "2026-08-08T00:00:00Z"
+        );
+        assert_eq!(
+            observation.lifecycle_details().end_date_iso().as_str(),
+            "2027-01-01T00:00:00Z"
+        );
+        assert_eq!(observation.lifecycle_details().game_start_time(), None);
+        assert_eq!(observation.lifecycle_details().seconds_delay(), 0);
         assert_eq!(
             observation.clob().configured_outcome().token(),
             scope().token()
@@ -658,8 +702,11 @@ mod tests {
 
         let inactive_market = market.replace("\"active\":true", "\"active\":false");
         let inactive_details = PmTypedLiveMarketDetails {
-            lifecycle: parse_live_clob_market_lifecycle(inactive_market.as_bytes(), scope())
-                .unwrap(),
+            long_market: parse_live_clob_market_lifecycle_details(
+                inactive_market.as_bytes(),
+                scope(),
+            )
+            .unwrap(),
             clob: observation.clob().clone(),
         };
         assert_ne!(
@@ -673,6 +720,36 @@ mod tests {
                 received,
             )
         );
+
+        for lifecycle_mutation in [
+            market.replace("2026-08-08T00:00:00Z", "2026-08-08T00:00:01Z"),
+            market.replace("2027-01-01T00:00:00Z", "2027-01-02T00:00:00Z"),
+            market.replace(
+                r#""game_start_time":null"#,
+                r#""game_start_time":"2026-12-31T00:00:00Z""#,
+            ),
+            market.replace(r#""seconds_delay":0"#, r#""seconds_delay":1"#),
+        ] {
+            let lifecycle_details = PmTypedLiveMarketDetails {
+                long_market: parse_live_clob_market_lifecycle_details(
+                    lifecycle_mutation.as_bytes(),
+                    scope(),
+                )
+                .unwrap(),
+                clob: observation.clob().clone(),
+            };
+            assert_ne!(
+                base,
+                live_metadata_observation_commitment(
+                    OriginMode::LocalEvidence,
+                    scope(),
+                    market.as_bytes(),
+                    clob.as_bytes(),
+                    &lifecycle_details,
+                    received,
+                )
+            );
+        }
 
         let later_receive = loop {
             let candidate = role.clock.observe().unwrap();

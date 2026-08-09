@@ -3,7 +3,8 @@ mod support;
 use reap_pm_core::{PmConditionId, PmTick};
 use reap_polymarket_wire::{
     PmBookMarketBinding, PmBookParserConfig, PmClobV2RequestScope, PmWireError,
-    compute_snapshot_hash, parse_live_clob_market_lifecycle, parse_live_clob_v2_metadata,
+    compute_snapshot_hash, parse_live_clob_market_lifecycle,
+    parse_live_clob_market_lifecycle_details, parse_live_clob_v2_metadata,
     parse_rest_book_snapshot,
 };
 
@@ -92,15 +93,35 @@ fn short_market(condition: Option<&str>, tick: &str, minimum: &str, nr: Option<&
 
 #[test]
 fn current_long_route_owns_exact_lifecycle_and_question_identity() {
-    let parsed = parse_live_clob_market_lifecycle(long_market().as_bytes(), support::scope())
-        .expect("reviewed long response");
-    assert_eq!(parsed.condition(), support::scope().condition());
-    assert_eq!(parsed.market(), support::scope().market());
-    assert!(parsed.lifecycle().active());
-    assert!(!parsed.lifecycle().closed());
-    assert!(!parsed.lifecycle().archived());
-    assert!(parsed.lifecycle().accepting_orders());
-    assert!(parsed.lifecycle().order_book_enabled());
+    let parsed =
+        parse_live_clob_market_lifecycle_details(long_market().as_bytes(), support::scope())
+            .expect("reviewed long response");
+    let metadata = parsed.metadata();
+    assert_eq!(metadata.condition(), support::scope().condition());
+    assert_eq!(metadata.market(), support::scope().market());
+    assert!(metadata.lifecycle().active());
+    assert!(!metadata.lifecycle().closed());
+    assert!(!metadata.lifecycle().archived());
+    assert!(metadata.lifecycle().accepting_orders());
+    assert!(metadata.lifecycle().order_book_enabled());
+    assert_eq!(
+        parsed
+            .details()
+            .accepting_order_timestamp()
+            .unwrap()
+            .as_str(),
+        "2026-08-08T00:00:00Z"
+    );
+    assert_eq!(
+        parsed.details().end_date_iso().as_str(),
+        "2027-01-01T00:00:00Z"
+    );
+    assert_eq!(parsed.details().game_start_time(), None);
+    assert_eq!(parsed.details().seconds_delay(), 0);
+    assert_eq!(
+        parse_live_clob_market_lifecycle(long_market().as_bytes(), support::scope()).unwrap(),
+        *metadata
+    );
 
     let wrong_condition = long_market().replace(support::CONDITION, OTHER_CONDITION);
     assert_eq!(
@@ -112,6 +133,116 @@ fn current_long_route_owns_exact_lifecycle_and_question_identity() {
         parse_live_clob_market_lifecycle(wrong_market.as_bytes(), support::scope()),
         Err(PmWireError::MarketMismatch)
     );
+}
+
+#[test]
+fn long_lifecycle_detail_missing_null_type_and_bounds_match_the_frozen_shape() {
+    let valid = long_market();
+    let without_accepting = valid.replace(
+        "          \"accepting_order_timestamp\":\"2026-08-08T00:00:00Z\",\n",
+        "",
+    );
+    assert_eq!(
+        parse_live_clob_market_lifecycle_details(without_accepting.as_bytes(), support::scope())
+            .unwrap()
+            .details()
+            .accepting_order_timestamp(),
+        None
+    );
+    let without_game = valid.replace("          \"game_start_time\":null,\n", "");
+    assert_eq!(
+        parse_live_clob_market_lifecycle_details(without_game.as_bytes(), support::scope())
+            .unwrap()
+            .details()
+            .game_start_time(),
+        None
+    );
+    let scheduled = valid
+        .replace(
+            r#""game_start_time":null"#,
+            r#""game_start_time":"2026-12-31T00:00:00Z""#,
+        )
+        .replace(r#""seconds_delay":0"#, r#""seconds_delay":17"#);
+    let scheduled =
+        parse_live_clob_market_lifecycle_details(scheduled.as_bytes(), support::scope()).unwrap();
+    assert_eq!(
+        scheduled.details().game_start_time().unwrap().as_str(),
+        "2026-12-31T00:00:00Z"
+    );
+    assert_eq!(scheduled.details().seconds_delay(), 17);
+
+    for (raw, error) in [
+        (
+            valid.replace(
+                r#""accepting_order_timestamp":"2026-08-08T00:00:00Z""#,
+                r#""accepting_order_timestamp":null"#,
+            ),
+            PmWireError::NullField("accepting_order_timestamp"),
+        ),
+        (
+            valid.replace("          \"end_date_iso\":\"2027-01-01T00:00:00Z\",\n", ""),
+            PmWireError::MissingField("end_date_iso"),
+        ),
+        (
+            valid.replace(
+                r#""end_date_iso":"2027-01-01T00:00:00Z""#,
+                r#""end_date_iso":null"#,
+            ),
+            PmWireError::NullField("end_date_iso"),
+        ),
+        (
+            valid.replace("          \"seconds_delay\":0,\n", ""),
+            PmWireError::MissingField("seconds_delay"),
+        ),
+        (
+            valid.replace(r#""seconds_delay":0"#, r#""seconds_delay":null"#),
+            PmWireError::NullField("seconds_delay"),
+        ),
+        (
+            valid.replace(
+                r#""end_date_iso":"2027-01-01T00:00:00Z""#,
+                &format!(r#""end_date_iso":"{}""#, "x".repeat(129)),
+            ),
+            PmWireError::FieldTooLong("end_date_iso"),
+        ),
+        (
+            valid.replace(
+                r#""end_date_iso":"2027-01-01T00:00:00Z""#,
+                r#""end_date_iso":"""#,
+            ),
+            PmWireError::InvalidIdentity("end_date_iso"),
+        ),
+        (
+            valid.replace(
+                r#""end_date_iso":"2027-01-01T00:00:00Z""#,
+                r#""end_date_iso":"2027-été""#,
+            ),
+            PmWireError::NonAsciiField("end_date_iso"),
+        ),
+    ] {
+        assert_eq!(
+            parse_live_clob_market_lifecycle_details(raw.as_bytes(), support::scope()),
+            Err(error)
+        );
+    }
+
+    for raw in [
+        valid.replace(
+            r#""accepting_order_timestamp":"2026-08-08T00:00:00Z""#,
+            r#""accepting_order_timestamp":true"#,
+        ),
+        valid.replace(r#""game_start_time":null"#, r#""game_start_time":7"#),
+        valid.replace(r#""seconds_delay":0"#, r#""seconds_delay":"0""#),
+        valid.replace(
+            r#""end_date_iso":"2027-01-01T00:00:00Z""#,
+            r#""end_date_iso":"2027-01-01T00:00:00Z","end_date_iso":"2027-01-02T00:00:00Z""#,
+        ),
+    ] {
+        assert_eq!(
+            parse_live_clob_market_lifecycle_details(raw.as_bytes(), support::scope()),
+            Err(PmWireError::MalformedJson)
+        );
+    }
 }
 
 #[test]

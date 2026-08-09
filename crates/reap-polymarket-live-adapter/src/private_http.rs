@@ -11,10 +11,12 @@ use reqwest::{
     header::{ACCEPT, HeaderName, HeaderValue},
     redirect::Policy,
 };
+use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
 use crate::{
-    PmAccountHttpRole, PmLiveAdapterError, PmPrivateHttpConfig, PmReadOnlySignatureType,
+    PM_CLOB_PRODUCTION_ORIGIN, PmAccountHttpRole, PmLiveAdapterError, PmPrivateHttpConfig,
+    PmPrivateReadEdgeClock, PmPrivateReadProductClock, PmReadOnlySignatureType,
     PmReconciliationHttpRole, config::OriginMode, private_credentials::PmHttpCredentialRole,
 };
 
@@ -24,6 +26,75 @@ const POLY_SIGNATURE: HeaderName = HeaderName::from_static("poly_signature");
 const POLY_TIMESTAMP: HeaderName = HeaderName::from_static("poly_timestamp");
 const POLY_API_KEY: HeaderName = HeaderName::from_static("poly_api_key");
 const POLY_PASSPHRASE: HeaderName = HeaderName::from_static("poly_passphrase");
+const CLOSED_ONLY_OBSERVATION_COMMITMENT_DOMAIN: &[u8] =
+    b"reap.pm.live-adapter.closed-only-observation.v1\0";
+
+/// SHA-256 commitment to one fixed signer-authenticated closed-only read.
+/// Construction is private to the source role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PmClosedOnlyObservationCommitment([u8; 32]);
+
+impl PmClosedOnlyObservationCommitment {
+    const fn from_source_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+/// Sealed result of the fixed authenticated closed-only source.
+///
+/// For signature type 1, the commitment names the L2 signer and profile only.
+/// The response does not remotely attest the separately configured proxy
+/// funder.
+#[derive(Debug)]
+pub struct PmClosedOnlyObservation {
+    status: PmClosedOnlyStatus,
+    receive_clock: PmPrivateReadEdgeClock,
+    commitment: PmClosedOnlyObservationCommitment,
+}
+
+impl PmClosedOnlyObservation {
+    fn from_source(
+        status: PmClosedOnlyStatus,
+        receive_clock: PmPrivateReadEdgeClock,
+        commitment: PmClosedOnlyObservationCommitment,
+    ) -> Self {
+        Self {
+            status,
+            receive_clock,
+            commitment,
+        }
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> PmClosedOnlyStatus {
+        self.status
+    }
+
+    #[must_use]
+    pub const fn receive_clock(&self) -> PmPrivateReadEdgeClock {
+        self.receive_clock
+    }
+
+    #[must_use]
+    pub const fn commitment(&self) -> PmClosedOnlyObservationCommitment {
+        self.commitment
+    }
+
+    #[must_use]
+    pub const fn into_status(self) -> PmClosedOnlyStatus {
+        self.status
+    }
+}
+
+struct FetchedClosedOnly {
+    raw_response: Zeroizing<Vec<u8>>,
+    parsed: PmClosedOnlyStatus,
+}
 
 pub(crate) enum PmPrivateRoute<'a> {
     OpenOrders {
@@ -66,6 +137,7 @@ pub(crate) enum PmPrivateHttpObservation {
 pub(crate) struct PmPrivateHttpTransport {
     client: Client,
     origin: Url,
+    mode: OriginMode,
     configured_address: EoaAddress,
 }
 
@@ -118,8 +190,17 @@ impl PmPrivateHttpTransport {
         Ok(Self {
             client,
             origin,
+            mode,
             configured_address,
         })
+    }
+
+    pub(crate) const fn mode(&self) -> OriginMode {
+        self.mode
+    }
+
+    pub(crate) const fn configured_signer(&self) -> EoaAddress {
+        self.configured_address
     }
 
     pub(crate) async fn get(
@@ -329,6 +410,7 @@ impl PmAuthenticatedHttpOwner {
         PmPrivatePreflightHttpRole {
             authority: &mut self.authority,
             transport: &self.transport,
+            signature_type: self.balance_signature_type,
         }
     }
 
@@ -343,6 +425,7 @@ impl PmAuthenticatedHttpOwner {
 pub struct PmPrivatePreflightHttpRole<'a> {
     authority: &'a mut PmHttpCredentialRole,
     transport: &'a PmPrivateHttpTransport,
+    signature_type: PmReadOnlySignatureType,
 }
 
 impl PmPrivatePreflightHttpRole<'_> {
@@ -350,6 +433,39 @@ impl PmPrivatePreflightHttpRole<'_> {
         &mut self,
         server_time: crate::PmReadServerTime,
     ) -> Result<PmClosedOnlyStatus, PmLiveAdapterError> {
+        Ok(self.closed_only_source(server_time).await?.parsed)
+    }
+
+    pub async fn closed_only_observation(
+        &mut self,
+        server_time: crate::PmReadServerTime,
+        clock: &mut PmPrivateReadProductClock,
+    ) -> Result<PmClosedOnlyObservation, PmLiveAdapterError> {
+        let fetched = self.closed_only_source(server_time).await?;
+        // The source samples after authentication, the complete bounded body,
+        // and strict parsing have all succeeded.
+        let receive_clock = clock
+            .observe_authenticated_read_complete()
+            .map_err(|_| PmLiveAdapterError::ProductClock)?;
+        let commitment = closed_only_observation_commitment(
+            self.transport.mode(),
+            self.signature_type,
+            self.transport.configured_signer().bytes(),
+            &fetched.raw_response,
+            fetched.parsed,
+            receive_clock,
+        );
+        Ok(PmClosedOnlyObservation::from_source(
+            fetched.parsed,
+            receive_clock,
+            commitment,
+        ))
+    }
+
+    async fn closed_only_source(
+        &mut self,
+        server_time: crate::PmReadServerTime,
+    ) -> Result<FetchedClosedOnly, PmLiveAdapterError> {
         let headers = self
             .authority
             .authenticate_closed_only(
@@ -368,7 +484,51 @@ impl PmPrivatePreflightHttpRole<'_> {
                 return Err(PmLiveAdapterError::UnexpectedStatus { status: 404 });
             }
         };
-        parse_pm_closed_only(&body).map_err(Into::into)
+        let parsed = parse_pm_closed_only(&body)?;
+        Ok(FetchedClosedOnly {
+            raw_response: body,
+            parsed,
+        })
+    }
+}
+
+fn closed_only_observation_commitment(
+    mode: OriginMode,
+    signature_type: PmReadOnlySignatureType,
+    authenticated_signer: [u8; 20],
+    raw_response: &[u8],
+    parsed: PmClosedOnlyStatus,
+    receive_clock: PmPrivateReadEdgeClock,
+) -> PmClosedOnlyObservationCommitment {
+    let mut digest = Sha256::new();
+    encode_closed_only_bytes(&mut digest, CLOSED_ONLY_OBSERVATION_COMMITMENT_DOMAIN);
+    encode_closed_only_bytes(&mut digest, origin_mode_name(mode));
+    encode_closed_only_bytes(&mut digest, PM_CLOB_PRODUCTION_ORIGIN.as_bytes());
+    encode_closed_only_bytes(&mut digest, b"GET");
+    encode_closed_only_bytes(&mut digest, b"/auth/ban-status/closed-only");
+    digest.update([signature_type.value()]);
+    digest.update(authenticated_signer);
+    encode_closed_only_bytes(&mut digest, raw_response);
+    digest.update([u8::from(parsed.closed_only())]);
+    digest.update(receive_clock.local_wall_receive_ns().to_be_bytes());
+    digest.update(receive_clock.monotonic_receive_ns().to_be_bytes());
+    PmClosedOnlyObservationCommitment::from_source_bytes(digest.finalize().into())
+}
+
+fn encode_closed_only_bytes(digest: &mut Sha256, value: &[u8]) {
+    digest.update(
+        u64::try_from(value.len())
+            .expect("bounded closed-only commitment field length fits u64")
+            .to_be_bytes(),
+    );
+    digest.update(value);
+}
+
+const fn origin_mode_name(mode: OriginMode) -> &'static [u8] {
+    match mode {
+        OriginMode::Production => b"production",
+        #[cfg(any(test, feature = "loopback-evidence", feature = "read-only-evidence"))]
+        OriginMode::LocalEvidence => b"local-evidence",
     }
 }
 
@@ -656,6 +816,12 @@ mod tests {
         crate::product_clock::test_support_read_server_time(AUTH_SECONDS)
     }
 
+    fn private_read_clock(readings: &[(u64, u64)]) -> PmPrivateReadProductClock {
+        let owner = crate::PmProductClockOwner::test_support_scripted(readings).unwrap();
+        let (_, _, _, _, private_read, _, _, _, _, _) = owner.split().into_views();
+        private_read
+    }
+
     #[tokio::test]
     async fn exact_routes_headers_pagination_and_account_wide_retention() {
         let foreign_order = order(ORDER_ID, FOREIGN_CONDITION, "999", FOREIGN_MAKER, API_KEY);
@@ -838,6 +1004,258 @@ mod tests {
 
         task.await.unwrap();
         assert!(requests.try_recv().is_err());
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn loopback_type_one_preflight_observations_bind_source_inputs_after_parse() {
+        let closed_raw = br#"{"closed_only":false}"#;
+        let balance_raw = balance();
+        let alternate_balance_raw = balance_raw.replace("1000", "1001");
+        let (origin, mut requests, task) = mock_server(vec![
+            MockResponse::ok(closed_raw.to_vec()),
+            MockResponse::ok(balance_raw.clone()),
+            MockResponse::ok(balance_raw.clone()),
+            MockResponse::ok(alternate_balance_raw),
+        ])
+        .await;
+        let (mut owner, supervisor) = local_proxy_owner(
+            &origin,
+            Duration::from_secs(1),
+            reap_pm_core::EvmAddress::parse(FOREIGN_MAKER).unwrap(),
+        );
+        let mut clock = private_read_clock(&[
+            (1_000, 10),
+            (1_001, 11),
+            (1_002, 12),
+            (1_003, 13),
+            (1_004, 14),
+        ]);
+        let signer = reap_pm_core::EvmAddress::parse(ADDRESS).unwrap().bytes();
+        let foreign_signer = reap_pm_core::EvmAddress::parse(FOREIGN_MAKER)
+            .unwrap()
+            .bytes();
+
+        let closed = owner
+            .preflight()
+            .closed_only_observation(timestamp(), &mut clock)
+            .await
+            .unwrap();
+        assert!(!closed.status().closed_only());
+        assert_eq!(closed.receive_clock().monotonic_receive_ns(), 10);
+        let closed_base = closed_only_observation_commitment(
+            OriginMode::LocalEvidence,
+            PmReadOnlySignatureType::Proxy,
+            signer,
+            closed_raw,
+            closed.status(),
+            closed.receive_clock(),
+        );
+        assert_eq!(closed_base, closed.commitment());
+        assert_ne!(
+            closed_base,
+            closed_only_observation_commitment(
+                OriginMode::Production,
+                PmReadOnlySignatureType::Proxy,
+                signer,
+                closed_raw,
+                closed.status(),
+                closed.receive_clock(),
+            )
+        );
+        assert_ne!(
+            closed_base,
+            closed_only_observation_commitment(
+                OriginMode::LocalEvidence,
+                PmReadOnlySignatureType::Eoa,
+                signer,
+                closed_raw,
+                closed.status(),
+                closed.receive_clock(),
+            )
+        );
+        assert_ne!(
+            closed_base,
+            closed_only_observation_commitment(
+                OriginMode::LocalEvidence,
+                PmReadOnlySignatureType::Proxy,
+                foreign_signer,
+                closed_raw,
+                closed.status(),
+                closed.receive_clock(),
+            )
+        );
+        let closed_raw_mutation = br#"{ "closed_only": false }"#;
+        assert_ne!(
+            closed_base,
+            closed_only_observation_commitment(
+                OriginMode::LocalEvidence,
+                PmReadOnlySignatureType::Proxy,
+                signer,
+                closed_raw_mutation,
+                closed.status(),
+                closed.receive_clock(),
+            )
+        );
+        let closed_status_mutation = parse_pm_closed_only(br#"{"closed_only":true}"#).unwrap();
+        assert_ne!(
+            closed_base,
+            closed_only_observation_commitment(
+                OriginMode::LocalEvidence,
+                PmReadOnlySignatureType::Proxy,
+                signer,
+                closed_raw,
+                closed_status_mutation,
+                closed.receive_clock(),
+            )
+        );
+
+        let (collateral, conditional, alternate_value) = {
+            let mut account = owner.account();
+            let collateral = account
+                .collateral_balance_allowance_observation(timestamp(), &mut clock)
+                .await
+                .unwrap();
+            let conditional = account
+                .conditional_balance_allowance_observation(timestamp(), &mut clock)
+                .await
+                .unwrap();
+            let alternate_value = account
+                .collateral_balance_allowance_observation(timestamp(), &mut clock)
+                .await
+                .unwrap();
+            (collateral, conditional, alternate_value)
+        };
+        assert_eq!(
+            collateral.balance_allowance().asset(),
+            crate::PmAccountAsset::Collateral
+        );
+        assert_eq!(collateral.receive_clock().monotonic_receive_ns(), 11);
+        assert_eq!(
+            conditional.balance_allowance().asset(),
+            crate::PmAccountAsset::Conditional(scope().token())
+        );
+        let balance_base = crate::account::balance_allowance_observation_commitment(
+            OriginMode::LocalEvidence,
+            PmReadOnlySignatureType::Proxy,
+            signer,
+            balance_raw.as_bytes(),
+            collateral.balance_allowance(),
+            collateral.receive_clock(),
+        );
+        assert_eq!(balance_base, collateral.commitment());
+        assert_ne!(
+            balance_base,
+            crate::account::balance_allowance_observation_commitment(
+                OriginMode::Production,
+                PmReadOnlySignatureType::Proxy,
+                signer,
+                balance_raw.as_bytes(),
+                collateral.balance_allowance(),
+                collateral.receive_clock(),
+            )
+        );
+        assert_ne!(
+            balance_base,
+            crate::account::balance_allowance_observation_commitment(
+                OriginMode::LocalEvidence,
+                PmReadOnlySignatureType::Eoa,
+                signer,
+                balance_raw.as_bytes(),
+                collateral.balance_allowance(),
+                collateral.receive_clock(),
+            )
+        );
+        assert_ne!(
+            balance_base,
+            crate::account::balance_allowance_observation_commitment(
+                OriginMode::LocalEvidence,
+                PmReadOnlySignatureType::Proxy,
+                foreign_signer,
+                balance_raw.as_bytes(),
+                collateral.balance_allowance(),
+                collateral.receive_clock(),
+            )
+        );
+        let balance_raw_mutation = format!("{balance_raw} ");
+        assert_ne!(
+            balance_base,
+            crate::account::balance_allowance_observation_commitment(
+                OriginMode::LocalEvidence,
+                PmReadOnlySignatureType::Proxy,
+                signer,
+                balance_raw_mutation.as_bytes(),
+                collateral.balance_allowance(),
+                collateral.receive_clock(),
+            )
+        );
+        assert_ne!(
+            balance_base,
+            crate::account::balance_allowance_observation_commitment(
+                OriginMode::LocalEvidence,
+                PmReadOnlySignatureType::Proxy,
+                signer,
+                balance_raw.as_bytes(),
+                conditional.balance_allowance(),
+                collateral.receive_clock(),
+            )
+        );
+        assert_ne!(
+            balance_base,
+            crate::account::balance_allowance_observation_commitment(
+                OriginMode::LocalEvidence,
+                PmReadOnlySignatureType::Proxy,
+                signer,
+                balance_raw.as_bytes(),
+                alternate_value.balance_allowance(),
+                collateral.receive_clock(),
+            )
+        );
+        let later_receive = clock.observe_authenticated_read_complete().unwrap();
+        assert_ne!(
+            balance_base,
+            crate::account::balance_allowance_observation_commitment(
+                OriginMode::LocalEvidence,
+                PmReadOnlySignatureType::Proxy,
+                signer,
+                balance_raw.as_bytes(),
+                collateral.balance_allowance(),
+                later_receive,
+            )
+        );
+
+        assert!(
+            !closed.into_status().closed_only(),
+            "consuming the sealed carrier preserves the legacy typed status"
+        );
+        assert_eq!(
+            collateral.into_balance_allowance().value().balance(),
+            U256::from_u64(1_000)
+        );
+
+        let mut request_lines = Vec::new();
+        for _ in 0..4 {
+            request_lines.push(
+                requests
+                    .recv()
+                    .await
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+        assert_eq!(
+            request_lines,
+            [
+                "GET /auth/ban-status/closed-only HTTP/1.1",
+                "GET /balance-allowance?asset_type=COLLATERAL&signature_type=1 HTTP/1.1",
+                "GET /balance-allowance?asset_type=CONDITIONAL&token_id=123&signature_type=1 HTTP/1.1",
+                "GET /balance-allowance?asset_type=COLLATERAL&signature_type=1 HTTP/1.1",
+            ]
+        );
+        task.await.unwrap();
         supervisor.shutdown().await.unwrap();
     }
 

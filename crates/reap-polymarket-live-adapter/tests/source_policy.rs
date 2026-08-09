@@ -91,6 +91,12 @@ fn modules_are_separate_and_raw_transport_remains_private() {
 
 #[test]
 fn public_preflight_observations_are_source_clocked_committed_and_sealed() {
+    assert!(METADATA_HTTP.contains(
+        r#"reap.pm.live-adapter.public-metadata-observation.v2\0"#
+    ));
+    assert!(!METADATA_HTTP.contains(
+        r#"reap.pm.live-adapter.public-metadata-observation.v1\0"#
+    ));
     for required in [
         "pub struct PmHttpReceiveClock",
         "pub(crate) struct PmHttpReceiveClockSource",
@@ -159,6 +165,125 @@ fn public_preflight_observations_are_source_clocked_committed_and_sealed() {
     let geoblock_carriers = &GEOBLOCK_HTTP[geoblock_start..geoblock_end];
     assert!(!geoblock_carriers.contains("raw_response:"));
     assert!(!geoblock_carriers.contains("body:"));
+}
+
+#[test]
+fn server_time_and_type_one_account_observations_are_sealed_and_source_clocked() {
+    let source = [PUBLIC_HTTP, PRIVATE_HTTP, ACCOUNT].join("\n");
+    for required in [
+        "pub struct PmReadServerTimeObservation",
+        "pub struct PmMutationServerTimeObservation",
+        "pub async fn fresh_read_server_time_observation(",
+        "pub async fn fresh_mutation_server_time_observation(",
+        "pub fn into_read_server_time(self) -> PmReadServerTime",
+        "pub fn into_pending_mutation_server_time(self) -> PmPendingMutationServerTime",
+        "READ_SERVER_TIME_OBSERVATION_COMMITMENT_DOMAIN",
+        "MUTATION_SERVER_TIME_OBSERVATION_COMMITMENT_DOMAIN",
+        "encode_server_time_bytes(&mut digest, &fetched.raw_response);",
+        "fetched.parsed_l2_timestamp.unix_seconds()",
+        "fetched.receive_clock.local_wall_receive_ns()",
+        "pub struct PmClosedOnlyObservation",
+        "pub async fn closed_only_observation(",
+        "let fetched = self.closed_only_source(server_time).await?;",
+        "observe_authenticated_read_complete()",
+        "CLOSED_ONLY_OBSERVATION_COMMITMENT_DOMAIN",
+        "pub struct PmAccountBalanceAllowanceObservation",
+        "pub async fn collateral_balance_allowance_observation(",
+        "pub async fn conditional_balance_allowance_observation(",
+        "BALANCE_ALLOWANCE_OBSERVATION_COMMITMENT_DOMAIN",
+        "self.transport.configured_signer().bytes()",
+        "signature_type.value()",
+        "parsed.asset()",
+        "encode_balance_bytes(&mut digest, raw_response);",
+        "parsed.value().balance()",
+    ] {
+        assert!(
+            source.contains(required),
+            "missing server/private provenance invariant: {required}"
+        );
+    }
+
+    for forbidden in [
+        "pub fn from_source(",
+        "pub const fn from_source_bytes(",
+        "pub fn raw_response(",
+        "pub const fn raw_response(",
+        "pub fn commitment_from_bytes(",
+        "PRODUCTION_ORDER_ENTRY_AUTHORIZED: bool = true",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "server/private observation construction or authority escape: {forbidden}"
+        );
+    }
+
+    let fetch_start = PUBLIC_HTTP.find("async fn fetch_server_time").unwrap();
+    let fetch_end = PUBLIC_HTTP[fetch_start..]
+        .find("fn server_time_observation_commitment")
+        .map(|offset| fetch_start + offset)
+        .unwrap();
+    let fetch = &PUBLIC_HTTP[fetch_start..fetch_end];
+    assert!(
+        fetch.find("let received = observe_rest_edge()").unwrap()
+            < fetch
+                .find("let seconds = parse_server_time(&body)")
+                .unwrap()
+    );
+
+    let closed_observe_start = PRIVATE_HTTP
+        .find("pub async fn closed_only_observation(")
+        .unwrap();
+    let closed_observe_end = PRIVATE_HTTP[closed_observe_start..]
+        .find("async fn closed_only_source(")
+        .map(|offset| closed_observe_start + offset)
+        .unwrap();
+    let closed_observe = &PRIVATE_HTTP[closed_observe_start..closed_observe_end];
+    assert!(
+        closed_observe
+            .find("self.closed_only_source(server_time)")
+            .unwrap()
+            < closed_observe
+                .find("observe_authenticated_read_complete()")
+                .unwrap()
+    );
+
+    let balance_observe_start = ACCOUNT.find("async fn read_observation(").unwrap();
+    let balance_observe_end = ACCOUNT[balance_observe_start..]
+        .find("async fn read_source(")
+        .map(|offset| balance_observe_start + offset)
+        .unwrap();
+    let balance_observe = &ACCOUNT[balance_observe_start..balance_observe_end];
+    assert!(
+        balance_observe
+            .find("self.read_source(server_time, route, asset)")
+            .unwrap()
+            < balance_observe
+                .find("observe_authenticated_read_complete()")
+                .unwrap()
+    );
+
+    let closed_commitment_start = PRIVATE_HTTP
+        .find("fn closed_only_observation_commitment(")
+        .unwrap();
+    let closed_commitment_end = PRIVATE_HTTP[closed_commitment_start..]
+        .find("fn encode_closed_only_bytes")
+        .map(|offset| closed_commitment_start + offset)
+        .unwrap();
+    let closed_commitment = &PRIVATE_HTTP[closed_commitment_start..closed_commitment_end];
+    let balance_commitment_start = ACCOUNT
+        .find("pub(crate) fn balance_allowance_observation_commitment(")
+        .unwrap();
+    let balance_commitment_end = ACCOUNT[balance_commitment_start..]
+        .find("fn encode_balance_bytes")
+        .map(|offset| balance_commitment_start + offset)
+        .unwrap();
+    let balance_commitment = &ACCOUNT[balance_commitment_start..balance_commitment_end];
+    for commitment in [closed_commitment, balance_commitment] {
+        assert!(!commitment.contains("funder"));
+        assert!(!commitment.contains("expected_order_maker"));
+    }
+    assert!(PRIVATE_HTTP.contains("response does not remotely attest"));
+    assert!(ACCOUNT.contains("was echoed or remotely attested"));
 }
 
 #[test]

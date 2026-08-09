@@ -33,7 +33,8 @@ mod user_ws;
 mod user_ws_config;
 
 pub use account::{
-    PmAccountAsset, PmAccountBalanceAllowance, PmAccountHttpRole, PmReadOnlyAccountHttpOwner,
+    PmAccountAsset, PmAccountBalanceAllowance, PmAccountBalanceAllowanceObservation,
+    PmAccountBalanceAllowanceObservationCommitment, PmAccountHttpRole, PmReadOnlyAccountHttpOwner,
     PmReadOnlySignatureType,
 };
 pub use config::{
@@ -68,7 +69,10 @@ pub use private_credentials::{
     PmCredentialAuthorityShutdownOutcome, PmCredentialAuthoritySupervisor,
     PmPrivateConnectivityOwner, PmPrivateConnectivityRoles,
 };
-pub use private_http::{PmAuthenticatedHttpOwner, PmPrivatePreflightHttpRole};
+pub use private_http::{
+    PmAuthenticatedHttpOwner, PmClosedOnlyObservation, PmClosedOnlyObservationCommitment,
+    PmPrivatePreflightHttpRole,
+};
 #[cfg(any(test, feature = "loopback-evidence"))]
 pub use product_clock::PmLoopbackServerTimeScript;
 pub use product_clock::{
@@ -81,7 +85,9 @@ pub use product_clock::{
 };
 pub use public_connectivity::{PmPublicConnectivityOwner, PmPublicConnectivityRoles};
 pub use public_http::{
-    PmMutationServerTimeHttpRole, PmPublicHttpRole, PmReadServerTimeHttpRole, PmRestBookPurpose,
+    PmMutationServerTimeHttpRole, PmMutationServerTimeObservation,
+    PmMutationServerTimeObservationCommitment, PmPublicHttpRole, PmReadServerTimeHttpRole,
+    PmReadServerTimeObservation, PmReadServerTimeObservationCommitment, PmRestBookPurpose,
     PmRestBookSnapshotSink,
 };
 pub use public_ws::{

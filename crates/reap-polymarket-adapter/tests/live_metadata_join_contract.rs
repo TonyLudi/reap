@@ -30,6 +30,10 @@ fn long_market() -> String {
           "archived":false,
           "accepting_orders":true,
           "enable_order_book":true,
+          "accepting_order_timestamp":"2026-08-08T00:00:00Z",
+          "end_date_iso":"2027-01-01T00:00:00Z",
+          "game_start_time":null,
+          "seconds_delay":0,
           "minimum_order_size":5,
           "minimum_tick_size":0.01,
           "tokens":[]
@@ -159,4 +163,22 @@ fn lifecycle_and_trading_contract_contradictions_remain_typed() {
             expected.to_string()
         );
     }
+}
+
+#[test]
+fn long_lifecycle_details_are_required_and_strict_before_join() {
+    let missing_end =
+        long_market().replace("          \"end_date_iso\":\"2027-01-01T00:00:00Z\",\n", "");
+    assert!(matches!(
+        join(&missing_end, &short_market(None, "0.01", "5", false, "Yes")),
+        Err(PmMetadataJoinError::Wire(PmWireError::MissingField(
+            "end_date_iso"
+        )))
+    ));
+
+    let wrong_delay = long_market().replace(r#""seconds_delay":0"#, r#""seconds_delay":"0""#);
+    assert!(matches!(
+        join(&wrong_delay, &short_market(None, "0.01", "5", false, "Yes")),
+        Err(PmMetadataJoinError::Wire(PmWireError::MalformedJson))
+    ));
 }

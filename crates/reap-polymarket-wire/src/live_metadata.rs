@@ -22,6 +22,8 @@ use crate::limits::{MAX_MARKET_TOKENS, MAX_PUBLIC_REST_BODY_BYTES};
 use crate::rest::{PmClobToken, PmLifecycleMetadata, parse_token};
 use crate::{PmWireError, PmWireScope};
 
+const MAX_LIFECYCLE_TIME_STRING_BYTES: usize = 128;
+
 /// Typed provenance for the fixed `/clob-markets/{condition}` request.
 ///
 /// The abbreviated response is not allowed to invent a market/question ID.
@@ -31,6 +33,72 @@ use crate::{PmWireError, PmWireScope};
 pub struct PmClobV2RequestScope {
     condition: PmConditionId,
     token: PmTokenId,
+}
+
+/// One bounded exact string from a long-market lifecycle time field.
+///
+/// The wire layer deliberately retains the venue string instead of parsing it
+/// through a wall-clock type. Canonical UTC policy belongs to the consuming
+/// preflight, while this type proves the source value was nonempty, ASCII, and
+/// bounded before it left the parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PmLifecycleTimeString(Box<str>);
+
+impl PmLifecycleTimeString {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Lifecycle details owned only by the long `GET /markets/{condition}` body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PmLongMarketLifecycleDetails {
+    accepting_order_timestamp: Option<PmLifecycleTimeString>,
+    end_date_iso: PmLifecycleTimeString,
+    game_start_time: Option<PmLifecycleTimeString>,
+    seconds_delay: u64,
+}
+
+impl PmLongMarketLifecycleDetails {
+    #[must_use]
+    pub const fn accepting_order_timestamp(&self) -> Option<&PmLifecycleTimeString> {
+        self.accepting_order_timestamp.as_ref()
+    }
+
+    #[must_use]
+    pub const fn end_date_iso(&self) -> &PmLifecycleTimeString {
+        &self.end_date_iso
+    }
+
+    #[must_use]
+    pub const fn game_start_time(&self) -> Option<&PmLifecycleTimeString> {
+        self.game_start_time.as_ref()
+    }
+
+    #[must_use]
+    pub const fn seconds_delay(&self) -> u64 {
+        self.seconds_delay
+    }
+}
+
+/// Complete typed projection of the long live-market response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PmLiveClobMarketLifecycle {
+    metadata: PmLifecycleMetadata,
+    details: PmLongMarketLifecycleDetails,
+}
+
+impl PmLiveClobMarketLifecycle {
+    #[must_use]
+    pub const fn metadata(&self) -> &PmLifecycleMetadata {
+        &self.metadata
+    }
+
+    #[must_use]
+    pub const fn details(&self) -> &PmLongMarketLifecycleDetails {
+        &self.details
+    }
 }
 
 impl PmClobV2RequestScope {
@@ -174,6 +242,15 @@ pub fn parse_live_clob_market_lifecycle(
     raw: &[u8],
     scope: PmWireScope,
 ) -> Result<PmLifecycleMetadata, PmWireError> {
+    parse_live_clob_market_lifecycle_details(raw, scope).map(|parsed| *parsed.metadata())
+}
+
+/// Parses lifecycle, question identity, and exact lifecycle details from
+/// `GET /markets/{condition}`.
+pub fn parse_live_clob_market_lifecycle_details(
+    raw: &[u8],
+    scope: PmWireScope,
+) -> Result<PmLiveClobMarketLifecycle, PmWireError> {
     check_rest_bound(raw)?;
     let wire =
         serde_json::from_slice::<RawLongClobMarket>(raw).map_err(|_| PmWireError::MalformedJson)?;
@@ -192,9 +269,41 @@ pub fn parse_live_clob_market_lifecycle(
         required_copy(wire.accepting_orders, "accepting_orders")?,
         required_copy(wire.enable_order_book, "enable_order_book")?,
     );
-    Ok(PmLifecycleMetadata::from_parts(
-        condition, market, lifecycle,
-    ))
+    let accepting_order_timestamp = match wire.accepting_order_timestamp {
+        PresentField::Missing => None,
+        PresentField::Present(None) => {
+            return Err(PmWireError::NullField("accepting_order_timestamp"));
+        }
+        PresentField::Present(Some(value)) => Some(parse_lifecycle_time_string(
+            value,
+            "accepting_order_timestamp",
+        )?),
+    };
+    let end_date_iso = match wire.end_date_iso {
+        PresentField::Missing => return Err(PmWireError::MissingField("end_date_iso")),
+        PresentField::Present(None) => return Err(PmWireError::NullField("end_date_iso")),
+        PresentField::Present(Some(value)) => parse_lifecycle_time_string(value, "end_date_iso")?,
+    };
+    let game_start_time = match wire.game_start_time {
+        PresentField::Missing | PresentField::Present(None) => None,
+        PresentField::Present(Some(value)) => {
+            Some(parse_lifecycle_time_string(value, "game_start_time")?)
+        }
+    };
+    let seconds_delay = match wire.seconds_delay {
+        PresentField::Missing => return Err(PmWireError::MissingField("seconds_delay")),
+        PresentField::Present(None) => return Err(PmWireError::NullField("seconds_delay")),
+        PresentField::Present(Some(value)) => value,
+    };
+    Ok(PmLiveClobMarketLifecycle {
+        metadata: PmLifecycleMetadata::from_parts(condition, market, lifecycle),
+        details: PmLongMarketLifecycleDetails {
+            accepting_order_timestamp,
+            end_date_iso,
+            game_start_time,
+            seconds_delay,
+        },
+    })
 }
 
 /// Parses exact trading metadata from `GET /clob-markets/{condition}`.
@@ -322,6 +431,25 @@ fn parse_fee_decimal(
     Ok(PmClobFeeDecimal(text.into()))
 }
 
+fn parse_lifecycle_time_string(
+    value: String,
+    field: &'static str,
+) -> Result<PmLifecycleTimeString, PmWireError> {
+    if value.is_empty() {
+        return Err(PmWireError::InvalidIdentity(field));
+    }
+    if value.len() > MAX_LIFECYCLE_TIME_STRING_BYTES {
+        return Err(PmWireError::FieldTooLong(field));
+    }
+    if !value.is_ascii() {
+        return Err(PmWireError::NonAsciiField(field));
+    }
+    if value.bytes().any(|byte| !byte.is_ascii_graphic()) {
+        return Err(PmWireError::InvalidIdentity(field));
+    }
+    Ok(PmLifecycleTimeString(value.into()))
+}
+
 fn check_rest_bound(raw: &[u8]) -> Result<(), PmWireError> {
     if raw.len() > MAX_PUBLIC_REST_BODY_BYTES {
         Err(PmWireError::RestBodyTooLarge)
@@ -395,8 +523,8 @@ struct RawLongClobMarket {
     accepting_orders: Option<bool>,
     #[serde(default)]
     enable_order_book: Option<bool>,
-    #[serde(default, rename = "accepting_order_timestamp")]
-    _accepting_order_timestamp: Option<Box<RawValue>>,
+    #[serde(default)]
+    accepting_order_timestamp: PresentField<Option<String>>,
     #[serde(default, rename = "minimum_order_size")]
     _minimum_order_size: Option<Box<RawValue>>,
     #[serde(default, rename = "minimum_tick_size")]
@@ -407,12 +535,12 @@ struct RawLongClobMarket {
     _description: Option<Box<RawValue>>,
     #[serde(default, rename = "market_slug")]
     _market_slug: Option<Box<RawValue>>,
-    #[serde(default, rename = "end_date_iso")]
-    _end_date_iso: Option<Box<RawValue>>,
-    #[serde(default, rename = "game_start_time")]
-    _game_start_time: Option<Box<RawValue>>,
-    #[serde(default, rename = "seconds_delay")]
-    _seconds_delay: Option<Box<RawValue>>,
+    #[serde(default)]
+    end_date_iso: PresentField<Option<String>>,
+    #[serde(default)]
+    game_start_time: PresentField<Option<String>>,
+    #[serde(default)]
+    seconds_delay: PresentField<Option<u64>>,
     #[serde(default, rename = "fpmm")]
     _fpmm: Option<Box<RawValue>>,
     #[serde(default, rename = "maker_base_fee")]

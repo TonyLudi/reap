@@ -848,7 +848,7 @@ mod tests {
         let condition = exact_scope.condition().to_string();
         let market = exact_scope.market().to_string();
         let long_market = format!(
-            r#"{{"condition_id":"{condition}","question_id":"{market}","active":true,"closed":false,"archived":false,"accepting_orders":true,"enable_order_book":true}}"#
+            r#"{{"condition_id":"{condition}","question_id":"{market}","active":true,"closed":false,"archived":false,"accepting_orders":true,"enable_order_book":true,"accepting_order_timestamp":"2026-08-08T00:00:00Z","end_date_iso":"2027-01-01T00:00:00Z","game_start_time":null,"seconds_delay":0}}"#
         );
         let short_market = format!(
             r#"{{"c":"{condition}","t":[{{"t":"7","o":"Yes"}},{{"t":"8","o":"No"}}],"mts":0.01,"mos":5,"nr":false,"fd":{{"r":0.020,"e":2.0,"to":true}},"mbf":0,"tbf":0,"itode":false,"oas":0}}"#
@@ -900,6 +900,20 @@ mod tests {
         let details = roles.market_details.refresh_typed().await.unwrap();
         assert_eq!(details.lifecycle().condition(), exact_scope.condition());
         assert_eq!(details.lifecycle().market(), exact_scope.market());
+        assert_eq!(
+            details
+                .lifecycle_details()
+                .accepting_order_timestamp()
+                .unwrap()
+                .as_str(),
+            "2026-08-08T00:00:00Z"
+        );
+        assert_eq!(
+            details.lifecycle_details().end_date_iso().as_str(),
+            "2027-01-01T00:00:00Z"
+        );
+        assert_eq!(details.lifecycle_details().game_start_time(), None);
+        assert_eq!(details.lifecycle_details().seconds_delay(), 0);
         assert_eq!(
             details.clob().configured_outcome().token(),
             exact_scope.token()
