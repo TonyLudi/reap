@@ -18,7 +18,9 @@ reap-pm-controlled-trial-live.workspace = true
 reap-pm-state.workspace = true
 reap-polymarket-adapter.workspace = true
 reap-polymarket-auth.workspace = true
+reap-polymarket-chain-source.workspace = true
 reap-polymarket-live-adapter.workspace = true
+reap-polymarket-public-source.workspace = true
 reap-polymarket-wire.workspace = true
 reap-transport.workspace = true
 rustix = { version = "=1.1.4", features = ["fs", "net", "process", "system", "thread"] }

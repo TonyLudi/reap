@@ -1,5 +1,8 @@
+mod credential_custody;
+
 use std::{
     fmt,
+    path::PathBuf,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -15,9 +18,9 @@ use reap_pm_controlled_trial_live::{
 use reap_pm_core::PmConditionId;
 use reap_polymarket_auth::{
     AuthenticatedL2Headers, AuthenticatedOwnedCancelRequest, AuthenticatedPlaceRequest,
-    AuthenticatedUserSubscription, CredentialOwnedUserFrame, FixedEoaSigner, L2Credentials,
-    L2Timestamp, PlacePublicRequestIdentity, PmAuthError, PmClobDomain, SerializedPlaceRequest,
-    derive_place_public_request_identity,
+    AuthenticatedUserSubscription, CredentialOwnedUserFrame, EoaAddress, FixedEoaSigner,
+    L2Credentials, L2Timestamp, PlacePublicRequestIdentity, PmAuthError, PmClobDomain,
+    SerializedPlaceRequest, derive_place_public_request_identity,
 };
 use reap_polymarket_live_adapter::{
     PmCancelMutationTimeFinalizer, PmCancelMutationTimeProof, PmHttpReadAuthorityProvider,
@@ -33,13 +36,13 @@ use tokio::{
     task::JoinHandle,
 };
 
+use self::credential_custody::{
+    FreshPlaceCredentialFiles, FreshPlaceCredentialHandoff, FreshPlaceCredentialTeardown,
+    RecoveryOnlyCredentialFiles, RecoveryOnlyCredentialHandoff, RecoveryOnlyCredentialTeardown,
+};
 use super::{
     AuthenticatedExactOwnedOrderRead, AuthorizedL2Timestamp,
     SealedExactOwnedOrderReadAuthentication,
-};
-use crate::credentials::{
-    FreshPlaceCredentialHandoff, FreshPlaceCredentialTeardown, RecoveryOnlyCredentialHandoff,
-    RecoveryOnlyCredentialTeardown,
 };
 
 const COMMON_AUTHORITY_CAPACITY: usize = 8;
@@ -104,6 +107,8 @@ pub(super) enum CredentialAuthorityError {
     CredentialOwnerMismatch,
     #[error("the task-local EOA signer has not yet been destroyed")]
     SignerStillOwned,
+    #[error("protected credential custody could not be loaded")]
+    CredentialCustodyLoadFailed,
     #[error("the staged credential teardown could not be completed safely")]
     StagedCredentialTeardownFailed,
     #[error("credential authority shutdown bounds must each be within 1ns..=60s")]
@@ -255,7 +260,31 @@ pub(super) struct FreshCredentialAuthorityOwner {
 }
 
 impl FreshCredentialAuthorityOwner {
-    pub(super) const fn from_custody(custody: FreshPlaceCredentialHandoff) -> Self {
+    /// Load the exact protected four-file custody directly into this sealed
+    /// authority owner. No raw signer, L2 bundle, handoff, or teardown value is
+    /// exposed to the caller.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn load_from_protected_files(
+        directory: PathBuf,
+        private_key_entry: String,
+        api_key_entry: String,
+        l2_secret_entry: String,
+        passphrase_entry: String,
+        configured_signer: EoaAddress,
+    ) -> Result<Self, CredentialAuthorityError> {
+        let custody = FreshPlaceCredentialFiles::new(
+            directory,
+            private_key_entry,
+            api_key_entry,
+            l2_secret_entry,
+            passphrase_entry,
+        )
+        .load(configured_signer)
+        .map_err(|_| CredentialAuthorityError::CredentialCustodyLoadFailed)?;
+        Ok(Self::from_custody(custody))
+    }
+
+    const fn from_custody(custody: FreshPlaceCredentialHandoff) -> Self {
         Self { custody }
     }
 
@@ -331,7 +360,28 @@ pub(super) struct RecoveryCredentialAuthorityOwner {
 }
 
 impl RecoveryCredentialAuthorityOwner {
-    pub(super) const fn from_custody(custody: RecoveryOnlyCredentialHandoff) -> Self {
+    /// Load the exact protected three-file recovery custody directly into this
+    /// sealed authority owner. This path cannot accept or produce a signer or
+    /// fresh-place capability.
+    pub(super) fn load_from_protected_files(
+        directory: PathBuf,
+        api_key_entry: String,
+        l2_secret_entry: String,
+        passphrase_entry: String,
+        configured_signer: EoaAddress,
+    ) -> Result<Self, CredentialAuthorityError> {
+        let custody = RecoveryOnlyCredentialFiles::new(
+            directory,
+            api_key_entry,
+            l2_secret_entry,
+            passphrase_entry,
+        )
+        .load(configured_signer)
+        .map_err(|_| CredentialAuthorityError::CredentialCustodyLoadFailed)?;
+        Ok(Self::from_custody(custody))
+    }
+
+    const fn from_custody(custody: RecoveryOnlyCredentialHandoff) -> Self {
         Self { custody }
     }
 
@@ -2041,10 +2091,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{
-        controlled_trial::{AuthorizedL2Timestamp, SealedExactOwnedOrderReadAuthentication},
-        credentials::{FreshPlaceCredentialFiles, RecoveryOnlyCredentialFiles},
-    };
+    use crate::controlled_trial::{AuthorizedL2Timestamp, SealedExactOwnedOrderReadAuthentication};
 
     const KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
     const SIGNER: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
@@ -2078,25 +2125,32 @@ mod tests {
     }
 
     fn fresh_owner(directory: &Path) -> FreshCredentialAuthorityOwner {
-        let custody = FreshPlaceCredentialFiles::new(
+        FreshCredentialAuthorityOwner::load_from_protected_files(
             directory.to_owned(),
             "private-key".into(),
             "api-key".into(),
             "l2-secret".into(),
             "passphrase".into(),
+            configured_eoa(),
         )
-        .load(configured_eoa())
-        .unwrap();
-        FreshCredentialAuthorityOwner::from_custody(custody)
+        .unwrap()
     }
 
     fn recovery_owner(directory: &Path) -> RecoveryCredentialAuthorityOwner {
-        let custody = recovery_handoff(directory);
-        RecoveryCredentialAuthorityOwner::from_custody(custody)
+        RecoveryCredentialAuthorityOwner::load_from_protected_files(
+            directory.to_owned(),
+            "api-key".into(),
+            "l2-secret".into(),
+            "passphrase".into(),
+            configured_eoa(),
+        )
+        .unwrap()
     }
 
-    fn recovery_handoff(directory: &Path) -> RecoveryOnlyCredentialHandoff {
-        RecoveryOnlyCredentialFiles::new(
+    fn recovery_handoff(
+        directory: &Path,
+    ) -> super::credential_custody::RecoveryOnlyCredentialHandoff {
+        super::credential_custody::RecoveryOnlyCredentialFiles::new(
             directory.to_owned(),
             "api-key".into(),
             "l2-secret".into(),

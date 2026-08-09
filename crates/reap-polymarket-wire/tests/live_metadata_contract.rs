@@ -99,6 +99,7 @@ fn short_market_without_optional_lifecycle_fields() -> String {
         .replace("          \"cbos\":true,\n", "")
         .replace("          \"aot\":\"2026-08-08T00:00:00Z\",\n", "")
         .replace("          \"rfqe\":false,\n", "")
+        .replace("          \"itode\":false,\n", "")
         .replace(
             "          \"oas\":0,\n          \"ibce\":true\n",
             "          \"oas\":0\n",
@@ -314,6 +315,7 @@ fn abbreviated_route_retains_request_provenance_without_fabricating_market_ident
     );
     assert_eq!(omitted.rfq_enabled(), Some(false));
     assert!(!omitted.take_only_delay_enabled());
+    assert_eq!(omitted.take_only_delay_enabled_reported(), Some(false));
     assert_eq!(omitted.bonding_curve_enabled(), Some(true));
     assert_eq!(omitted.minimum_order_age_seconds(), 0);
 
@@ -368,6 +370,8 @@ fn abbreviated_optional_fields_default_only_when_omitted() {
     assert_eq!(omitted.cancel_book_on_start(), None);
     assert_eq!(omitted.accepting_order_timestamp(), None);
     assert_eq!(omitted.rfq_enabled(), None);
+    assert!(!omitted.take_only_delay_enabled());
+    assert_eq!(omitted.take_only_delay_enabled_reported(), None);
     assert_eq!(omitted.bonding_curve_enabled(), None);
 }
 
@@ -660,11 +664,9 @@ fn abbreviated_membership_required_fields_and_unknowns_fail_closed() {
 fn abbreviated_fee_delay_and_order_age_fields_are_exact_and_typed() {
     let valid = short_market(None, "0.01", "5", None);
     let delayed = valid.replace(r#""itode":false"#, r#""itode":true"#);
-    assert!(
-        parse_live_clob_v2_metadata(delayed.as_bytes(), request_scope())
-            .unwrap()
-            .take_only_delay_enabled()
-    );
+    let delayed = parse_live_clob_v2_metadata(delayed.as_bytes(), request_scope()).unwrap();
+    assert!(delayed.take_only_delay_enabled());
+    assert_eq!(delayed.take_only_delay_enabled_reported(), Some(true));
 
     for (raw, field) in [
         (valid.replace(r#""mbf":0"#, r#""mbf":-1"#), "maker_base_fee"),

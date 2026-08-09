@@ -1733,11 +1733,8 @@ mod tests {
     };
 
     use super::*;
-    use crate::{
-        controlled_trial::authority::{
-            CredentialAuthorityShutdownBounds, RecoveryCredentialAuthorityOwner,
-        },
-        credentials::RecoveryOnlyCredentialFiles,
+    use crate::controlled_trial::authority::{
+        CredentialAuthorityShutdownBounds, RecoveryCredentialAuthorityOwner,
     };
 
     const SIGNER: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
@@ -2010,17 +2007,16 @@ mod tests {
         write_secret(directory.path(), "api-key", API_KEY);
         write_secret(directory.path(), "l2-secret", L2_SECRET);
         write_secret(directory.path(), "passphrase", PASSPHRASE);
-        let handoff = RecoveryOnlyCredentialFiles::new(
+        let roles = RecoveryCredentialAuthorityOwner::load_from_protected_files(
             directory.path().to_owned(),
             "api-key".into(),
             "l2-secret".into(),
             "passphrase".into(),
+            signer(),
         )
-        .load(signer())
+        .unwrap()
+        .spawn()
         .unwrap();
-        let roles = RecoveryCredentialAuthorityOwner::from_custody(handoff)
-            .spawn()
-            .unwrap();
         (directory, roles)
     }
 

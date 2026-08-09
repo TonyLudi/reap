@@ -585,7 +585,7 @@ pub(super) struct PmPhaseAMarketProjection {
     fee_taker_only: Option<bool>,
     seconds_delay: u64,
     reported_seconds_delay: Option<u64>,
-    take_only_delay_enabled: bool,
+    take_only_delay_enabled: Option<bool>,
     cancel_book_on_start: Option<bool>,
     minimum_order_age_seconds: u64,
     accepting_orders_reported: Option<bool>,
@@ -639,7 +639,7 @@ impl PmPhaseAMarketProjection {
             fee_taker_only: clob.fee_details().taker_only(),
             seconds_delay: lifecycle_details.seconds_delay(),
             reported_seconds_delay: clob.seconds_delay(),
-            take_only_delay_enabled: clob.take_only_delay_enabled(),
+            take_only_delay_enabled: clob.take_only_delay_enabled_reported(),
             cancel_book_on_start: clob.cancel_book_on_start(),
             minimum_order_age_seconds: clob.minimum_order_age_seconds(),
             accepting_orders_reported: clob.accepting_orders(),
@@ -864,6 +864,15 @@ impl PmPhaseAMarketProjection {
 
     #[must_use]
     pub(super) const fn take_only_delay_enabled(&self) -> bool {
+        match self.take_only_delay_enabled {
+            Some(value) => value,
+            None => false,
+        }
+    }
+
+    /// Presence-preserving abbreviated-route fact for safety-sensitive joins.
+    #[must_use]
+    pub(super) const fn take_only_delay_enabled_reported(&self) -> Option<bool> {
         self.take_only_delay_enabled
     }
 
@@ -3220,6 +3229,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_projection_preserves_omitted_take_only_delay_flag() {
+        let omitted = short_market().replace(r#""itode":false,"#, "");
+        let state = state_with_source(
+            long_market(),
+            omitted,
+            CONTROL_BEGIN_NS,
+            CONTROL_COMPLETE_NS,
+        )
+        .await;
+        let market = &state.phase_a_market;
+        assert!(!market.take_only_delay_enabled());
+        assert_eq!(market.take_only_delay_enabled_reported(), None);
+    }
+
+    #[tokio::test]
     async fn source_projection_is_exact_redacted_and_carried_by_snapshot_and_lease() {
         let mut state = state().await;
         let expected = state.phase_a_market.duplicate_for_seal();
@@ -3276,6 +3300,7 @@ mod tests {
         assert_eq!(market.seconds_delay(), 0);
         assert_eq!(market.reported_seconds_delay(), Some(0));
         assert!(!market.take_only_delay_enabled());
+        assert_eq!(market.take_only_delay_enabled_reported(), Some(false));
         assert_eq!(market.cancel_book_on_start(), Some(true));
         assert_eq!(market.minimum_order_age_seconds(), 0);
         assert_eq!(market.accepting_orders_reported(), Some(true));

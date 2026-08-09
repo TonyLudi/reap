@@ -2,6 +2,7 @@ const AUTHORITY: &str = include_str!("../src/controlled_trial/authority.rs");
 const CURRENT_RUNTIME: &str = include_str!("../src/controlled_trial/runtime/current_runtime.rs");
 const LINUX_EGRESS_LOCAL_FACTS: &str =
     include_str!("../src/controlled_trial/runtime/linux_egress_local_facts.rs");
+const ONLINE_PREFLIGHT: &str = include_str!("../src/controlled_trial/runtime/online_preflight.rs");
 const PRIVATE_READS: &str = include_str!("../src/controlled_trial/runtime/private_reads.rs");
 const PUBLIC_BOOK: &str = include_str!("../src/controlled_trial/runtime/public_book.rs");
 const USER_STREAM: &str = include_str!("../src/controlled_trial/runtime/user_stream.rs");
@@ -25,6 +26,7 @@ fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
 fn runtime_is_binary_private_read_only_evidence_without_a_transport_escape() {
     assert!(RUNTIME_MOD.contains("mod current_runtime;"));
     assert!(RUNTIME_MOD.contains("mod linux_egress_local_facts;"));
+    assert!(RUNTIME_MOD.contains("mod online_preflight;"));
     assert!(RUNTIME_MOD.contains("mod private_reads;"));
     assert!(RUNTIME_MOD.contains("mod public_book;"));
     assert!(RUNTIME_MOD.contains("mod user_stream;"));
@@ -36,6 +38,7 @@ fn runtime_is_binary_private_read_only_evidence_without_a_transport_escape() {
             "Linux local-egress facts",
             production_prefix(LINUX_EGRESS_LOCAL_FACTS),
         ),
+        ("online preflight", production_prefix(ONLINE_PREFLIGHT)),
         ("private reads", production_prefix(PRIVATE_READS)),
         ("public book", production_prefix(PUBLIC_BOOK)),
         ("user stream", production_prefix(USER_STREAM)),
@@ -60,6 +63,138 @@ fn runtime_is_binary_private_read_only_evidence_without_a_transport_escape() {
                 "{name} runtime gained forbidden `{forbidden}` surface",
             );
         }
+    }
+}
+
+#[test]
+fn online_preflight_is_an_inseparable_denied_partial_candidate() {
+    let production = production_prefix(ONLINE_PREFLIGHT);
+    for required in [
+        "pub(super) struct PmDeniedOnlinePreflightCandidate",
+        "book: PmPublicBookLease",
+        "rest: PmFreshAuthenticatedRestCut",
+        "user: PmUserOnlinePreflightLease",
+        "status: PmProductionStatusAnnouncementObservation",
+        "health: PmProductionClobLivenessHealthObservation",
+        "polygon: PmProductionPolygonFinalizedAuthorizationCut",
+        "position: PmProductionDataApiPositionObservation",
+        "candidate_manifest: PmOnlinePreflightCandidateManifest",
+        "PhantomData<Rc<()>>",
+        "OfflineAuthorizationState::DENIED",
+        "OuterWindowRuntimeAndSelectedEgressNotIntegrated",
+        "minimum_source_wall_edge_ns",
+        "maximum_source_wall_edge_ns",
+        "market_end_time",
+        "take_only_delay_enabled_reported",
+        "b\"take_only_delay_enabled_reported\"",
+        "market.take_only_delay_enabled != Some(false)",
+        "market.cancel_book_on_start != Some(false)",
+        "market.rfq_enabled != Some(false)",
+        "market.bonding_curve_enabled != Some(false)",
+    ] {
+        assert!(production.contains(required), "missing `{required}`");
+    }
+    for forbidden in [
+        "impl Clone for PmDeniedOnlinePreflightCandidate",
+        "fn into_parts(",
+        "fn into_dispatch",
+        "fn into_permit",
+        "fn runtime_binding",
+        "fn online_runtime_binding",
+        "PmPhaseAOnlinePreflightEvidenceManifestV2",
+        "AuthenticatedPlaceRequest",
+        "RuntimeExactBodyCommitment",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "online preflight gained forbidden `{forbidden}` surface",
+        );
+    }
+}
+
+#[test]
+fn online_preflight_requires_explicit_false_optional_market_flags() {
+    let preflight = production_prefix(ONLINE_PREFLIGHT);
+    let public_book = production_prefix(PUBLIC_BOOK);
+    for required in [
+        "take_only_delay_enabled: Option<bool>",
+        "clob.take_only_delay_enabled_reported()",
+        "fn take_only_delay_enabled_reported(&self) -> Option<bool>",
+    ] {
+        assert!(
+            public_book.contains(required),
+            "public-book projection lost `{required}`",
+        );
+    }
+    for permissive in [
+        "market.cancel_book_on_start == Some(true)",
+        "market.rfq_enabled == Some(true)",
+        "market.bonding_curve_enabled == Some(true)",
+    ] {
+        assert!(
+            !preflight.contains(permissive),
+            "online preflight regained permissive optional flag check `{permissive}`",
+        );
+    }
+}
+
+#[test]
+fn online_preflight_extrema_cover_every_committed_user_stream_clock() {
+    let production = production_prefix(ONLINE_PREFLIGHT);
+    let source_join = between(
+        production,
+        "impl JoinedFacts {",
+        "fn append_current_user_source_wall_clocks(",
+    );
+    for required in [
+        "user.connection_open_clock()",
+        "user.subscription_clock()",
+        "user.ping_clock()",
+        "user.correlated_pong_clock()",
+        "for reconnect in user.reconnect_history()",
+        "reconnect.connection_open_generation()",
+        "reconnect.connection_open_clock()",
+        "reconnect.subscription_generation()",
+        "reconnect.subscription_clock()",
+        "reconnect.latest_ping_generation()",
+        "reconnect.latest_ping_clock()",
+        "reconnect.correlated_pong_generation()",
+        "reconnect.correlated_pong_clock()",
+        "reconnect.retirement_clock()",
+        "reconnect.reconnect_clock()",
+    ] {
+        assert!(
+            source_join.contains(required),
+            "candidate extrema lost user source edge `{required}`",
+        );
+    }
+    for required in [
+        "fn append_optional_user_source_wall_clock(",
+        "(Some(_), Some(clock))",
+        "(None, None) => Ok(())",
+        "UserReconnectHistory",
+        "user.reconnect_count != user.reconnect_history_count",
+        "user.reconnect_count != 0",
+        "user.initial_connection_epoch != user.current_connection_epoch",
+        "source_wall_extrema(&facts.source_wall_clocks_ns)",
+    ] {
+        assert!(
+            production.contains(required),
+            "missing clock pin `{required}`"
+        );
+    }
+    for committed_reconnect_clock in [
+        "reconnect.connection_open_clock()",
+        "reconnect.subscription_clock()",
+        "reconnect.latest_ping_clock()",
+        "reconnect.correlated_pong_clock()",
+        "reconnect.retirement_clock()",
+        "reconnect.reconnect_clock()",
+    ] {
+        assert!(
+            production.matches(committed_reconnect_clock).count() >= 2,
+            "`{committed_reconnect_clock}` must feed both digest and candidate extrema",
+        );
     }
 }
 
@@ -278,13 +413,13 @@ fn current_runtime_is_source_owned_move_only_and_consumingly_rechecked() {
         1,
         "final runtime witness must have one consuming construction",
     );
-    assert_eq!(
+    assert!(
         production
             .matches(
                 "validate_place_cancel_phase(config.value().phase, authorization.value().phase)?;"
             )
-            .count(),
-        2,
+            .count()
+            >= 2,
         "initial observation and consuming recheck must both reject non-Phase-A inputs",
     );
 
@@ -307,6 +442,93 @@ fn current_runtime_is_source_owned_move_only_and_consumingly_rechecked() {
             !final_witness_impl.contains(forbidden),
             "non-authoritative runtime witness gained decomposition/authority `{forbidden}`",
         );
+    }
+}
+
+#[test]
+fn online_runtime_window_and_consumption_are_source_owned_inseparable_and_closed() {
+    let production = production_prefix(CURRENT_RUNTIME);
+    for required in [
+        "pub(super) struct PmPhaseAOnlinePreflightWindow",
+        "pub(super) struct PmFinishedPhaseAOnlinePreflightWindow",
+        "pub(super) struct PmSelectedEgressGeoblockObservation<T>",
+        "owned_custody: T",
+        "observation: PmProductionGeoblockObservation",
+        "thread_confinement: Rc<()>",
+        "There is deliberately no production constructor in this slice",
+        "stable selected actor/client generation",
+        "initial observation, Prepared transition, Basis transition, A3",
+        "actor-private generation and client custody through every",
+        "this type must gain no constructor",
+        "pub(super) struct PmPhaseAOnlineCurrentRuntimeWitness",
+        "struct PmRevalidatedPhaseAOnlineCurrentRuntimeWitness",
+        "pub(super) struct PmPhaseAOnlinePreparedConsumptionPair",
+        "pub(super) struct PmPendingPhaseAOnlineRuntimeBurnV2",
+        "pub(super) struct PmPhaseAOnlineRuntimeBurnedV2",
+        "pub(super) fn begin_phase_a_online_preflight(",
+        "pub(super) fn finish_phase_a_online_preflight(",
+        "pub(super) fn observe_phase_a_online_current_runtime(",
+        "pub(super) fn prepare_phase_a_online_consumptions(",
+        "pub(super) fn create_phase_a_online_preflight_basis(",
+        "pub(super) fn burn_phase_a_online_preflight_a3(",
+        "Duration::from_millis(maximum_age_ms)",
+        ".min(policy_value.maximum_observation_age_ms)",
+        "validate_candidate_inside_outer_window(",
+        "source_minimum < outer_started_ns",
+        "source_maximum > outer_completed_ns",
+        "market_end <= cleanup",
+        "full_online_preflight_manifest_identity(",
+        "complete-online-preflight-manifest.v2",
+        "exact_consumption_runtime_bindings(",
+        "prepare_online_authorization_consumption_v2(",
+        "prepare_authorization_consumption(",
+        "create_phase_a_online_preflight_basis_v2(",
+        ".burn_and_record_a3(",
+        "abandon_to_definitely_not_dispatched",
+        "final-recheck-required",
+        "actively re-observe the live book/user handles",
+        "snapshot equality and cannot detect subsequent live source changes",
+    ] {
+        assert!(
+            production.contains(required),
+            "missing online runtime pin `{required}`"
+        );
+    }
+    let v2_prepare = production
+        .find("let mut v2_consumption = prepare_online_authorization_consumption_v2(")
+        .expect("V2 Prepared transition");
+    let v1_prepare = production
+        .find("prepare_authorization_consumption(config, v1_authorization, &v1_runtime)")
+        .expect("V1 Prepared transition");
+    assert!(v2_prepare < v1_prepare, "V2 must become Prepared before V1");
+    for forbidden in [
+        "Ok(PmSelectedEgressGeoblockObservation",
+        "fn selected_egress_geoblock",
+        "fn runtime_binding(&self)",
+        "fn online_runtime_binding(&self)",
+        "pub(super) fn runtime_bindings",
+        "pub(super) fn into_dispatch",
+        "pub(super) fn into_parts",
+        "revalidate_phase_a_online_preflight_v2_for_network_dispatch",
+        "AuthenticatedPlaceRequest",
+        "RuntimeExactBodyCommitment",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "online runtime gained forbidden open/escape surface `{forbidden}`",
+        );
+    }
+    for owner in [
+        "PmPhaseAOnlinePreflightWindow",
+        "PmFinishedPhaseAOnlinePreflightWindow",
+        "PmSelectedEgressGeoblockObservation",
+        "PmPhaseAOnlineCurrentRuntimeWitness",
+        "PmPhaseAOnlinePreparedConsumptionPair",
+        "PmPhaseAOnlineRuntimeBurnedV2",
+    ] {
+        for forbidden in ["Clone", "Serialize", "Deserialize"] {
+            assert!(!production.contains(&format!("impl {forbidden} for {owner}")));
+        }
     }
 }
 
@@ -393,11 +615,25 @@ fn linux_egress_local_facts_are_fd_held_source_facts_without_a_stale_positive_be
         "route, destination, DNS answer, connected socket, geoblock response, NAT",
         "cannot construct an online runtime binding",
         "must never become a stale positive bearer on its own",
-        "future actor must invoke",
+        "current-runtime gate can consume this",
         "capture on its own dedicated OS thread",
         "structurally neither `Send` nor `Sync`",
-        "final identity check and rehash are deliberately absent here",
-        "selected actor's immediate connection boundary",
+        "repeats process,",
+        "profile-identity, and profile-",
+        "same-local-egress",
+        "pub(super) fn validate_captured_window(",
+        "pub(super) fn revalidate_for_current_runtime(",
+        "self.reviewed_profile.revalidate(",
+        "hash_profile_descriptor(&mut self.file)?",
+        "pub(super) struct PmLinuxEgressLocalFactsView<'a>",
+        "wall_completed: SystemTime",
+        "monotonic_completed: Instant",
+        "effective_user_id: final_sample.effective_user_id",
+        "network_namespace_device: final_sample.current_namespace.device",
+        "network_namespace_inode: final_sample.current_namespace.inode",
+        "interface_name: final_sample.interface.name",
+        "interface_index: final_sample.interface.index",
+        "local_source_ip: final_sample.interface.local_source_ip",
     ] {
         assert!(
             production.contains(required),
@@ -423,12 +659,69 @@ fn linux_egress_local_facts_are_fd_held_source_facts_without_a_stale_positive_be
             && final_thread < final_effective_user,
         "final interface read must be followed by namespace, thread, and EUID checks",
     );
-    assert_eq!(
+
+    let custody_impl = between(
+        production,
+        "impl PmLinuxEgressLocalFactCustody {",
+        "impl fmt::Debug for PmLinuxEgressLocalFactCustody",
+    );
+    let consuming_recheck = between(
+        custody_impl,
+        "pub(super) fn revalidate_for_current_runtime(",
+        "    fn validate_authorization_binding(",
+    );
+    let profile_rehash = consuming_recheck
+        .find("self.reviewed_profile.revalidate(")
+        .expect("consuming profile rehash");
+    let post_rehash_interface = consuming_recheck
+        .rfind("let final_interface = observe_exact_assigned_interface(")
+        .expect("post-rehash exact interface observation");
+    let post_rehash_namespace = consuming_recheck
+        .find("let final_namespace = observe_thread_network_namespace_identity()?")
+        .expect("post-rehash current namespace observation");
+    let post_rehash_held_namespace = consuming_recheck
+        .find("let final_held_namespace = namespace_file_identity(&self.held_network_namespace)?")
+        .expect("post-rehash held namespace observation");
+    let post_rehash_process = consuming_recheck
+        .find("let final_process_id = std::process::id()")
+        .expect("post-rehash PID observation");
+    let post_rehash_thread = consuming_recheck
+        .find("let final_thread_id = current_thread_id()?")
+        .expect("post-rehash TID observation");
+    let post_rehash_euid = consuming_recheck
+        .find("let final_effective_user_id = rustix::process::geteuid().as_raw()")
+        .expect("post-rehash EUID observation");
+    let final_validation = consuming_recheck
+        .find("let final_sample = validate_final_local_source_sample(")
+        .expect("post-rehash exact sample validation");
+    let final_euid_binding = consuming_recheck
+        .find("validate_effective_user_binding(\n                final_sample.effective_user_id,")
+        .expect("post-rehash exact authorization EUID validation");
+    let completion_wall = consuming_recheck
+        .find("let wall_completed = SystemTime::now()")
+        .expect("consuming completion wall edge");
+    let completion_monotonic = consuming_recheck
+        .find("let monotonic_completed = Instant::now()")
+        .expect("consuming completion monotonic edge");
+    assert!(
+        profile_rehash < post_rehash_interface
+            && post_rehash_interface < post_rehash_namespace
+            && post_rehash_namespace < post_rehash_held_namespace
+            && post_rehash_held_namespace < post_rehash_process
+            && post_rehash_process < post_rehash_thread
+            && post_rehash_thread < post_rehash_euid
+            && post_rehash_euid < final_validation
+            && final_validation < final_euid_binding
+            && final_euid_binding < completion_wall
+            && completion_wall < completion_monotonic,
+        "consuming recheck must close every mutable source after profile rehash and before clocks",
+    );
+    assert!(
         production
             .matches("authorization.value().host.linux_euid")
-            .count(),
-        2,
-        "both initial and final EUID samples must bind to authorization",
+            .count()
+            >= 2,
+        "capture and consuming rechecks must bind EUID to authorization",
     );
 
     let attributes = production
@@ -458,16 +751,15 @@ fn linux_egress_local_facts_are_fd_held_source_facts_without_a_stale_positive_be
         );
     }
 
-    let custody_impl = between(
-        production,
-        "impl PmLinuxEgressLocalFactCustody {",
-        "impl fmt::Debug for PmLinuxEgressLocalFactCustody",
+    assert_eq!(
+        custody_impl.matches("pub(super) fn ").count(),
+        3,
+        "custody must expose only capture, window validation, and consuming recheck",
     );
-    assert_eq!(custody_impl.matches("pub(super) fn ").count(), 1);
     assert_eq!(
         custody_impl.matches("fn ").count(),
-        1,
-        "local-egress custody must have only its one runner-private capture constructor",
+        4,
+        "custody must add only its private authorization-binding helper",
     );
     assert_eq!(
         custody_impl.matches("Self {").count(),
@@ -479,7 +771,6 @@ fn linux_egress_local_facts_are_fd_held_source_facts_without_a_stale_positive_be
         "fn into_",
         "fn consume",
         "fn recheck",
-        "fn revalidate",
         "fn refresh",
         "fn authorize",
         "fn permit",
@@ -573,6 +864,8 @@ fn linux_egress_local_facts_have_no_network_test_matrix() {
     for required in [
         "reviewed_profile_path_must_be_exact_absolute_utf8",
         "numeric_effective_user_must_match_authorization",
+        "consuming_recheck_rejects_post_rehash_interface_or_ip_drift",
+        "validate_final_local_source_sample(expected(), drifted)",
         "current_thread_namespace_source_is_descriptor_pinned_and_stable",
         "profile_source_holds_exact_nonsecret_bytes_and_rejects_wrong_hash",
         "capture_clock_window_rejects_regression_and_expiry",

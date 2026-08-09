@@ -24,18 +24,35 @@ use std::{
     io::{Read, Seek, SeekFrom},
     net::IpAddr,
     process::{Child, Command, Stdio},
+    rc::Rc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use reap_pm_controlled_trial::{
-    CanonicalAuthorization, CanonicalTrialConfig, TrialPhase, verify_authorization,
+    AuthorizationHostBinding, AuthorizationRuntimeBinding, CanonicalAuthorization,
+    CanonicalOnlineAuthorizationV2, CanonicalOnlinePolicyV2, CanonicalTrialConfig,
+    OnlineAuthorizationRuntimeBindingV2, PmAuthorizationConsumptionError,
+    PmOnlineAuthorizationConsumptionV2Error, PreparedAuthorizationConsumption,
+    PreparedOnlineAuthorizationConsumptionV2, TrialPhase, prepare_authorization_consumption,
+    prepare_online_authorization_consumption_v2, verify_authorization,
+};
+use reap_pm_controlled_trial_live::{
+    PmControlledTrialLiveJournals, PmDurablePlacePreparedAckV1,
+    PmPendingPhaseAOnlinePreflightBasisV2, PmPhaseAOnlinePreflightDispatchOwnerV2,
+    PmPhaseAOnlinePreflightEvidenceManifestV2, PmPhaseAOnlinePreflightV2Error,
+    PmPhaseAPlaceDefinitelyNotDispatchedV1, create_phase_a_online_preflight_basis_v2,
 };
 use reap_polymarket_live_adapter::{
     PmGeoblockObservationCommitment, PmHttpReceiveClock, PmProductionGeoblockObservation,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
+
+use super::{
+    linux_egress_local_facts::{PmLinuxEgressLocalFactCustody, PmLinuxEgressLocalFactError},
+    online_preflight::PmDeniedOnlinePreflightCandidate,
+};
 
 const PROC_ROOT_PATH: &str = "/proc";
 const PROC_SELF_EXE_ENTRY: &str = "self/exe";
@@ -204,6 +221,434 @@ impl PmCurrentRuntimeObserver {
             return Err(PmCurrentRuntimeError::ProcessIdentityChanged);
         }
         Ok(())
+    }
+}
+
+impl PmCurrentRuntimeObserver {
+    /// Begin the sole outer Phase-A online preflight clock window before the
+    /// first source operation. Every identity and clock is observed locally.
+    pub(super) fn begin_phase_a_online_preflight(
+        &mut self,
+        config: &CanonicalTrialConfig,
+        v1_authorization: &CanonicalAuthorization,
+        policy: &CanonicalOnlinePolicyV2,
+        online_authorization: &CanonicalOnlineAuthorizationV2,
+    ) -> Result<PmPhaseAOnlinePreflightWindow, PmPhaseAOnlineRuntimeError> {
+        self.validate_observer_process()?;
+        let monotonic_started = Instant::now();
+        let wall_started = SystemTime::now();
+        let source_thread_id = current_runtime_thread_id()?;
+        let effective_user_id = current_effective_user_id()?;
+        let maximum_age_ms = validate_exact_online_inputs(
+            config,
+            v1_authorization,
+            policy,
+            online_authorization,
+            wall_started,
+        )?;
+        Ok(PmPhaseAOnlinePreflightWindow {
+            pins: OnlineRuntimePins::capture(
+                config,
+                v1_authorization,
+                policy,
+                online_authorization,
+            ),
+            creating_process_id: self.creating_process_id,
+            source_thread_id,
+            effective_user_id,
+            wall_started,
+            monotonic_started,
+            maximum_age: Duration::from_millis(maximum_age_ms),
+            maximum_age_ms,
+        })
+    }
+
+    /// Finish the outer window after the last preflight source operation.
+    /// The returned value remains denied and cannot expose runtime bindings.
+    pub(super) fn finish_phase_a_online_preflight(
+        &mut self,
+        window: PmPhaseAOnlinePreflightWindow,
+        config: &CanonicalTrialConfig,
+        v1_authorization: &CanonicalAuthorization,
+        policy: &CanonicalOnlinePolicyV2,
+        online_authorization: &CanonicalOnlineAuthorizationV2,
+    ) -> Result<PmFinishedPhaseAOnlinePreflightWindow, PmPhaseAOnlineRuntimeError> {
+        self.validate_observer_process()?;
+        window
+            .pins
+            .validate(config, v1_authorization, policy, online_authorization)?;
+        validate_online_source_identity(
+            window.creating_process_id,
+            window.source_thread_id,
+            window.effective_user_id,
+        )?;
+        let wall_completed = SystemTime::now();
+        let monotonic_completed = Instant::now();
+        validate_age_window(
+            window.wall_started,
+            window.monotonic_started,
+            wall_completed,
+            monotonic_completed,
+            window.maximum_age,
+        )?;
+        let maximum_age_ms = validate_exact_online_inputs(
+            config,
+            v1_authorization,
+            policy,
+            online_authorization,
+            wall_completed,
+        )?;
+        if maximum_age_ms != window.maximum_age_ms {
+            return Err(PmCurrentRuntimeError::AuthorizationBinding.into());
+        }
+        let started_at_utc = canonical_utc(window.wall_started)?.into();
+        let completed_at_utc = canonical_utc(wall_completed)?.into();
+        Ok(PmFinishedPhaseAOnlinePreflightWindow {
+            open: window,
+            wall_completed,
+            monotonic_completed,
+            started_at_utc,
+            completed_at_utc,
+        })
+    }
+
+    /// Consume a closed outer window, same-thread local-egress custody, and a
+    /// geoblock response sealed by the selected-egress actor. No generic
+    /// production observation can enter this positive V2 typestate.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn observe_phase_a_online_current_runtime(
+        &mut self,
+        window: PmFinishedPhaseAOnlinePreflightWindow,
+        config: &CanonicalTrialConfig,
+        v1_authorization: &CanonicalAuthorization,
+        policy: &CanonicalOnlinePolicyV2,
+        online_authorization: &CanonicalOnlineAuthorizationV2,
+        selected_geoblock: PmSelectedEgressGeoblockObservation<PmLinuxEgressLocalFactCustody>,
+    ) -> Result<PmPhaseAOnlineCurrentRuntimeWitness, PmPhaseAOnlineRuntimeError> {
+        self.validate_observer_process()?;
+        let PmFinishedPhaseAOnlinePreflightWindow {
+            open,
+            wall_completed,
+            monotonic_completed,
+            started_at_utc,
+            completed_at_utc,
+        } = window;
+        open.pins
+            .validate(config, v1_authorization, policy, online_authorization)?;
+        validate_online_source_identity(
+            open.creating_process_id,
+            open.source_thread_id,
+            open.effective_user_id,
+        )?;
+        let (local_egress, geoblock) = consume_selected_geoblock(selected_geoblock)?;
+        local_egress.validate_captured_window(
+            online_authorization,
+            open.wall_started,
+            wall_completed,
+            open.monotonic_started,
+            monotonic_completed,
+            open.maximum_age,
+        )?;
+        validate_production_geoblock_inside_window(
+            &geoblock,
+            open.wall_started,
+            wall_completed,
+            open.maximum_age,
+        )?;
+        let v1 = self.observe_phase_a_place(config, v1_authorization, geoblock)?;
+        let PmPhaseAPlaceCurrentRuntimeWitness { mut evidence } = v1;
+        evidence.maximum_age = open.maximum_age;
+        evidence.maximum_age_ms = open.maximum_age_ms;
+        validate_age_window(
+            open.wall_started,
+            open.monotonic_started,
+            evidence.checked_wall_complete,
+            evidence.checked_monotonic_complete,
+            open.maximum_age,
+        )?;
+        validate_exact_v2_runtime_binding(
+            &evidence,
+            config,
+            v1_authorization,
+            policy,
+            online_authorization,
+        )?;
+        Ok(PmPhaseAOnlineCurrentRuntimeWitness {
+            evidence: PmPhaseAOnlineRuntimeEvidence {
+                current: evidence,
+                window: FinishedOnlineWindowEvidence {
+                    pins: open.pins,
+                    creating_process_id: open.creating_process_id,
+                    source_thread_id: open.source_thread_id,
+                    effective_user_id: open.effective_user_id,
+                    wall_started: open.wall_started,
+                    monotonic_started: open.monotonic_started,
+                    wall_completed,
+                    monotonic_completed,
+                    started_at_utc,
+                    completed_at_utc,
+                    maximum_age: open.maximum_age,
+                    maximum_age_ms: open.maximum_age_ms,
+                },
+                local_egress,
+                prior_selected_geoblocks: Vec::new(),
+            },
+        })
+    }
+
+    /// Perform a fresh selected-egress/runtime recheck, construct both freely
+    /// constructible library binding records only as stack locals, and create
+    /// the V2 Prepared ledger before the V1 Prepared ledger. The returned pair
+    /// retains all source and descriptor custody and exposes no binding getter.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prepare_phase_a_online_consumptions(
+        &mut self,
+        selected_geoblock: PmSelectedEgressGeoblockObservation<PmPhaseAOnlineCurrentRuntimeWitness>,
+        config: &CanonicalTrialConfig,
+        v1_authorization: &CanonicalAuthorization,
+        policy: CanonicalOnlinePolicyV2,
+        online_authorization: CanonicalOnlineAuthorizationV2,
+    ) -> Result<PmPhaseAOnlinePreparedConsumptionPair, PmPhaseAOnlineRuntimeError> {
+        let (witness, selected_geoblock) = consume_selected_geoblock(selected_geoblock)?;
+        let PmPhaseAOnlineCurrentRuntimeWitness { evidence } = witness;
+        let mut runtime = self.recheck_phase_a_online_evidence(
+            evidence,
+            config,
+            v1_authorization,
+            &policy,
+            &online_authorization,
+            GeoblockEvidence::from_source(selected_geoblock),
+        )?;
+        let (v1_runtime, v2_runtime) =
+            exact_consumption_runtime_bindings(&mut runtime.evidence, &online_authorization)?;
+        let mut v2_consumption = prepare_online_authorization_consumption_v2(
+            config,
+            policy,
+            online_authorization,
+            &v2_runtime,
+        )
+        .map_err(PmPhaseAOnlineRuntimeError::V2Consumption)?;
+        let v1_consumption =
+            prepare_authorization_consumption(config, v1_authorization, &v1_runtime)
+                .map_err(PmPhaseAOnlineRuntimeError::V1Consumption)?;
+        // V1 Prepared creation is a new directory entry after V2 Prepared.
+        v2_consumption
+            .refresh_after_bound_artifact_create()
+            .map_err(PmPhaseAOnlineRuntimeError::V2Consumption)?;
+        Ok(PmPhaseAOnlinePreparedConsumptionPair {
+            runtime,
+            v1_consumption,
+            v2_consumption,
+        })
+    }
+
+    /// Consume the complete denied source candidate and internally assemble
+    /// the exact public sidecar manifest. No caller-supplied manifest or
+    /// digest enters this path.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn create_phase_a_online_preflight_basis(
+        &mut self,
+        selected_pair: PmSelectedEgressGeoblockObservation<PmPhaseAOnlinePreparedConsumptionPair>,
+        candidate: PmDeniedOnlinePreflightCandidate,
+        config: &CanonicalTrialConfig,
+        v1_authorization: &CanonicalAuthorization,
+        journals: &mut PmControlledTrialLiveJournals,
+        prepared: PmDurablePlacePreparedAckV1,
+    ) -> Result<PmPendingPhaseAOnlineRuntimeBurnV2, PmPhaseAOnlineRuntimeError> {
+        let (pair, selected_geoblock) = consume_selected_geoblock(selected_pair)?;
+        let PmPhaseAOnlinePreparedConsumptionPair {
+            runtime,
+            v1_consumption,
+            v2_consumption,
+        } = pair;
+        let policy = v2_consumption.policy();
+        let online_authorization = v2_consumption.authorization();
+        let candidate = candidate
+            .revalidate_non_authoritative(config, policy)
+            .map_err(|_| PmPhaseAOnlineRuntimeError::CandidateManifest)?;
+        let mut runtime = self.recheck_phase_a_online_evidence(
+            runtime.evidence,
+            config,
+            v1_authorization,
+            policy,
+            online_authorization,
+            GeoblockEvidence::from_source(selected_geoblock),
+        )?;
+        validate_candidate_inside_outer_window(
+            &candidate,
+            &runtime.evidence.window,
+            online_authorization,
+        )?;
+        let (v1_runtime, v2_runtime) =
+            exact_consumption_runtime_bindings(&mut runtime.evidence, online_authorization)?;
+        let evidence = assemble_online_preflight_manifest(
+            &candidate,
+            &runtime.evidence,
+            policy,
+            online_authorization,
+            &v1_runtime,
+            &v2_runtime,
+        )?;
+        let pending = create_phase_a_online_preflight_basis_v2(
+            config,
+            v1_authorization,
+            journals,
+            prepared,
+            v1_consumption,
+            v2_consumption,
+            evidence,
+        )
+        .map_err(PmPhaseAOnlineRuntimeError::OnlinePreflight)?;
+        Ok(PmPendingPhaseAOnlineRuntimeBurnV2 {
+            pending,
+            runtime,
+            candidate,
+        })
+    }
+
+    /// Burn V2 then V1 through the live sidecar owner only after another
+    /// selected-egress source recheck. Success retains the complete dispatch,
+    /// candidate, runtime, window, geoblock history, and egress custody for a
+    /// separate final consuming edge.
+    pub(super) fn burn_phase_a_online_preflight_a3(
+        &mut self,
+        selected_pending: PmSelectedEgressGeoblockObservation<PmPendingPhaseAOnlineRuntimeBurnV2>,
+        config: &CanonicalTrialConfig,
+        v1_authorization: &CanonicalAuthorization,
+        journals: &mut PmControlledTrialLiveJournals,
+    ) -> Result<PmPhaseAOnlineRuntimeBurnedV2, PmPhaseAOnlineRuntimeError> {
+        let (pending_owner, selected_geoblock) = consume_selected_geoblock(selected_pending)?;
+        let PmPendingPhaseAOnlineRuntimeBurnV2 {
+            pending,
+            runtime,
+            candidate,
+        } = pending_owner;
+        let policy = pending.online_policy();
+        let online_authorization = pending.online_authorization();
+        let candidate = candidate
+            .revalidate_non_authoritative(config, policy)
+            .map_err(|_| PmPhaseAOnlineRuntimeError::CandidateManifest)?;
+        let mut runtime = self.recheck_phase_a_online_evidence(
+            runtime.evidence,
+            config,
+            v1_authorization,
+            policy,
+            online_authorization,
+            GeoblockEvidence::from_source(selected_geoblock),
+        )?;
+        let (v1_runtime, v2_runtime) =
+            exact_consumption_runtime_bindings(&mut runtime.evidence, online_authorization)?;
+        let dispatch = pending
+            .burn_and_record_a3(journals, config, v1_authorization, &v1_runtime, &v2_runtime)
+            .map_err(PmPhaseAOnlineRuntimeError::OnlinePreflight)?;
+        Ok(PmPhaseAOnlineRuntimeBurnedV2 {
+            dispatch,
+            runtime,
+            candidate,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn recheck_phase_a_online_evidence(
+        &mut self,
+        mut evidence: PmPhaseAOnlineRuntimeEvidence,
+        config: &CanonicalTrialConfig,
+        v1_authorization: &CanonicalAuthorization,
+        policy: &CanonicalOnlinePolicyV2,
+        online_authorization: &CanonicalOnlineAuthorizationV2,
+        selected: GeoblockEvidence,
+    ) -> Result<PmRevalidatedPhaseAOnlineCurrentRuntimeWitness, PmPhaseAOnlineRuntimeError> {
+        self.validate_observer_process()?;
+        evidence
+            .window
+            .pins
+            .validate(config, v1_authorization, policy, online_authorization)?;
+        validate_online_source_identity(
+            evidence.window.creating_process_id,
+            evidence.window.source_thread_id,
+            evidence.window.effective_user_id,
+        )?;
+        validate_fresh_selected_geoblock(
+            &selected,
+            evidence.current.checked_wall_complete,
+            evidence.window.maximum_age,
+        )?;
+        let previous = std::mem::replace(&mut evidence.current.geoblock, selected);
+        evidence.prior_selected_geoblocks.push(previous);
+        let v1 = self.recheck_phase_a_place(
+            PmPhaseAPlaceCurrentRuntimeWitness {
+                evidence: evidence.current,
+            },
+            config,
+            v1_authorization,
+        )?;
+        let PmRevalidatedPhaseAPlaceCurrentRuntimeWitness { evidence: current } = v1;
+        evidence.current = current;
+        validate_age_window(
+            evidence.window.wall_started,
+            evidence.window.monotonic_started,
+            evidence.current.checked_wall_complete,
+            evidence.current.checked_monotonic_complete,
+            evidence.window.maximum_age,
+        )?;
+        let maximum_age_ms = validate_exact_online_inputs(
+            config,
+            v1_authorization,
+            policy,
+            online_authorization,
+            evidence.current.checked_wall_complete,
+        )?;
+        if maximum_age_ms != evidence.window.maximum_age_ms {
+            return Err(PmCurrentRuntimeError::AuthorizationBinding.into());
+        }
+        validate_exact_v2_runtime_binding(
+            &evidence.current,
+            config,
+            v1_authorization,
+            policy,
+            online_authorization,
+        )?;
+        let (egress_wall_completed, egress_monotonic_completed) = {
+            let facts = evidence.local_egress.revalidate_for_current_runtime(
+                online_authorization,
+                evidence.window.wall_started,
+                evidence.window.wall_completed,
+                evidence.window.monotonic_started,
+                evidence.window.monotonic_completed,
+                evidence.window.maximum_age,
+            )?;
+            (facts.wall_completed(), facts.monotonic_completed())
+        };
+        evidence.current.executable.revalidate_held_identity()?;
+        validate_online_source_identity(
+            evidence.window.creating_process_id,
+            evidence.window.source_thread_id,
+            evidence.window.effective_user_id,
+        )?;
+        validate_geoblock(
+            &evidence.current.geoblock,
+            egress_wall_completed,
+            evidence.window.maximum_age,
+        )?;
+        validate_age_window(
+            evidence.window.wall_started,
+            evidence.window.monotonic_started,
+            egress_wall_completed,
+            egress_monotonic_completed,
+            evidence.window.maximum_age,
+        )?;
+        let _ = validate_exact_online_inputs(
+            config,
+            v1_authorization,
+            policy,
+            online_authorization,
+            egress_wall_completed,
+        )?;
+        evidence.current.checked_wall_complete = egress_wall_completed;
+        evidence.current.checked_monotonic_complete = egress_monotonic_completed;
+        evidence.current.checked_wall_capture_unix_ns = unix_nanoseconds(egress_wall_completed)?;
+        evidence.current.checked_at_utc = canonical_utc(egress_wall_completed)?.into();
+        Ok(PmRevalidatedPhaseAOnlineCurrentRuntimeWitness { evidence })
     }
 }
 
@@ -408,6 +853,873 @@ impl fmt::Debug for PmCurrentRuntimeFactsView<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("PmCurrentRuntimeFactsView(<borrowed; nonsecret; non-authority>)")
     }
+}
+
+/// Open, move-only outer window. The observer is the sole clock source; this
+/// value is denied evidence and has no fact or runtime-binding projection.
+#[must_use = "the source-owned online preflight window must be finished or dropped"]
+pub(super) struct PmPhaseAOnlinePreflightWindow {
+    pins: OnlineRuntimePins,
+    creating_process_id: u32,
+    source_thread_id: u32,
+    effective_user_id: u32,
+    wall_started: SystemTime,
+    monotonic_started: Instant,
+    maximum_age: Duration,
+    maximum_age_ms: u64,
+}
+
+impl fmt::Debug for PmPhaseAOnlinePreflightWindow {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PmPhaseAOnlinePreflightWindow(<move-only; open; denied>)")
+    }
+}
+
+/// Closed outer window. It still grants no preparation, HMAC, dispatch, or
+/// transport authority. Only the exact V2 runtime join can consume it.
+#[must_use = "a finished online preflight window is denied evidence, not authority"]
+pub(super) struct PmFinishedPhaseAOnlinePreflightWindow {
+    open: PmPhaseAOnlinePreflightWindow,
+    wall_completed: SystemTime,
+    monotonic_completed: Instant,
+    started_at_utc: Box<str>,
+    completed_at_utc: Box<str>,
+}
+
+impl fmt::Debug for PmFinishedPhaseAOnlinePreflightWindow {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PmFinishedPhaseAOnlinePreflightWindow(<move-only; denied>)")
+    }
+}
+
+/// Runner-private proof that one production geoblock response was received by
+/// the future selected-egress actor while it owned the exact input custody.
+///
+/// There is deliberately no production constructor in this slice. Pairing an
+/// arbitrary production-origin observation with separately captured local
+/// facts would not prove that the GET used that interface/address selection.
+/// Nor does this scaffold yet carry one stable selected actor/client generation
+/// across the initial observation, Prepared transition, Basis transition, A3
+/// burn, final source refresh, and POST. A future child selected-actor module
+/// must retain actor-private generation and client custody through every
+/// reseal. Until that lands, this type must gain no constructor and every V2
+/// positive path remains unconstructible.
+#[must_use = "selected-egress geoblock evidence must remain under runtime custody"]
+pub(super) struct PmSelectedEgressGeoblockObservation<T> {
+    owned_custody: T,
+    observation: PmProductionGeoblockObservation,
+    thread_confinement: Rc<()>,
+}
+
+impl<T> fmt::Debug for PmSelectedEgressGeoblockObservation<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "PmSelectedEgressGeoblockObservation(<move-only; inseparable-custody-and-selected-egress-source>)",
+        )
+    }
+}
+
+/// First inseparable V2 runtime typestate. It is still denied and cannot mint
+/// a consumption runtime binding on its own.
+#[must_use = "online runtime evidence must be rechecked or dropped"]
+pub(super) struct PmPhaseAOnlineCurrentRuntimeWitness {
+    evidence: PmPhaseAOnlineRuntimeEvidence,
+}
+
+impl PmPhaseAOnlineCurrentRuntimeWitness {
+    /// Lend only non-authoritative manifest facts while all descriptor and
+    /// monotonic custody remains owned by this witness.
+    #[must_use]
+    pub(super) const fn facts(&self) -> PmPhaseAOnlineCurrentRuntimeFactsView<'_> {
+        PmPhaseAOnlineCurrentRuntimeFactsView {
+            evidence: &self.evidence,
+        }
+    }
+}
+
+impl fmt::Debug for PmPhaseAOnlineCurrentRuntimeWitness {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "PmPhaseAOnlineCurrentRuntimeWitness(<move-only; window-runtime-egress-bound; denied>)",
+        )
+    }
+}
+
+/// Revalidated typestate retained inside prepared-consumption custody. It has
+/// no public/sibling runtime-binding getter and cannot be detached.
+struct PmRevalidatedPhaseAOnlineCurrentRuntimeWitness {
+    evidence: PmPhaseAOnlineRuntimeEvidence,
+}
+
+/// Exact prepared V1+V2 consumption owners kept inseparable from the current
+/// runtime/window/egress custody that created their runtime bindings.
+#[must_use = "prepared online consumption custody must create the sealed Basis or be dropped"]
+pub(super) struct PmPhaseAOnlinePreparedConsumptionPair {
+    runtime: PmRevalidatedPhaseAOnlineCurrentRuntimeWitness,
+    v1_consumption: PreparedAuthorizationConsumption,
+    v2_consumption: PreparedOnlineAuthorizationConsumptionV2,
+}
+
+impl PmPhaseAOnlinePreparedConsumptionPair {
+    #[must_use]
+    pub(super) const fn facts(&self) -> PmPhaseAOnlineCurrentRuntimeFactsView<'_> {
+        PmPhaseAOnlineCurrentRuntimeFactsView {
+            evidence: &self.runtime.evidence,
+        }
+    }
+}
+
+impl fmt::Debug for PmPhaseAOnlinePreparedConsumptionPair {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .write_str("PmPhaseAOnlinePreparedConsumptionPair(<move-only; denied; runtime-bound>)")
+    }
+}
+
+/// Pending Basis plus every source owner that was admitted into its internal
+/// manifest. No component getter exists.
+pub(super) struct PmPendingPhaseAOnlineRuntimeBurnV2 {
+    pending: PmPendingPhaseAOnlinePreflightBasisV2,
+    runtime: PmRevalidatedPhaseAOnlineCurrentRuntimeWitness,
+    candidate: PmDeniedOnlinePreflightCandidate,
+}
+
+/// Burned durable dispatch evidence remains inseparable from source custody.
+/// This is not a final freshness bearer; a later purpose-specific consuming
+/// network handoff must actively re-observe the live book/user handles and
+/// every mutable runtime/selected-egress source again immediately before
+/// HMAC/transport. Candidate/Basis/A3 validation only rechecks retained
+/// snapshot equality and cannot detect subsequent live source changes.
+#[must_use = "burned online runtime custody must be finally consumed or converted to DND"]
+pub(super) struct PmPhaseAOnlineRuntimeBurnedV2 {
+    dispatch: PmPhaseAOnlinePreflightDispatchOwnerV2,
+    runtime: PmRevalidatedPhaseAOnlineCurrentRuntimeWitness,
+    candidate: PmDeniedOnlinePreflightCandidate,
+}
+
+impl fmt::Debug for PmPhaseAOnlineRuntimeBurnedV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "PmPhaseAOnlineRuntimeBurnedV2(<move-only; inseparable; final-recheck-required>)",
+        )
+    }
+}
+
+impl PmPhaseAOnlineRuntimeBurnedV2 {
+    /// Fail closed without exposing the embedded dispatch owner. The only
+    /// current production exit destroys every positive place path.
+    #[must_use]
+    pub(super) fn abandon_to_definitely_not_dispatched(
+        self,
+    ) -> PmPhaseAPlaceDefinitelyNotDispatchedV1 {
+        let Self {
+            dispatch,
+            runtime,
+            candidate,
+        } = self;
+        drop(runtime);
+        drop(candidate);
+        dispatch.into_definitely_not_dispatched()
+    }
+}
+
+/// Borrowed persistence facts only. It cannot construct either public runtime
+/// binding and contains no `Instant`, descriptor, or owned source value.
+pub(super) struct PmPhaseAOnlineCurrentRuntimeFactsView<'a> {
+    evidence: &'a PmPhaseAOnlineRuntimeEvidence,
+}
+
+impl PmPhaseAOnlineCurrentRuntimeFactsView<'_> {
+    #[must_use]
+    pub(super) fn observation_started_at_utc(&self) -> &str {
+        &self.evidence.window.started_at_utc
+    }
+
+    #[must_use]
+    pub(super) fn observation_completed_at_utc(&self) -> &str {
+        &self.evidence.window.completed_at_utc
+    }
+
+    #[must_use]
+    pub(super) const fn current_runtime(&self) -> PmCurrentRuntimeFactsView<'_> {
+        PmCurrentRuntimeFactsView {
+            evidence: &self.evidence.current,
+        }
+    }
+}
+
+impl fmt::Debug for PmPhaseAOnlineCurrentRuntimeFactsView<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PmPhaseAOnlineCurrentRuntimeFactsView(<borrowed; denied>)")
+    }
+}
+
+struct PmPhaseAOnlineRuntimeEvidence {
+    current: PmCurrentRuntimeEvidence,
+    window: FinishedOnlineWindowEvidence,
+    local_egress: PmLinuxEgressLocalFactCustody,
+    prior_selected_geoblocks: Vec<GeoblockEvidence>,
+}
+
+struct FinishedOnlineWindowEvidence {
+    pins: OnlineRuntimePins,
+    creating_process_id: u32,
+    source_thread_id: u32,
+    effective_user_id: u32,
+    wall_started: SystemTime,
+    monotonic_started: Instant,
+    wall_completed: SystemTime,
+    monotonic_completed: Instant,
+    started_at_utc: Box<str>,
+    completed_at_utc: Box<str>,
+    maximum_age: Duration,
+    maximum_age_ms: u64,
+}
+
+struct OnlineRuntimePins {
+    config_sha256: Box<str>,
+    config_length: u64,
+    config_fingerprint: Box<str>,
+    plan_fingerprint: Box<str>,
+    v1_authorization_id: Box<str>,
+    v1_authorization_fingerprint: Box<str>,
+    online_policy_sha256: Box<str>,
+    online_policy_length: u64,
+    online_policy_fingerprint: Box<str>,
+    online_authorization_id: Box<str>,
+    online_authorization_sha256: Box<str>,
+    online_authorization_length: u64,
+    online_authorization_fingerprint: Box<str>,
+}
+
+impl OnlineRuntimePins {
+    fn capture(
+        config: &CanonicalTrialConfig,
+        v1_authorization: &CanonicalAuthorization,
+        policy: &CanonicalOnlinePolicyV2,
+        online_authorization: &CanonicalOnlineAuthorizationV2,
+    ) -> Self {
+        Self {
+            config_sha256: config.canonical_sha256().into(),
+            config_length: config.canonical_length(),
+            config_fingerprint: config.fingerprint().into(),
+            plan_fingerprint: config.plan_fingerprint().into(),
+            v1_authorization_id: v1_authorization.value().authorization_id.as_str().into(),
+            v1_authorization_fingerprint: v1_authorization.fingerprint().into(),
+            online_policy_sha256: policy.canonical_sha256().into(),
+            online_policy_length: policy.canonical_length(),
+            online_policy_fingerprint: policy.fingerprint().into(),
+            online_authorization_id: online_authorization
+                .value()
+                .authorization_id
+                .as_str()
+                .into(),
+            online_authorization_sha256: online_authorization.canonical_sha256().into(),
+            online_authorization_length: online_authorization.canonical_length(),
+            online_authorization_fingerprint: online_authorization.fingerprint().into(),
+        }
+    }
+
+    fn validate(
+        &self,
+        config: &CanonicalTrialConfig,
+        v1_authorization: &CanonicalAuthorization,
+        policy: &CanonicalOnlinePolicyV2,
+        online_authorization: &CanonicalOnlineAuthorizationV2,
+    ) -> Result<(), PmCurrentRuntimeError> {
+        if self.config_sha256.as_ref() != config.canonical_sha256()
+            || self.config_length != config.canonical_length()
+            || self.config_fingerprint.as_ref() != config.fingerprint()
+            || self.plan_fingerprint.as_ref() != config.plan_fingerprint()
+            || self.v1_authorization_id.as_ref()
+                != v1_authorization.value().authorization_id.as_str()
+            || self.v1_authorization_fingerprint.as_ref() != v1_authorization.fingerprint()
+            || self.online_policy_sha256.as_ref() != policy.canonical_sha256()
+            || self.online_policy_length != policy.canonical_length()
+            || self.online_policy_fingerprint.as_ref() != policy.fingerprint()
+            || self.online_authorization_id.as_ref()
+                != online_authorization.value().authorization_id.as_str()
+            || self.online_authorization_sha256.as_ref() != online_authorization.canonical_sha256()
+            || self.online_authorization_length != online_authorization.canonical_length()
+            || self.online_authorization_fingerprint.as_ref() != online_authorization.fingerprint()
+        {
+            return Err(PmCurrentRuntimeError::AuthorizationBinding);
+        }
+        Ok(())
+    }
+}
+
+fn consume_selected_geoblock<T>(
+    selected: PmSelectedEgressGeoblockObservation<T>,
+) -> Result<(T, PmProductionGeoblockObservation), PmPhaseAOnlineRuntimeError> {
+    let PmSelectedEgressGeoblockObservation {
+        owned_custody,
+        observation,
+        thread_confinement,
+    } = selected;
+    if Rc::strong_count(&thread_confinement) != 1 {
+        return Err(PmPhaseAOnlineRuntimeError::SelectedEgressProvenance);
+    }
+    drop(thread_confinement);
+    Ok((owned_custody, observation))
+}
+
+fn validate_production_geoblock_inside_window(
+    observation: &PmProductionGeoblockObservation,
+    wall_started: SystemTime,
+    wall_completed: SystemTime,
+    maximum_age: Duration,
+) -> Result<(), PmCurrentRuntimeError> {
+    let receive_ns = observation.receive_clock().local_wall_receive_ns();
+    let started_ns = unix_nanoseconds(wall_started)?;
+    let completed_ns = unix_nanoseconds(wall_completed)?;
+    if receive_ns < started_ns || receive_ns > completed_ns {
+        return Err(PmCurrentRuntimeError::GeoblockOutsidePreflightWindow);
+    }
+    validate_geoblock_values(
+        observation.status().blocked(),
+        receive_ns,
+        wall_completed,
+        maximum_age,
+    )
+}
+
+fn validate_fresh_selected_geoblock(
+    geoblock: &GeoblockEvidence,
+    previous_runtime_edge: SystemTime,
+    maximum_age: Duration,
+) -> Result<(), PmCurrentRuntimeError> {
+    let previous_ns = unix_nanoseconds(previous_runtime_edge)?;
+    if geoblock.receive_clock.local_wall_receive_ns() < previous_ns {
+        return Err(PmCurrentRuntimeError::GeoblockNotFreshRecheck);
+    }
+    validate_geoblock(geoblock, SystemTime::now(), maximum_age)
+}
+
+fn validate_online_source_identity(
+    expected_process_id: u32,
+    expected_thread_id: u32,
+    expected_effective_user_id: u32,
+) -> Result<(), PmCurrentRuntimeError> {
+    if std::process::id() != expected_process_id
+        || current_runtime_thread_id()? != expected_thread_id
+        || current_effective_user_id()? != expected_effective_user_id
+    {
+        return Err(PmCurrentRuntimeError::OnlineSourceIdentityChanged);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn current_runtime_thread_id() -> Result<u32, PmCurrentRuntimeError> {
+    u32::try_from(rustix::thread::gettid().as_raw_pid())
+        .map_err(|_| PmCurrentRuntimeError::OnlineSourceIdentityChanged)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_runtime_thread_id() -> Result<u32, PmCurrentRuntimeError> {
+    Err(PmCurrentRuntimeError::UnsupportedPlatform)
+}
+
+#[cfg(target_os = "linux")]
+fn current_effective_user_id() -> Result<u32, PmCurrentRuntimeError> {
+    Ok(rustix::process::geteuid().as_raw())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_effective_user_id() -> Result<u32, PmCurrentRuntimeError> {
+    Err(PmCurrentRuntimeError::UnsupportedPlatform)
+}
+
+fn validate_exact_online_inputs(
+    config: &CanonicalTrialConfig,
+    v1_authorization: &CanonicalAuthorization,
+    policy: &CanonicalOnlinePolicyV2,
+    online_authorization: &CanonicalOnlineAuthorizationV2,
+    current_wall: SystemTime,
+) -> Result<u64, PmCurrentRuntimeError> {
+    validate_place_cancel_phase(config.value().phase, v1_authorization.value().phase)?;
+    let current_utc = system_time_utc(current_wall)?;
+    verify_authorization(config, v1_authorization, current_utc)
+        .map_err(|_| PmCurrentRuntimeError::AuthorizationBinding)?;
+    let policy_value = policy.value();
+    let online = online_authorization.value();
+    let config_pins = &online.v1_config;
+    if policy_value.phase != TrialPhase::APlaceCancel
+        || online.phase != TrialPhase::APlaceCancel
+        || policy_value.v1_config != online.v1_config
+        || config_pins.canonical_config_sha256 != config.canonical_sha256()
+        || config_pins.canonical_config_length != config.canonical_length()
+        || config_pins.canonical_config_fingerprint != config.fingerprint()
+        || config_pins.trial_plan_fingerprint != config.plan_fingerprint()
+        || online.online_policy.canonical_sha256 != policy.canonical_sha256()
+        || online.online_policy.canonical_length != policy.canonical_length()
+        || online.online_policy.fingerprint != policy.fingerprint()
+        || online.build.repository_commit != v1_authorization.value().build.repository_commit
+        || online.build.cargo_lock_sha256 != v1_authorization.value().build.cargo_lock_sha256
+        || online.build.release_binary_sha256
+            != v1_authorization.value().build.release_binary_sha256
+        || online.build.release_binary_length
+            != v1_authorization.value().build.release_binary_length
+        || online.host.uts_nodename != v1_authorization.value().host.host_identity
+        || online.host.boot_id != v1_authorization.value().host.boot_identity
+        || online.host.nss_username != v1_authorization.value().host.runtime_user
+        || online.host.egress.authorized_geoblock_reported_public_ip
+            != v1_authorization.value().host.egress_identity
+        || online.status_notice_history.clob_component
+            != policy_value.reviewed_status_clob_component
+    {
+        return Err(PmCurrentRuntimeError::AuthorizationBinding);
+    }
+
+    let policy_reviewed_at = parse_canonical_utc(&policy_value.reviewed_at_utc)?;
+    let reviewed_at = parse_canonical_utc(&online.reviewed_at_utc)?;
+    let not_before = parse_canonical_utc(&online.not_before_utc)?;
+    let expires_at = parse_canonical_utc(&online.expires_at_utc)?;
+    let cleanup_not_after = parse_canonical_utc(&online.cleanup_not_after_utc)?;
+    let history_started =
+        parse_canonical_utc(&online.status_notice_history.history_window_start_utc)?;
+    let history_completed =
+        parse_canonical_utc(&online.status_notice_history.reviewed_through_utc)?;
+    let current_utc = system_time_utc(current_wall)?;
+    let history_seconds = history_completed
+        .timestamp()
+        .checked_sub(history_started.timestamp())
+        .ok_or(PmCurrentRuntimeError::AuthorizationBinding)?;
+    let required_history_seconds =
+        i64::try_from(policy_value.minimum_notice_history_quiet_interval_seconds)
+            .map_err(|_| PmCurrentRuntimeError::AuthorizationBinding)?;
+    if policy_reviewed_at > reviewed_at
+        || reviewed_at > not_before
+        || history_completed != reviewed_at
+        || history_seconds < required_history_seconds
+        || current_utc < not_before
+        || current_utc >= expires_at
+    {
+        return Err(PmCurrentRuntimeError::AuthorizationBinding);
+    }
+    let cleanup_budget = Duration::from_millis(config.value().time_limits.cleanup_not_after_ms);
+    validate_cleanup_runway(
+        current_wall,
+        SystemTime::from(cleanup_not_after),
+        cleanup_budget,
+    )?;
+    let v1_cleanup = parse_canonical_utc(&v1_authorization.value().cleanup_not_after_utc)?;
+    validate_cleanup_runway(current_wall, SystemTime::from(v1_cleanup), cleanup_budget)?;
+    let maximum_age_ms = config
+        .value()
+        .time_limits
+        .maximum_preflight_observation_age_ms
+        .min(policy_value.maximum_observation_age_ms);
+    if maximum_age_ms == 0 {
+        return Err(PmCurrentRuntimeError::ObservationExpired);
+    }
+    Ok(maximum_age_ms)
+}
+
+fn validate_exact_v2_runtime_binding(
+    evidence: &PmCurrentRuntimeEvidence,
+    config: &CanonicalTrialConfig,
+    v1_authorization: &CanonicalAuthorization,
+    policy: &CanonicalOnlinePolicyV2,
+    online_authorization: &CanonicalOnlineAuthorizationV2,
+) -> Result<(), PmCurrentRuntimeError> {
+    let _ = validate_exact_online_inputs(
+        config,
+        v1_authorization,
+        policy,
+        online_authorization,
+        evidence.checked_wall_complete,
+    )?;
+    let online = online_authorization.value();
+    let authorized_public_ip = online
+        .host
+        .egress
+        .authorized_geoblock_reported_public_ip
+        .parse::<IpAddr>()
+        .map_err(|_| PmCurrentRuntimeError::AuthorizationBinding)?;
+    if evidence.executable.sha256_hex.as_ref() != online.build.release_binary_sha256
+        || evidence.executable.length != online.build.release_binary_length
+        || evidence.observed_host.host_identity.as_ref() != online.host.uts_nodename
+        || evidence.observed_host.boot_identity.as_ref() != online.host.boot_id
+        || evidence.observed_host.runtime_user.as_ref() != online.host.nss_username
+        || evidence.effective_user_id != online.host.linux_euid
+        || evidence.geoblock.blocked
+        || evidence.geoblock.ip != authorized_public_ip
+        || evidence.observed_host.egress_identity != authorized_public_ip
+    {
+        return Err(PmCurrentRuntimeError::AuthorizationBinding);
+    }
+    Ok(())
+}
+
+fn exact_consumption_runtime_bindings(
+    evidence: &mut PmPhaseAOnlineRuntimeEvidence,
+    online_authorization: &CanonicalOnlineAuthorizationV2,
+) -> Result<
+    (
+        AuthorizationRuntimeBinding,
+        OnlineAuthorizationRuntimeBindingV2,
+    ),
+    PmPhaseAOnlineRuntimeError,
+> {
+    let (
+        final_wall,
+        final_monotonic,
+        final_effective_user_id,
+        network_namespace_device,
+        network_namespace_inode,
+        interface_name,
+        interface_index,
+        local_source_ip,
+    ) = {
+        let local = evidence.local_egress.revalidate_for_current_runtime(
+            online_authorization,
+            evidence.window.wall_started,
+            evidence.window.wall_completed,
+            evidence.window.monotonic_started,
+            evidence.window.monotonic_completed,
+            evidence.window.maximum_age,
+        )?;
+        (
+            local.wall_completed(),
+            local.monotonic_completed(),
+            local.effective_user_id(),
+            local.network_namespace_device(),
+            local.network_namespace_inode(),
+            local.interface_name().to_owned(),
+            local.interface_index(),
+            local.local_source_ip().to_string(),
+        )
+    };
+    validate_age_window(
+        evidence.window.wall_started,
+        evidence.window.monotonic_started,
+        final_wall,
+        final_monotonic,
+        evidence.window.maximum_age,
+    )?;
+    evidence.current.executable.revalidate_held_identity()?;
+    validate_online_source_identity(
+        evidence.window.creating_process_id,
+        evidence.window.source_thread_id,
+        evidence.window.effective_user_id,
+    )?;
+    validate_geoblock(
+        &evidence.current.geoblock,
+        final_wall,
+        evidence.window.maximum_age,
+    )?;
+    let observed_at_utc = canonical_utc(final_wall)?;
+    let v1_runtime = AuthorizationRuntimeBinding {
+        release_binary_sha256: evidence.current.executable.sha256_hex.to_string(),
+        release_binary_length: evidence.current.executable.length,
+        host: AuthorizationHostBinding {
+            host_identity: evidence.current.observed_host.host_identity.to_string(),
+            boot_identity: evidence.current.observed_host.boot_identity.to_string(),
+            runtime_user: evidence.current.observed_host.runtime_user.to_string(),
+            egress_identity: evidence.current.geoblock.ip.to_string(),
+        },
+        observed_at_utc: observed_at_utc.clone(),
+    };
+    let v2_runtime = OnlineAuthorizationRuntimeBindingV2 {
+        release_binary_sha256: evidence.current.executable.sha256_hex.to_string(),
+        release_binary_length: evidence.current.executable.length,
+        uts_nodename: evidence.current.observed_host.host_identity.to_string(),
+        boot_id: evidence.current.observed_host.boot_identity.to_string(),
+        nss_username: evidence.current.observed_host.runtime_user.to_string(),
+        linux_euid: final_effective_user_id,
+        network_namespace_device,
+        network_namespace_inode,
+        interface_name,
+        interface_index,
+        local_source_ip,
+        geoblock_reported_public_ip: evidence.current.geoblock.ip.to_string(),
+        observed_at_utc,
+    };
+    evidence.current.checked_wall_complete = final_wall;
+    evidence.current.checked_monotonic_complete = final_monotonic;
+    evidence.current.checked_wall_capture_unix_ns = unix_nanoseconds(final_wall)?;
+    evidence.current.checked_at_utc = canonical_utc(final_wall)?.into();
+    Ok((v1_runtime, v2_runtime))
+}
+
+fn validate_candidate_inside_outer_window(
+    candidate: &PmDeniedOnlinePreflightCandidate,
+    window: &FinishedOnlineWindowEvidence,
+    online_authorization: &CanonicalOnlineAuthorizationV2,
+) -> Result<(), PmPhaseAOnlineRuntimeError> {
+    let manifest = candidate.candidate_manifest();
+    let outer_started_ns = unix_nanoseconds(window.wall_started)?;
+    let outer_completed_ns = unix_nanoseconds(window.wall_completed)?;
+    let source_minimum = manifest.minimum_source_wall_edge_ns();
+    let source_maximum = manifest.maximum_source_wall_edge_ns();
+    if source_minimum == 0
+        || source_minimum > source_maximum
+        || source_minimum < outer_started_ns
+        || source_maximum > outer_completed_ns
+    {
+        return Err(PmPhaseAOnlineRuntimeError::CandidateManifest);
+    }
+    let market_end = parse_canonical_utc(manifest.market_end_time())?;
+    let cleanup = parse_canonical_utc(&online_authorization.value().cleanup_not_after_utc)?;
+    if market_end <= cleanup {
+        return Err(PmPhaseAOnlineRuntimeError::CandidateManifest);
+    }
+    let canonical_sha256: [u8; 32] = Sha256::digest(manifest.canonical_bytes()).into();
+    if canonical_sha256 != manifest.canonical_sha256()
+        || manifest.canonical_bytes().is_empty()
+        || manifest.fingerprint() == [0_u8; 32]
+    {
+        return Err(PmPhaseAOnlineRuntimeError::CandidateManifest);
+    }
+    Ok(())
+}
+
+fn assemble_online_preflight_manifest(
+    candidate: &PmDeniedOnlinePreflightCandidate,
+    runtime: &PmPhaseAOnlineRuntimeEvidence,
+    policy: &CanonicalOnlinePolicyV2,
+    online_authorization: &CanonicalOnlineAuthorizationV2,
+    v1_runtime: &AuthorizationRuntimeBinding,
+    v2_runtime: &OnlineAuthorizationRuntimeBindingV2,
+) -> Result<PmPhaseAOnlinePreflightEvidenceManifestV2, PmPhaseAOnlineRuntimeError> {
+    let candidate_manifest = candidate.candidate_manifest();
+    let reviewed_market_evidence_sha256 = policy.value().reviewed_market.review_sha256.clone();
+    let reviewed_status_history_sha256 = online_authorization
+        .value()
+        .status_notice_history
+        .review_sha256
+        .clone();
+    let fresh_status_announcements_sha256 =
+        lower_hex(&candidate_manifest.fresh_status_announcements_sha256());
+    let clob_ok_liveness_sha256 = lower_hex(&candidate_manifest.clob_ok_liveness_sha256());
+    let same_account_closed_only_sha256 =
+        lower_hex(&candidate_manifest.same_account_closed_only_sha256());
+    let public_book_cut_sha256 = lower_hex(&candidate_manifest.public_book_cut_sha256());
+    let user_account_cut_sha256 = lower_hex(&candidate_manifest.user_account_cut_sha256());
+    let same_authority_rest_cut_sha256 =
+        lower_hex(&candidate_manifest.same_authority_rest_cut_sha256());
+    let finalized_chain_cut_sha256 = lower_hex(&candidate_manifest.finalized_chain_cut_sha256());
+    let data_api_position_cut_sha256 =
+        lower_hex(&candidate_manifest.data_api_position_cut_sha256());
+    let current_runtime_and_egress_sha256 =
+        runtime_and_egress_digest(runtime, v1_runtime, v2_runtime);
+    let reviewed_repository_state_sha256 = reviewed_repository_state_digest(online_authorization);
+    let (canonical_manifest_sha256, canonical_manifest_length) =
+        full_online_preflight_manifest_identity(
+            &candidate_manifest,
+            runtime,
+            policy,
+            online_authorization,
+            &[
+                &reviewed_market_evidence_sha256,
+                &reviewed_status_history_sha256,
+                &fresh_status_announcements_sha256,
+                &clob_ok_liveness_sha256,
+                &same_account_closed_only_sha256,
+                &public_book_cut_sha256,
+                &user_account_cut_sha256,
+                &same_authority_rest_cut_sha256,
+                &finalized_chain_cut_sha256,
+                &data_api_position_cut_sha256,
+                &current_runtime_and_egress_sha256,
+                &reviewed_repository_state_sha256,
+            ],
+        )?;
+    Ok(PmPhaseAOnlinePreflightEvidenceManifestV2 {
+        observation_started_at_utc: runtime.window.started_at_utc.to_string(),
+        observation_completed_at_utc: runtime.window.completed_at_utc.to_string(),
+        canonical_manifest_sha256,
+        canonical_manifest_length,
+        reviewed_market_evidence_sha256,
+        reviewed_status_history_sha256,
+        fresh_status_announcements_sha256,
+        clob_ok_liveness_sha256,
+        same_account_closed_only_sha256,
+        public_book_cut_sha256,
+        user_account_cut_sha256,
+        same_authority_rest_cut_sha256,
+        finalized_chain_cut_sha256,
+        data_api_position_cut_sha256,
+        current_runtime_and_egress_sha256,
+        reviewed_repository_state_sha256,
+    })
+}
+
+/// Canonical identity of the complete runner-assembled manifest body. The
+/// self-identifying SHA/length fields are intentionally excluded; every
+/// candidate, window, config/policy/authorization, runtime/egress, reviewed
+/// repository, and per-source digest input is included exactly once.
+fn full_online_preflight_manifest_identity(
+    candidate: &super::online_preflight::PmOnlinePreflightCandidateManifestView<'_>,
+    runtime: &PmPhaseAOnlineRuntimeEvidence,
+    policy: &CanonicalOnlinePolicyV2,
+    online_authorization: &CanonicalOnlineAuthorizationV2,
+    evidence_sha256: &[&str; 12],
+) -> Result<(String, u64), PmPhaseAOnlineRuntimeError> {
+    let mut bytes = Vec::new();
+    append_manifest_bytes(
+        &mut bytes,
+        b"domain",
+        b"reap.pm-t2.runner.complete-online-preflight-manifest.v2\0",
+    );
+    append_manifest_bytes(
+        &mut bytes,
+        b"partial_candidate",
+        candidate.canonical_bytes(),
+    );
+    append_manifest_bytes(
+        &mut bytes,
+        b"partial_candidate_sha256",
+        &candidate.canonical_sha256(),
+    );
+    append_manifest_bytes(
+        &mut bytes,
+        b"partial_candidate_fingerprint",
+        &candidate.fingerprint(),
+    );
+    append_manifest_u64(
+        &mut bytes,
+        b"source_wall_min_ns",
+        candidate.minimum_source_wall_edge_ns(),
+    );
+    append_manifest_u64(
+        &mut bytes,
+        b"source_wall_max_ns",
+        candidate.maximum_source_wall_edge_ns(),
+    );
+    append_manifest_text(&mut bytes, b"market_end_time", candidate.market_end_time());
+    append_manifest_text(
+        &mut bytes,
+        b"window_started_at_utc",
+        &runtime.window.started_at_utc,
+    );
+    append_manifest_text(
+        &mut bytes,
+        b"window_completed_at_utc",
+        &runtime.window.completed_at_utc,
+    );
+    append_manifest_u64(
+        &mut bytes,
+        b"window_maximum_age_ms",
+        runtime.window.maximum_age_ms,
+    );
+    append_manifest_text(
+        &mut bytes,
+        b"config_fingerprint",
+        &runtime.window.pins.config_fingerprint,
+    );
+    append_manifest_text(
+        &mut bytes,
+        b"v1_authorization_fingerprint",
+        &runtime.window.pins.v1_authorization_fingerprint,
+    );
+    append_manifest_text(&mut bytes, b"policy_sha256", policy.canonical_sha256());
+    append_manifest_u64(&mut bytes, b"policy_length", policy.canonical_length());
+    append_manifest_text(&mut bytes, b"policy_fingerprint", policy.fingerprint());
+    append_manifest_text(
+        &mut bytes,
+        b"online_authorization_sha256",
+        online_authorization.canonical_sha256(),
+    );
+    append_manifest_u64(
+        &mut bytes,
+        b"online_authorization_length",
+        online_authorization.canonical_length(),
+    );
+    append_manifest_text(
+        &mut bytes,
+        b"online_authorization_fingerprint",
+        online_authorization.fingerprint(),
+    );
+    for (index, digest) in evidence_sha256.iter().enumerate() {
+        append_manifest_u64(&mut bytes, b"evidence_index", index as u64);
+        append_manifest_text(&mut bytes, b"evidence_sha256", digest);
+    }
+    let length =
+        u64::try_from(bytes.len()).map_err(|_| PmPhaseAOnlineRuntimeError::CandidateManifest)?;
+    if length == 0 {
+        return Err(PmPhaseAOnlineRuntimeError::CandidateManifest);
+    }
+    let sha256: [u8; 32] = Sha256::digest(&bytes).into();
+    Ok((lower_hex(&sha256), length))
+}
+
+fn append_manifest_bytes(target: &mut Vec<u8>, key: &[u8], value: &[u8]) {
+    target.extend_from_slice(&(key.len() as u64).to_be_bytes());
+    target.extend_from_slice(key);
+    target.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    target.extend_from_slice(value);
+}
+
+fn append_manifest_text(target: &mut Vec<u8>, key: &[u8], value: &str) {
+    append_manifest_bytes(target, key, value.as_bytes());
+}
+
+fn append_manifest_u64(target: &mut Vec<u8>, key: &[u8], value: u64) {
+    append_manifest_bytes(target, key, &value.to_be_bytes());
+}
+
+fn runtime_and_egress_digest(
+    runtime: &PmPhaseAOnlineRuntimeEvidence,
+    v1: &AuthorizationRuntimeBinding,
+    v2: &OnlineAuthorizationRuntimeBindingV2,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"reap.pm-t2.runner.current-runtime-and-selected-egress.v2\0");
+    digest_text(&mut digest, &v1.release_binary_sha256);
+    digest_u64(&mut digest, v1.release_binary_length);
+    digest_text(&mut digest, &v1.host.host_identity);
+    digest_text(&mut digest, &v1.host.boot_identity);
+    digest_text(&mut digest, &v1.host.runtime_user);
+    digest_text(&mut digest, &v1.host.egress_identity);
+    digest_text(&mut digest, &v1.observed_at_utc);
+    digest_text(&mut digest, &v2.uts_nodename);
+    digest_text(&mut digest, &v2.boot_id);
+    digest_text(&mut digest, &v2.nss_username);
+    digest_u64(&mut digest, u64::from(v2.linux_euid));
+    digest_u64(&mut digest, v2.network_namespace_device);
+    digest_u64(&mut digest, v2.network_namespace_inode);
+    digest_text(&mut digest, &v2.interface_name);
+    digest_u64(&mut digest, u64::from(v2.interface_index));
+    digest_text(&mut digest, &v2.local_source_ip);
+    digest_text(&mut digest, &v2.geoblock_reported_public_ip);
+    digest_text(&mut digest, &v2.observed_at_utc);
+    digest_text(&mut digest, &runtime.window.started_at_utc);
+    digest_text(&mut digest, &runtime.window.completed_at_utc);
+    digest_u64(&mut digest, runtime.window.maximum_age_ms);
+    digest.update(runtime.current.geoblock.commitment.bytes());
+    digest_u64(&mut digest, runtime.prior_selected_geoblocks.len() as u64);
+    for geoblock in &runtime.prior_selected_geoblocks {
+        digest.update(geoblock.commitment.bytes());
+    }
+    let value: [u8; 32] = digest.finalize().into();
+    lower_hex(&value)
+}
+
+fn reviewed_repository_state_digest(
+    online_authorization: &CanonicalOnlineAuthorizationV2,
+) -> String {
+    let build = &online_authorization.value().build;
+    let mut digest = Sha256::new();
+    digest.update(b"reap.pm-t2.runner.reviewed-repository-state.v2\0");
+    digest_text(&mut digest, &build.repository_commit);
+    digest_text(&mut digest, "exact_clean_commit");
+    digest_text(&mut digest, &build.cargo_lock_sha256);
+    digest_text(&mut digest, &build.release_binary_sha256);
+    digest_u64(&mut digest, build.release_binary_length);
+    let value: [u8; 32] = digest.finalize().into();
+    lower_hex(&value)
+}
+
+fn digest_text(digest: &mut Sha256, value: &str) {
+    digest_u64(digest, value.len() as u64);
+    digest.update(value.as_bytes());
+}
+
+fn digest_u64(digest: &mut Sha256, value: u64) {
+    digest.update(value.to_be_bytes());
 }
 
 struct PmCurrentRuntimeEvidence {
@@ -1158,10 +2470,34 @@ pub(super) enum PmCurrentRuntimeError {
     GeoblockFromFuture,
     #[error("the typed geoblock wall observation is stale")]
     GeoblockExpired,
+    #[error("the selected-egress geoblock response falls outside the outer preflight window")]
+    GeoblockOutsidePreflightWindow,
+    #[error("the selected-egress geoblock response does not follow the prior runtime edge")]
+    GeoblockNotFreshRecheck,
+    #[error("the online preflight process, thread, or effective-user source changed")]
+    OnlineSourceIdentityChanged,
     #[error("canonical config, authorization, release, host, or egress binding differs")]
     AuthorizationBinding,
     #[error("the full conservative cleanup budget no longer fits its authorization window")]
     CleanupWindow,
+}
+
+#[derive(Debug, Error)]
+pub(super) enum PmPhaseAOnlineRuntimeError {
+    #[error(transparent)]
+    CurrentRuntime(#[from] PmCurrentRuntimeError),
+    #[error(transparent)]
+    LocalEgress(#[from] PmLinuxEgressLocalFactError),
+    #[error("selected-egress provenance custody is not unique")]
+    SelectedEgressProvenance,
+    #[error("V1 authorization-consumption preparation failed closed")]
+    V1Consumption(PmAuthorizationConsumptionError),
+    #[error("V2 authorization-consumption preparation failed closed")]
+    V2Consumption(PmOnlineAuthorizationConsumptionV2Error),
+    #[error("durable online-preflight sidecar transition failed closed")]
+    OnlinePreflight(PmPhaseAOnlinePreflightV2Error),
+    #[error("the sealed online-preflight candidate manifest binding is invalid")]
+    CandidateManifest,
 }
 
 #[cfg(test)]

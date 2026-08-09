@@ -451,6 +451,14 @@ pub(super) struct PmUserOnlinePreflightLease {
 }
 
 impl PmUserOnlinePreflightLease {
+    /// Exact L2 signer retained by the same-credential marker that owns both
+    /// this user-stream ticket and its authenticated REST allocation. This is
+    /// a borrowed value projection, never a caller-supplied account claim.
+    #[must_use]
+    pub(super) fn signer(&self) -> reap_polymarket_auth::EoaAddress {
+        self.ticket.marker.signer()
+    }
+
     #[must_use]
     pub(super) const fn scope(&self) -> PmWireScope {
         self.ticket.core.scope

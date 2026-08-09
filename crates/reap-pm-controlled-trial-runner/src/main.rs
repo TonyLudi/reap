@@ -12,6 +12,5 @@
 )]
 
 mod controlled_trial;
-mod credentials;
 
 fn main() {}

@@ -140,7 +140,7 @@ pub struct PmClobV2Metadata {
     cancel_book_on_start: Option<bool>,
     accepting_order_timestamp: Option<PmLifecycleTimeString>,
     rfq_enabled: Option<bool>,
-    take_only_delay_enabled: bool,
+    take_only_delay_enabled: Option<bool>,
     bonding_curve_enabled: Option<bool>,
     minimum_order_age_seconds: u64,
 }
@@ -265,6 +265,18 @@ impl PmClobV2Metadata {
 
     #[must_use]
     pub const fn take_only_delay_enabled(&self) -> bool {
+        match self.take_only_delay_enabled {
+            Some(value) => value,
+            None => false,
+        }
+    }
+
+    /// Exact presence-preserving value reported by the abbreviated CLOB
+    /// route. The compatibility getter above retains its historical
+    /// missing-as-false behavior; safety-sensitive consumers must use this
+    /// accessor and require an explicit value.
+    #[must_use]
+    pub const fn take_only_delay_enabled_reported(&self) -> Option<bool> {
         self.take_only_delay_enabled
     }
 
@@ -446,8 +458,8 @@ pub fn parse_live_clob_v2_metadata(
             .transpose()?;
     let rfq_enabled = optional_nonnull(wire.rfq_enabled, "rfq_enabled")?;
     let take_only_delay_enabled = match wire.is_take_only_delay_enabled {
-        PresentField::Missing => false,
-        PresentField::Present(value) => value,
+        PresentField::Missing => None,
+        PresentField::Present(value) => Some(value),
     };
     let bonding_curve_enabled =
         optional_nonnull(wire.is_bonding_curve_enabled, "is_bonding_curve_enabled")?;

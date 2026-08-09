@@ -26,7 +26,7 @@ const MAX_PASSPHRASE_BYTES: usize = 128;
 /// Names are resolved only beneath `directory`; they are never interpreted as
 /// paths. This type is intentionally distinct from recovery custody.
 #[must_use = "a fresh-place credential file specification must be loaded or deliberately dropped"]
-pub(crate) struct FreshPlaceCredentialFiles {
+pub(super) struct FreshPlaceCredentialFiles {
     directory: PathBuf,
     private_key_entry: String,
     api_key_entry: String,
@@ -35,7 +35,7 @@ pub(crate) struct FreshPlaceCredentialFiles {
 }
 
 impl FreshPlaceCredentialFiles {
-    pub(crate) fn new(
+    pub(super) fn new(
         directory: PathBuf,
         private_key_entry: String,
         api_key_entry: String,
@@ -52,7 +52,7 @@ impl FreshPlaceCredentialFiles {
     }
 
     /// Load and bind all four fresh-place secrets under one pinned directory.
-    pub(crate) fn load(
+    pub(super) fn load(
         self,
         configured_signer: EoaAddress,
     ) -> Result<FreshPlaceCredentialHandoff, CredentialCustodyError> {
@@ -133,7 +133,7 @@ impl fmt::Debug for FreshPlaceCredentialFiles {
 /// Three staged L2 entries for recovery. There is deliberately no private-key
 /// field, private-key entry argument, signer authority, or place capability.
 #[must_use = "a recovery-only credential file specification must be loaded or deliberately dropped"]
-pub(crate) struct RecoveryOnlyCredentialFiles {
+pub(super) struct RecoveryOnlyCredentialFiles {
     directory: PathBuf,
     api_key_entry: String,
     l2_secret_entry: String,
@@ -141,7 +141,7 @@ pub(crate) struct RecoveryOnlyCredentialFiles {
 }
 
 impl RecoveryOnlyCredentialFiles {
-    pub(crate) fn new(
+    pub(super) fn new(
         directory: PathBuf,
         api_key_entry: String,
         l2_secret_entry: String,
@@ -156,7 +156,7 @@ impl RecoveryOnlyCredentialFiles {
     }
 
     /// Load and structurally bind only the three L2 recovery secrets.
-    pub(crate) fn load(
+    pub(super) fn load(
         self,
         configured_signer: EoaAddress,
     ) -> Result<RecoveryOnlyCredentialHandoff, CredentialCustodyError> {
@@ -212,17 +212,18 @@ impl fmt::Debug for RecoveryOnlyCredentialFiles {
     }
 }
 
-/// Move-only fresh-place authority handoff. Only sibling runner modules can
-/// consume it, and no operation exposes secret text or bytes.
+/// Move-only fresh-place authority handoff. Only its immediate authority parent
+/// can consume it; no crate sibling can name or decompose this custody, and no
+/// operation exposes secret text or bytes.
 #[must_use = "credential authorities and their staged-file teardown must remain owned"]
-pub(crate) struct FreshPlaceCredentialHandoff {
+pub(super) struct FreshPlaceCredentialHandoff {
     signer: FixedEoaSigner,
     l2: L2Credentials,
     teardown: FreshPlaceCredentialTeardown,
 }
 
 impl FreshPlaceCredentialHandoff {
-    pub(crate) fn into_authorities_and_teardown(
+    pub(super) fn into_authorities_and_teardown(
         self,
     ) -> (FixedEoaSigner, L2Credentials, FreshPlaceCredentialTeardown) {
         let Self {
@@ -240,16 +241,17 @@ impl fmt::Debug for FreshPlaceCredentialHandoff {
     }
 }
 
-/// Move-only recovery authority handoff. Its shape cannot carry a signer or a
-/// private-key teardown capability.
+/// Move-only recovery authority handoff. Only its immediate authority parent
+/// can consume it; no crate sibling can name or decompose this custody. Its
+/// shape cannot carry a signer or a private-key teardown capability.
 #[must_use = "the L2 authority and its staged-file teardown must remain owned"]
-pub(crate) struct RecoveryOnlyCredentialHandoff {
+pub(super) struct RecoveryOnlyCredentialHandoff {
     l2: L2Credentials,
     teardown: RecoveryOnlyCredentialTeardown,
 }
 
 impl RecoveryOnlyCredentialHandoff {
-    pub(crate) fn into_authority_and_teardown(
+    pub(super) fn into_authority_and_teardown(
         self,
     ) -> (L2Credentials, RecoveryOnlyCredentialTeardown) {
         let Self { l2, teardown } = self;
@@ -266,18 +268,18 @@ impl fmt::Debug for RecoveryOnlyCredentialHandoff {
 /// Exact staged-file capabilities retained by fresh mode. The private-key
 /// entry is independently removable before terminal L2 teardown.
 #[must_use = "dropping this token leaves any remaining staged credentials unchanged"]
-pub(crate) struct FreshPlaceCredentialTeardown {
+pub(super) struct FreshPlaceCredentialTeardown {
     directory: PinnedDirectory,
     private_key: Option<StagedCredential>,
     l2: StagedL2Files,
 }
 
 impl FreshPlaceCredentialTeardown {
-    pub(crate) fn remove_private_key(&mut self) -> Result<(), CredentialCustodyError> {
+    pub(super) fn remove_private_key(&mut self) -> Result<(), CredentialCustodyError> {
         unlink_slot(&mut self.directory, &mut self.private_key, true)
     }
 
-    pub(crate) fn remove_l2_files(&mut self) -> Result<(), CredentialCustodyError> {
+    pub(super) fn remove_l2_files(&mut self) -> Result<(), CredentialCustodyError> {
         if self.private_key.is_some() {
             return Err(CredentialCustodyError::PrivateKeyTeardownRequired);
         }
@@ -299,13 +301,13 @@ impl fmt::Debug for FreshPlaceCredentialTeardown {
 /// Exact staged-file capabilities retained by recovery mode. Its type has no
 /// private-key entry and cannot request private-key deletion.
 #[must_use = "dropping this token leaves any remaining staged credentials unchanged"]
-pub(crate) struct RecoveryOnlyCredentialTeardown {
+pub(super) struct RecoveryOnlyCredentialTeardown {
     directory: PinnedDirectory,
     l2: StagedL2Files,
 }
 
 impl RecoveryOnlyCredentialTeardown {
-    pub(crate) fn remove_l2_files(&mut self) -> Result<(), CredentialCustodyError> {
+    pub(super) fn remove_l2_files(&mut self) -> Result<(), CredentialCustodyError> {
         self.l2.remove_all(&mut self.directory)
     }
 
@@ -322,7 +324,7 @@ impl fmt::Debug for RecoveryOnlyCredentialTeardown {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CredentialRole {
+pub(super) enum CredentialRole {
     PrivateKey,
     ApiKey,
     L2Secret,
@@ -343,7 +345,7 @@ impl fmt::Display for CredentialRole {
 /// Content-free credential failures. No variant retains a caller path, file
 /// name, secret value, or operating-system error string.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CredentialCustodyError {
+pub(super) enum CredentialCustodyError {
     #[error("the credential directory must be one real protected directory")]
     InvalidDirectory,
     #[error("the credential directory is not owned by the effective user")]

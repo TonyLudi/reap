@@ -1,4 +1,8 @@
+use std::{fs, path::Path};
+
 const AUTHORITY_SOURCE: &str = include_str!("../src/controlled_trial/authority.rs");
+const CREDENTIAL_CUSTODY_SOURCE: &str =
+    include_str!("../src/controlled_trial/authority/credential_custody.rs");
 const PARENT_SOURCE: &str = include_str!("../src/controlled_trial/mod.rs");
 const MAIN_SOURCE: &str = include_str!("../src/main.rs");
 const MANIFEST_SOURCE: &str = include_str!("../Cargo.toml");
@@ -25,6 +29,57 @@ fn declaration_prefix<'a>(source: &'a str, declaration: &str) -> &'a str {
         .split_once(declaration)
         .map(|(prefix, _)| prefix.rsplit("\n\n").next().unwrap_or(prefix))
         .expect("declared authority type must remain present")
+}
+
+fn function_signature<'a>(source: &'a str, declaration: &str) -> &'a str {
+    source
+        .split_once(declaration)
+        .and_then(|(_, tail)| tail.split_once('{').map(|(signature, _)| signature))
+        .expect("source-policy function declaration must remain present")
+}
+
+fn assert_no_raw_credential_authority_outside(
+    directory: &Path,
+    source_root: &Path,
+    allowed: &[&str],
+) {
+    let mut entries = fs::read_dir(directory)
+        .expect("runner source directory must remain readable")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("runner source directory entries must remain readable");
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            assert_no_raw_credential_authority_outside(&path, source_root, allowed);
+            continue;
+        }
+        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(source_root)
+            .expect("runner source must remain below its source root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if allowed.contains(&relative.as_str()) {
+            continue;
+        }
+        let source = fs::read_to_string(&path).expect("runner Rust source must remain readable");
+        for forbidden in [
+            "FixedEoaSigner",
+            "L2Credentials",
+            "EoaPrivateKeyInput",
+            "L2CredentialInput",
+            "into_authorities_and_teardown",
+            "into_authority_and_teardown",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "raw credential authority `{forbidden}` escaped into {relative}",
+            );
+        }
+    }
 }
 
 #[test]
@@ -72,6 +127,7 @@ fn recovery_surface_and_task_cannot_acquire_fresh_place_or_signer_authority() {
 #[test]
 fn authority_is_binary_private_and_has_no_raw_secret_or_generic_signing_escape() {
     assert!(MAIN_SOURCE.contains("mod controlled_trial;"));
+    assert!(!MAIN_SOURCE.contains("mod credentials;"));
     assert!(!MAIN_SOURCE.contains("pub mod controlled_trial"));
     assert!(MANIFEST_SOURCE.contains("[[bin]]"));
     assert!(!MANIFEST_SOURCE.contains("[lib]"));
@@ -102,6 +158,122 @@ fn authority_is_binary_private_and_has_no_raw_secret_or_generic_signing_escape()
             );
         }
     }
+}
+
+#[test]
+fn credential_custody_is_a_private_authority_child_with_no_raw_sibling_escape() {
+    assert!(
+        AUTHORITY_SOURCE
+            .lines()
+            .any(|line| line == "mod credential_custody;")
+    );
+    assert!(!AUTHORITY_SOURCE.contains("pub mod credential_custody;"));
+    assert!(!AUTHORITY_SOURCE.contains("pub(crate) mod credential_custody;"));
+    assert!(!AUTHORITY_SOURCE.contains("pub(super) mod credential_custody;"));
+    assert!(!AUTHORITY_SOURCE.contains("pub(in "));
+    assert!(!PARENT_SOURCE.contains("mod credential_custody;"));
+    assert!(!MAIN_SOURCE.contains("mod credentials;"));
+
+    let production = CREDENTIAL_CUSTODY_SOURCE
+        .split_once("#[cfg(all(test, target_os = \"linux\"))]")
+        .map(|(production, _)| production)
+        .expect("credential-custody unit tests must remain after production custody");
+    let (authority_production, authority_tests) = AUTHORITY_SOURCE
+        .split_once("#[cfg(all(test, target_os = \"linux\"))]\nmod tests")
+        .expect("authority unit tests must remain after production authority code");
+    assert!(!production.contains("pub(crate)"));
+    assert!(!production.contains("pub(in "));
+    for line in production.lines() {
+        let line = line.trim_start();
+        assert!(
+            !line.starts_with("pub struct")
+                && !line.starts_with("pub enum")
+                && !line.starts_with("pub fn")
+                && !line.starts_with("pub async fn"),
+            "credential custody gained an externally public item: {line}",
+        );
+    }
+    for required in [
+        "pub(super) struct FreshPlaceCredentialHandoff",
+        "pub(super) struct RecoveryOnlyCredentialHandoff",
+        "pub(super) fn into_authorities_and_teardown(",
+        "pub(super) fn into_authority_and_teardown(",
+        "pub(super) struct FreshPlaceCredentialTeardown",
+        "pub(super) struct RecoveryOnlyCredentialTeardown",
+    ] {
+        assert!(
+            production.contains(required),
+            "credential custody lost parent-only boundary `{required}`",
+        );
+    }
+
+    let fresh_owner = authority_production
+        .split_once("impl FreshCredentialAuthorityOwner {")
+        .map(|(_, owner)| owner)
+        .expect("fresh credential owner implementation");
+    let fresh_loader = function_signature(fresh_owner, "pub(super) fn load_from_protected_files");
+    let recovery_owner = authority_production
+        .split_once("impl RecoveryCredentialAuthorityOwner {")
+        .map(|(_, owner)| owner)
+        .expect("recovery credential owner implementation");
+    let recovery_loader =
+        function_signature(recovery_owner, "pub(super) fn load_from_protected_files");
+    assert!(fresh_loader.contains("private_key_entry: String"));
+    assert!(!recovery_loader.contains("private_key_entry"));
+    for (owner, signature) in [("fresh", fresh_loader), ("recovery", recovery_loader)] {
+        assert!(signature.contains(") -> Result<Self, CredentialAuthorityError>"));
+        for forbidden in [
+            "FixedEoaSigner",
+            "L2Credentials",
+            "CredentialHandoff",
+            "CredentialTeardown",
+        ] {
+            assert!(
+                !signature.contains(forbidden),
+                "sealed {owner} loader exposes `{forbidden}`",
+            );
+        }
+    }
+    assert!(authority_production.contains("CredentialCustodyLoadFailed,"));
+    assert_eq!(
+        authority_production
+            .matches("const fn from_custody(")
+            .count(),
+        2
+    );
+    assert!(!authority_production.contains("pub(super) const fn from_custody("));
+    assert!(!authority_production.contains("pub(crate) const fn from_custody("));
+    assert_eq!(
+        authority_production
+            .matches(".into_authorities_and_teardown()")
+            .count(),
+        1,
+        "production may decompose fresh custody only in its credential task spawn",
+    );
+    assert_eq!(
+        authority_production
+            .matches(".into_authority_and_teardown()")
+            .count(),
+        1,
+        "production may decompose recovery custody only in its credential task spawn",
+    );
+    assert_eq!(
+        authority_tests
+            .matches(".into_authority_and_teardown()")
+            .count(),
+        1,
+        "the authority-local timeout test retains its one direct recovery handoff",
+    );
+
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    assert_no_raw_credential_authority_outside(
+        &source_root,
+        &source_root,
+        &[
+            "controlled_trial/authority.rs",
+            "controlled_trial/authority/credential_custody.rs",
+        ],
+    );
 }
 
 #[test]

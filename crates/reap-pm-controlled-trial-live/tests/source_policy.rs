@@ -98,6 +98,12 @@ fn online_preflight_v2_is_an_additive_denied_two_record_conjunct() {
         .0;
     assert!(!pending_impl.contains("public_request_identity"));
     assert!(!pending_impl.contains("l2_timestamp_seconds"));
+    assert!(pending_impl.contains("pub const fn online_policy(&self)"));
+    assert!(pending_impl.contains("-> &reap_pm_controlled_trial::CanonicalOnlinePolicyV2"));
+    assert!(pending_impl.contains("pub const fn online_authorization("));
+    assert!(pending_impl.contains("-> &reap_pm_controlled_trial::CanonicalOnlineAuthorizationV2"));
+    assert!(!pending_impl.contains("-> reap_pm_controlled_trial::CanonicalOnlinePolicyV2"));
+    assert!(!pending_impl.contains("-> reap_pm_controlled_trial::CanonicalOnlineAuthorizationV2"));
     let composite_impl = online
         .split_once("impl PmPhaseAOnlinePreflightDispatchOwnerV2 {")
         .expect("composite V2 owner impl")

@@ -6,6 +6,7 @@
 
 mod current_runtime;
 mod linux_egress_local_facts;
+mod online_preflight;
 mod private_reads;
 mod public_book;
 mod user_stream;

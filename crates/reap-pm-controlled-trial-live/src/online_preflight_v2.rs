@@ -348,6 +348,22 @@ impl PmPendingPhaseAOnlinePreflightBasisV2 {
         self.prepared.preparation()
     }
 
+    /// Borrow the exact move-only policy owner already sealed inside the V2
+    /// Prepared consumption custody. This cannot detach or clone it.
+    #[must_use]
+    pub const fn online_policy(&self) -> &reap_pm_controlled_trial::CanonicalOnlinePolicyV2 {
+        self.v2_consumption.policy()
+    }
+
+    /// Borrow the exact move-only authorization owner already sealed inside
+    /// the V2 Prepared consumption custody. This cannot detach or clone it.
+    #[must_use]
+    pub const fn online_authorization(
+        &self,
+    ) -> &reap_pm_controlled_trial::CanonicalOnlineAuthorizationV2 {
+        self.v2_consumption.authorization()
+    }
+
     #[must_use]
     pub fn basis_record_fingerprint(&self) -> &str {
         &self.basis.record_fingerprint

@@ -4,8 +4,8 @@
 //! thread's network namespace to an exact interface index and assigned local
 //! address. It also pins and hashes the exact absolute, reviewer-authorized
 //! non-secret tunnel/gateway profile artifact. The namespace and profile file
-//! descriptors remain held so a future selected-connection actor can consume
-//! this custody and perform its own immediate checks.
+//! descriptors remain held so the current-runtime gate can consume this
+//! custody and perform its own immediate checks.
 //!
 //! This value is deliberately unwired and non-authoritative. It observes no
 //! route, destination, DNS answer, connected socket, geoblock response, NAT
@@ -13,10 +13,10 @@
 //! permit, credential, request, mutation, or network transport. In particular,
 //! a held namespace descriptor pins an object but does not prove that a later
 //! thread still inhabits it, and a held profile descriptor does not freeze
-//! in-place writes. Those are future selected-connection checks, not claims
-//! made by this precursor. In particular, the final profile-descriptor identity
-//! check and rehash are deliberately deferred to the future selected actor's
-//! immediate connection boundary.
+//! in-place writes. The consuming runtime recheck therefore repeats process,
+//! thread, EUID, namespace, interface, address, profile-identity, and profile-
+//! hash observations. Even that recheck proves only same-local-egress
+//! selection; it does not create a socket or attest destination NAT behavior.
 
 use std::{
     fmt,
@@ -183,6 +183,219 @@ impl PmLinuxEgressLocalFactCustody {
             Err(PmLinuxEgressLocalFactError::UnsupportedPlatform)
         }
     }
+
+    /// Check that this source capture occurred wholly inside the exact outer
+    /// preflight window and still belongs to the supplied canonical V2
+    /// authorization. This performs no current-source recheck and yields no
+    /// fact view; it is used only while assembling the initial runtime
+    /// typestate immediately after capture.
+    pub(super) fn validate_captured_window(
+        &self,
+        authorization: &CanonicalOnlineAuthorizationV2,
+        window_wall_started: SystemTime,
+        window_wall_completed: SystemTime,
+        window_monotonic_started: Instant,
+        window_monotonic_completed: Instant,
+        maximum_age: Duration,
+    ) -> Result<(), PmLinuxEgressLocalFactError> {
+        self.validate_authorization_binding(authorization)?;
+        validate_nested_window(
+            window_wall_started,
+            window_wall_completed,
+            window_monotonic_started,
+            window_monotonic_completed,
+            self.wall_started,
+            self.wall_completed,
+            self.monotonic_started,
+            self.monotonic_completed,
+            maximum_age,
+        )
+    }
+
+    /// Re-observe every mutable local source and lend the exact facts only for
+    /// the lifetime of this still-owned, thread-confined custody. The view is
+    /// non-authoritative and cannot outlive the revalidated descriptors.
+    pub(super) fn revalidate_for_current_runtime(
+        &mut self,
+        authorization: &CanonicalOnlineAuthorizationV2,
+        window_wall_started: SystemTime,
+        window_wall_completed: SystemTime,
+        window_monotonic_started: Instant,
+        window_monotonic_completed: Instant,
+        maximum_age: Duration,
+    ) -> Result<PmLinuxEgressLocalFactsView<'_>, PmLinuxEgressLocalFactError> {
+        #[cfg(target_os = "linux")]
+        {
+            self.validate_captured_window(
+                authorization,
+                window_wall_started,
+                window_wall_completed,
+                window_monotonic_started,
+                window_monotonic_completed,
+                maximum_age,
+            )?;
+            let recheck_wall_started = SystemTime::now();
+            let recheck_monotonic_started = Instant::now();
+
+            if std::process::id() != self.creating_process_id
+                || current_thread_id()? != self.source_thread_id
+                || Rc::strong_count(&self.thread_confinement) != 1
+            {
+                return Err(PmLinuxEgressLocalFactError::ProcessOrThreadChanged);
+            }
+            let current_effective_user_id = rustix::process::geteuid().as_raw();
+            if current_effective_user_id != self.effective_user_id {
+                return Err(PmLinuxEgressLocalFactError::EffectiveUserChanged);
+            }
+            validate_effective_user_binding(
+                current_effective_user_id,
+                authorization.value().host.linux_euid,
+            )?;
+
+            let expected_namespace = NamespaceIdentity {
+                device: self.network_namespace_device,
+                inode: self.network_namespace_inode,
+            };
+            if namespace_file_identity(&self.held_network_namespace)? != expected_namespace
+                || observe_thread_network_namespace_identity()? != expected_namespace
+            {
+                return Err(PmLinuxEgressLocalFactError::NamespaceChanged);
+            }
+            let current_interface = observe_exact_assigned_interface(
+                &self.interface_name,
+                self.interface_index,
+                self.local_source_ip,
+            )?;
+            if current_interface.name.as_ref() != self.interface_name.as_ref()
+                || current_interface.index != self.interface_index
+                || current_interface.local_source_ip != self.local_source_ip
+            {
+                return Err(PmLinuxEgressLocalFactError::InterfaceChanged);
+            }
+            self.reviewed_profile.revalidate(
+                Path::new(
+                    &authorization
+                        .value()
+                        .host
+                        .egress
+                        .dedicated_tunnel_or_gateway_profile_reference,
+                ),
+                &authorization
+                    .value()
+                    .host
+                    .egress
+                    .dedicated_tunnel_or_gateway_profile_sha256,
+            )?;
+
+            // Close every mutable-source gap after the potentially blocking
+            // full profile rehash. This final interface observation repeats
+            // name/index, UP, non-loopback, and exact assigned authorized IP.
+            // Namespace membership, the held namespace FD, PID, TID, and EUID
+            // are then sampled again before either completion clock edge.
+            let final_interface = observe_exact_assigned_interface(
+                &authorization.value().host.egress.interface_name,
+                authorization.value().host.egress.interface_index,
+                authorization
+                    .value()
+                    .host
+                    .egress
+                    .local_source_ip
+                    .parse::<IpAddr>()
+                    .map_err(|_| PmLinuxEgressLocalFactError::AuthorizationBinding)?,
+            )?;
+            let final_namespace = observe_thread_network_namespace_identity()?;
+            let final_held_namespace = namespace_file_identity(&self.held_network_namespace)?;
+            let final_process_id = std::process::id();
+            let final_thread_id = current_thread_id()?;
+            let final_effective_user_id = rustix::process::geteuid().as_raw();
+            let final_sample = validate_final_local_source_sample(
+                ExpectedFinalLocalSources {
+                    process_id: self.creating_process_id,
+                    thread_id: self.source_thread_id,
+                    effective_user_id: self.effective_user_id,
+                    namespace: expected_namespace,
+                    interface_name: &authorization.value().host.egress.interface_name,
+                    interface_index: authorization.value().host.egress.interface_index,
+                    local_source_ip: self.local_source_ip,
+                },
+                FinalLocalSourceSample {
+                    process_id: final_process_id,
+                    thread_id: final_thread_id,
+                    effective_user_id: final_effective_user_id,
+                    current_namespace: final_namespace,
+                    held_namespace: final_held_namespace,
+                    interface: final_interface,
+                },
+            )?;
+            validate_effective_user_binding(
+                final_sample.effective_user_id,
+                authorization.value().host.linux_euid,
+            )?;
+            let wall_completed = SystemTime::now();
+            let monotonic_completed = Instant::now();
+            validate_elapsed_window(
+                recheck_wall_started,
+                recheck_monotonic_started,
+                wall_completed,
+                monotonic_completed,
+                MAX_LOCAL_FACT_CAPTURE_DURATION,
+            )?;
+            validate_elapsed_window(
+                window_wall_started,
+                window_monotonic_started,
+                wall_completed,
+                monotonic_completed,
+                maximum_age,
+            )?;
+            Ok(PmLinuxEgressLocalFactsView {
+                _custody: self,
+                effective_user_id: final_sample.effective_user_id,
+                network_namespace_device: final_sample.current_namespace.device,
+                network_namespace_inode: final_sample.current_namespace.inode,
+                interface_name: final_sample.interface.name,
+                interface_index: final_sample.interface.index,
+                local_source_ip: final_sample.interface.local_source_ip,
+                wall_completed,
+                monotonic_completed,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (
+                authorization,
+                window_wall_started,
+                window_wall_completed,
+                window_monotonic_started,
+                window_monotonic_completed,
+                maximum_age,
+            );
+            Err(PmLinuxEgressLocalFactError::UnsupportedPlatform)
+        }
+    }
+
+    fn validate_authorization_binding(
+        &self,
+        authorization: &CanonicalOnlineAuthorizationV2,
+    ) -> Result<(), PmLinuxEgressLocalFactError> {
+        let egress = &authorization.value().host.egress;
+        let authorized_local_ip = egress
+            .local_source_ip
+            .parse::<IpAddr>()
+            .map_err(|_| PmLinuxEgressLocalFactError::AuthorizationBinding)?;
+        if self.online_authorization_fingerprint.as_ref() != authorization.fingerprint()
+            || self.effective_user_id != authorization.value().host.linux_euid
+            || self.network_namespace_device != egress.network_namespace_device
+            || self.network_namespace_inode != egress.network_namespace_inode
+            || self.interface_name.as_ref() != egress.interface_name
+            || self.interface_index != egress.interface_index
+            || self.local_source_ip != authorized_local_ip
+            || lower_hex(&self.reviewed_profile.sha256)
+                != egress.dedicated_tunnel_or_gateway_profile_sha256
+        {
+            return Err(PmLinuxEgressLocalFactError::AuthorizationBinding);
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Debug for PmLinuxEgressLocalFactCustody {
@@ -233,11 +446,108 @@ impl HeldReviewedEgressProfile {
             length,
         })
     }
+
+    #[cfg(target_os = "linux")]
+    fn revalidate(
+        &mut self,
+        reviewed_path: &Path,
+        expected_sha256: &str,
+    ) -> Result<(), PmLinuxEgressLocalFactError> {
+        validate_exact_reviewed_profile_path(
+            reviewed_path,
+            reviewed_path
+                .to_str()
+                .ok_or(PmLinuxEgressLocalFactError::ProfilePathMismatch)?,
+        )?;
+        let before = profile_file_identity(&self.file)?;
+        validate_profile_file_identity(before)?;
+        if before != self.identity || before.length != self.length {
+            return Err(PmLinuxEgressLocalFactError::ProfileChanged);
+        }
+        let (sha256, length) = hash_profile_descriptor(&mut self.file)?;
+        let after = profile_file_identity(&self.file)?;
+        if after != before
+            || length != self.length
+            || sha256 != self.sha256
+            || lower_hex(&sha256) != expected_sha256
+        {
+            return Err(PmLinuxEgressLocalFactError::ProfileChanged);
+        }
+        let reopened = open_profile_descriptor(reviewed_path)?;
+        let reopened_identity = profile_file_identity(&reopened)?;
+        validate_profile_file_identity(reopened_identity)?;
+        if reopened_identity != self.identity {
+            return Err(PmLinuxEgressLocalFactError::ProfileChanged);
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Debug for HeldReviewedEgressProfile {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("HeldReviewedEgressProfile(<non-secret; descriptor-pinned; hashed>)")
+    }
+}
+
+/// Lifetime-borrowed facts available only while the revalidated descriptor
+/// custody remains owned on its creating thread. This is not an egress permit.
+pub(super) struct PmLinuxEgressLocalFactsView<'a> {
+    _custody: &'a PmLinuxEgressLocalFactCustody,
+    effective_user_id: u32,
+    network_namespace_device: u64,
+    network_namespace_inode: u64,
+    interface_name: Box<str>,
+    interface_index: u32,
+    local_source_ip: IpAddr,
+    wall_completed: SystemTime,
+    monotonic_completed: Instant,
+}
+
+impl PmLinuxEgressLocalFactsView<'_> {
+    #[must_use]
+    pub(super) const fn network_namespace_device(&self) -> u64 {
+        self.network_namespace_device
+    }
+
+    #[must_use]
+    pub(super) const fn network_namespace_inode(&self) -> u64 {
+        self.network_namespace_inode
+    }
+
+    #[must_use]
+    pub(super) fn interface_name(&self) -> &str {
+        &self.interface_name
+    }
+
+    #[must_use]
+    pub(super) const fn interface_index(&self) -> u32 {
+        self.interface_index
+    }
+
+    #[must_use]
+    pub(super) const fn local_source_ip(&self) -> IpAddr {
+        self.local_source_ip
+    }
+
+    #[must_use]
+    pub(super) const fn effective_user_id(&self) -> u32 {
+        self.effective_user_id
+    }
+
+    #[must_use]
+    pub(super) const fn wall_completed(&self) -> SystemTime {
+        self.wall_completed
+    }
+
+    #[must_use]
+    pub(super) const fn monotonic_completed(&self) -> Instant {
+        self.monotonic_completed
+    }
+}
+
+impl fmt::Debug for PmLinuxEgressLocalFactsView<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PmLinuxEgressLocalFactsView(<borrowed; non-authoritative>)")
     }
 }
 
@@ -252,6 +562,43 @@ struct InterfaceObservation {
     name: Box<str>,
     index: u32,
     local_source_ip: IpAddr,
+}
+
+struct ExpectedFinalLocalSources<'a> {
+    process_id: u32,
+    thread_id: u32,
+    effective_user_id: u32,
+    namespace: NamespaceIdentity,
+    interface_name: &'a str,
+    interface_index: u32,
+    local_source_ip: IpAddr,
+}
+
+struct FinalLocalSourceSample {
+    process_id: u32,
+    thread_id: u32,
+    effective_user_id: u32,
+    current_namespace: NamespaceIdentity,
+    held_namespace: NamespaceIdentity,
+    interface: InterfaceObservation,
+}
+
+fn validate_final_local_source_sample(
+    expected: ExpectedFinalLocalSources<'_>,
+    sample: FinalLocalSourceSample,
+) -> Result<FinalLocalSourceSample, PmLinuxEgressLocalFactError> {
+    if sample.process_id != expected.process_id
+        || sample.thread_id != expected.thread_id
+        || sample.effective_user_id != expected.effective_user_id
+        || sample.current_namespace != expected.namespace
+        || sample.held_namespace != expected.namespace
+        || sample.interface.name.as_ref() != expected.interface_name
+        || sample.interface.index != expected.interface_index
+        || sample.interface.local_source_ip != expected.local_source_ip
+    {
+        return Err(PmLinuxEgressLocalFactError::SourceChangedDuringRecheck);
+    }
+    Ok(sample)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -563,6 +910,67 @@ fn validate_capture_window(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_nested_window(
+    outer_wall_started: SystemTime,
+    outer_wall_completed: SystemTime,
+    outer_monotonic_started: Instant,
+    outer_monotonic_completed: Instant,
+    inner_wall_started: SystemTime,
+    inner_wall_completed: SystemTime,
+    inner_monotonic_started: Instant,
+    inner_monotonic_completed: Instant,
+    maximum_age: Duration,
+) -> Result<(), PmLinuxEgressLocalFactError> {
+    validate_elapsed_window(
+        outer_wall_started,
+        outer_monotonic_started,
+        outer_wall_completed,
+        outer_monotonic_completed,
+        maximum_age,
+    )?;
+    inner_wall_started
+        .duration_since(outer_wall_started)
+        .map_err(|_| PmLinuxEgressLocalFactError::CaptureOutsidePreflightWindow)?;
+    outer_wall_completed
+        .duration_since(inner_wall_completed)
+        .map_err(|_| PmLinuxEgressLocalFactError::CaptureOutsidePreflightWindow)?;
+    inner_monotonic_started
+        .checked_duration_since(outer_monotonic_started)
+        .ok_or(PmLinuxEgressLocalFactError::CaptureOutsidePreflightWindow)?;
+    outer_monotonic_completed
+        .checked_duration_since(inner_monotonic_completed)
+        .ok_or(PmLinuxEgressLocalFactError::CaptureOutsidePreflightWindow)?;
+    validate_capture_window(
+        inner_wall_started,
+        inner_wall_completed,
+        inner_monotonic_started,
+        inner_monotonic_completed,
+    )
+}
+
+fn validate_elapsed_window(
+    wall_started: SystemTime,
+    monotonic_started: Instant,
+    wall_completed: SystemTime,
+    monotonic_completed: Instant,
+    maximum_age: Duration,
+) -> Result<(), PmLinuxEgressLocalFactError> {
+    if maximum_age.is_zero() {
+        return Err(PmLinuxEgressLocalFactError::CaptureExpired);
+    }
+    let wall_elapsed = wall_completed
+        .duration_since(wall_started)
+        .map_err(|_| PmLinuxEgressLocalFactError::ClockRegression)?;
+    let monotonic_elapsed = monotonic_completed
+        .checked_duration_since(monotonic_started)
+        .ok_or(PmLinuxEgressLocalFactError::ClockRegression)?;
+    if wall_elapsed > maximum_age || monotonic_elapsed > maximum_age {
+        return Err(PmLinuxEgressLocalFactError::CaptureExpired);
+    }
+    Ok(())
+}
+
 fn lower_hex(value: &[u8; 32]) -> String {
     let mut encoded = String::with_capacity(64);
     for byte in value {
@@ -584,6 +992,8 @@ pub(super) enum PmLinuxEgressLocalFactError {
     AuthorizationBinding,
     #[error("the observing process or Linux thread changed during capture")]
     ProcessOrThreadChanged,
+    #[error("a local Linux egress source changed during consuming recheck")]
+    SourceChangedDuringRecheck,
     #[error("the numeric effective Linux user differs from authorization")]
     EffectiveUserAuthorizationMismatch,
     #[error("the numeric effective Linux user changed during capture")]
@@ -622,6 +1032,8 @@ pub(super) enum PmLinuxEgressLocalFactError {
     ClockRegression,
     #[error("the local egress source capture exceeded its fixed time bound")]
     CaptureExpired,
+    #[error("the local egress capture falls outside the exact outer preflight window")]
+    CaptureOutsidePreflightWindow,
 }
 
 #[cfg(test)]
@@ -673,6 +1085,69 @@ mod tests {
             assert!(matches!(
                 validate_effective_user_binding(observed, authorized),
                 Err(PmLinuxEgressLocalFactError::EffectiveUserAuthorizationMismatch),
+            ));
+        }
+    }
+
+    #[test]
+    fn consuming_recheck_rejects_post_rehash_interface_or_ip_drift() {
+        fn expected() -> ExpectedFinalLocalSources<'static> {
+            ExpectedFinalLocalSources {
+                process_id: 101,
+                thread_id: 202,
+                effective_user_id: 1_000,
+                namespace: NamespaceIdentity {
+                    device: 303,
+                    inode: 404,
+                },
+                interface_name: "pm-tunnel0",
+                interface_index: 505,
+                local_source_ip: "192.0.2.10".parse().unwrap(),
+            }
+        }
+
+        fn sample(
+            interface_name: &str,
+            interface_index: u32,
+            local_source_ip: &str,
+        ) -> FinalLocalSourceSample {
+            FinalLocalSourceSample {
+                process_id: 101,
+                thread_id: 202,
+                effective_user_id: 1_000,
+                current_namespace: NamespaceIdentity {
+                    device: 303,
+                    inode: 404,
+                },
+                held_namespace: NamespaceIdentity {
+                    device: 303,
+                    inode: 404,
+                },
+                interface: InterfaceObservation {
+                    name: interface_name.into(),
+                    index: interface_index,
+                    local_source_ip: local_source_ip.parse().unwrap(),
+                },
+            }
+        }
+
+        let final_sample =
+            validate_final_local_source_sample(expected(), sample("pm-tunnel0", 505, "192.0.2.10"))
+                .unwrap();
+        assert_eq!(final_sample.interface.name.as_ref(), "pm-tunnel0");
+        assert_eq!(final_sample.interface.index, 505);
+        assert_eq!(
+            final_sample.interface.local_source_ip,
+            "192.0.2.10".parse::<IpAddr>().unwrap(),
+        );
+        for drifted in [
+            sample("pm-tunnel1", 505, "192.0.2.10"),
+            sample("pm-tunnel0", 506, "192.0.2.10"),
+            sample("pm-tunnel0", 505, "192.0.2.11"),
+        ] {
+            assert!(matches!(
+                validate_final_local_source_sample(expected(), drifted),
+                Err(PmLinuxEgressLocalFactError::SourceChangedDuringRecheck),
             ));
         }
     }

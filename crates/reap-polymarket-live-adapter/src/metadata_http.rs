@@ -1075,6 +1075,38 @@ mod tests {
             )
         );
 
+        // The historical v2 commitment already binds the exact native CLOB
+        // body before its redundant parsed fields. Preserve that encoding:
+        // omission and explicit false remain distinct without changing the
+        // commitment domain or the existing parsed-bool byte.
+        let omitted_take_only = clob.replace(r#""itode":false,"#, "");
+        let omitted_take_only_details = PmTypedLiveMarketDetails {
+            long_market: parse_live_clob_market_lifecycle_details(market.as_bytes(), scope())
+                .unwrap(),
+            clob: parse_live_clob_v2_metadata(
+                omitted_take_only.as_bytes(),
+                PmClobV2RequestScope::new(scope().condition(), scope().token()),
+            )
+            .unwrap(),
+        };
+        assert_eq!(
+            omitted_take_only_details
+                .clob()
+                .take_only_delay_enabled_reported(),
+            None
+        );
+        assert_ne!(
+            base,
+            live_metadata_observation_commitment(
+                OriginMode::LocalEvidence,
+                scope(),
+                market.as_bytes(),
+                omitted_take_only.as_bytes(),
+                &omitted_take_only_details,
+                received,
+            )
+        );
+
         let inactive_market = market.replace("\"active\":true", "\"active\":false");
         let inactive_details = PmTypedLiveMarketDetails {
             long_market: parse_live_clob_market_lifecycle_details(
