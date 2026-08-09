@@ -1,0 +1,196 @@
+{
+  "schema_family": "reap-pm-controlled-trial-official-sources",
+  "schema_version": 1,
+  "retrieved_at_utc": "2026-08-09T10:17:00Z",
+  "official_sdk_pins": [
+    {
+      "component": "clob-client-v2",
+      "repository": "https://github.com/Polymarket/clob-client-v2.git",
+      "git_reference": "refs/tags/v1.1.0",
+      "commit": "f3e1a05f868a1fd0c34ef85dfc45c6ce78f5bb69",
+      "package_version": "1.1.0",
+      "package_url": "https://registry.npmjs.org/@polymarket/clob-client-v2/-/clob-client-v2-1.1.0.tgz",
+      "package_final_url": "https://registry.npmjs.org/@polymarket/clob-client-v2/-/clob-client-v2-1.1.0.tgz",
+      "package_content_type": "application/octet-stream",
+      "package_byte_length": 111883,
+      "package_sha256": "a3a56de6d1df809d6ce5e23f29f2dde0982b5f2b38850d763459e600c392f622"
+    },
+    {
+      "component": "py-clob-client-v2",
+      "repository": "https://github.com/Polymarket/py-clob-client-v2.git",
+      "git_reference": "refs/tags/v1.1.0",
+      "commit": "215fc63a8fd6ec3a10c7edb73997c9772d8686d3",
+      "package_version": "1.1.0",
+      "package_url": "https://files.pythonhosted.org/packages/5e/c9/a4d6f78aeb1b961f728815f54a22c4cb355e9608635b692f3215afea1776/py_clob_client_v2-1.1.0.tar.gz",
+      "package_final_url": "https://files.pythonhosted.org/packages/5e/c9/a4d6f78aeb1b961f728815f54a22c4cb355e9608635b692f3215afea1776/py_clob_client_v2-1.1.0.tar.gz",
+      "package_content_type": "application/octet-stream",
+      "package_byte_length": 49113,
+      "package_sha256": "7821e2f3ced3651da0956a1225e89ec94434736a8e16086c1c6a14351774088d"
+    }
+  ],
+  "source_count": 18,
+  "sources": [
+    {
+      "id": "wallets_auth",
+      "requested_url": "https://docs.polymarket.com/trading/wallets-auth.md",
+      "final_url": "https://docs.polymarket.com/trading/wallets-auth.md",
+      "retrieved_at_utc": "2026-08-09T10:17:00Z",
+      "content_type": "text/markdown; charset=utf-8",
+      "byte_length": 54259,
+      "sha256": "34095970a28c384375127aa481b3f928c3e3c2337414aa3d3af4a8b8bd43e8f5"
+    },
+    {
+      "id": "api_authentication",
+      "requested_url": "https://docs.polymarket.com/getting-started/api.md",
+      "final_url": "https://docs.polymarket.com/getting-started/api.md",
+      "retrieved_at_utc": "2026-08-09T10:17:00Z",
+      "content_type": "text/markdown; charset=utf-8",
+      "byte_length": 9391,
+      "sha256": "6c397c66109852220b3f5d8033ea274061b3fc44b426edc9faa60673ecbef8fc"
+    },
+    {
+      "id": "place_orders",
+      "requested_url": "https://docs.polymarket.com/trading/place-orders.md",
+      "final_url": "https://docs.polymarket.com/trading/place-orders.md",
+      "retrieved_at_utc": "2026-08-09T10:17:00Z",
+      "content_type": "text/markdown; charset=utf-8",
+      "byte_length": 61459,
+      "sha256": "a3426c3ac3c04c96a4e988009cd6e603d22622a31e1b3c02a453ce3ac22d7563"
+    },
+    {
+      "id": "manage_orders",
+      "requested_url": "https://docs.polymarket.com/trading/manage-orders.md",
+      "final_url": "https://docs.polymarket.com/trading/manage-orders.md",
+      "retrieved_at_utc": "2026-08-09T10:17:00Z",
+      "content_type": "text/markdown; charset=utf-8",
+      "byte_length": 52401,
+      "sha256": "e4a0238db31d5137b4d0da0d4333b1fb90be8f7c7b47d92968edfd993c8c4482"
+    },
+    {
+      "id": "realtime_order_updates",
+      "requested_url": "https://docs.polymarket.com/trading/realtime-order-updates.md",
+      "final_url": "https://docs.polymarket.com/trading/realtime-order-updates.md",
+      "retrieved_at_utc": "2026-08-09T10:17:00Z",
+      "content_type": "text/markdown; charset=utf-8",
+      "byte_length": 15782,
+      "sha256": "b5fde86d9fd5c63f5148b55af5357bcaafd67d090e08f054a2b0774ffc55b741"
+    },
+    {
+      "id": "matching_engine",
+      "requested_url": "https://docs.polymarket.com/trading/matching-engine.md",
+      "final_url": "https://docs.polymarket.com/trading/matching-engine.md",
+      "retrieved_at_utc": "2026-08-09T10:17:00Z",
+      "content_type": "text/markdown; charset=utf-8",
+      "byte_length": 6864,
+      "sha256": "f0d718b69509593654cb0085bb94fb96447c9b8d5ece6ddb990003d1e1f6f36c"
+    },
+    {
+      "id": "geoblock",
+      "requested_url": "https://docs.polymarket.com/api-reference/geoblock.md",
+      "final_url": "https://docs.polymarket.com/api-reference/geoblock.md",
+      "retrieved_at_utc": "2026-08-09T10:17:00Z",
+      "content_type": "text/markdown; charset=utf-8",
+      "byte_length": 7169,
+      "sha256": "271b25f80b2a1c244afaab1396babf7196fb3e88f5e6ac7886e499b3f37a7172"
+    },
+    {
+      "id": "clob_market_info",
+      "requested_url": "https://docs.polymarket.com/api-reference/markets/get-clob-market-info.md",
+      "final_url": "https://docs.polymarket.com/api-reference/markets/get-clob-market-info.md",
+      "retrieved_at_utc": "2026-08-09T10:17:00Z",
+      "content_type": "text/markdown; charset=utf-8",
+      "byte_length": 5703,
+      "sha256": "b6e72949b7dc1c8c6cf97a1657a3dcd0f7aa145ca4ca9c82d9f9f77110b4e1a4"
+    },
+    {
+      "id": "fees",
+      "requested_url": "https://docs.polymarket.com/trading/fees.md",
+      "final_url": "https://docs.polymarket.com/trading/fees.md",
+      "retrieved_at_utc": "2026-08-09T10:17:00Z",
+      "content_type": "text/markdown; charset=utf-8",
+      "byte_length": 8128,
+      "sha256": "8e246189f6ca85b8b8782e1d76a769cf98672a98c4c63d8bbe6150d659db8d7c"
+    },
+    {
+      "id": "v2_migration",
+      "requested_url": "https://docs.polymarket.com/v2-migration.md",
+      "final_url": "https://docs.polymarket.com/v2-migration.md",
+      "retrieved_at_utc": "2026-08-09T10:17:00Z",
+      "content_type": "text/markdown; charset=utf-8",
+      "byte_length": 25625,
+      "sha256": "8dc52780b87a85faa22a030174cb28a2ee7bfd3c2797712527e3a83147452c7b"
+    },
+    {
+      "id": "contracts",
+      "requested_url": "https://docs.polymarket.com/resources/contracts.md",
+      "final_url": "https://docs.polymarket.com/resources/contracts.md",
+      "retrieved_at_utc": "2026-08-09T10:17:00Z",
+      "content_type": "text/markdown; charset=utf-8",
+      "byte_length": 7987,
+      "sha256": "ed59020bd28a24cbca9dbd2f92624a2a8ad7e403f0f08b6ff1529e33860c99a6"
+    },
+    {
+      "id": "current_positions",
+      "requested_url": "https://docs.polymarket.com/api-reference/core/get-current-positions-for-a-user.md",
+      "final_url": "https://docs.polymarket.com/api-reference/core/get-current-positions-for-a-user.md",
+      "retrieved_at_utc": "2026-08-09T10:17:00Z",
+      "content_type": "text/markdown; charset=utf-8",
+      "byte_length": 5424,
+      "sha256": "ff5ae34274c305970f85741997f70149ed284350229a8d417386c3986a62db57"
+    },
+    {
+      "id": "rate_limits",
+      "requested_url": "https://docs.polymarket.com/api-reference/rate-limits.md",
+      "final_url": "https://docs.polymarket.com/api-reference/rate-limits.md",
+      "retrieved_at_utc": "2026-08-09T10:17:00Z",
+      "content_type": "text/markdown; charset=utf-8",
+      "byte_length": 4124,
+      "sha256": "7ba9bdb5df4bfd12199349220dd3c0d0923f6fcc5352385d038ea4eb69ec051a"
+    },
+    {
+      "id": "polygon_rpc_endpoints",
+      "requested_url": "https://docs.polygon.technology/pos/reference/rpc-endpoints.md",
+      "final_url": "https://docs.polygon.technology/pos/reference/rpc-endpoints.md",
+      "retrieved_at_utc": "2026-08-09T10:17:00Z",
+      "content_type": "text/markdown; charset=utf-8",
+      "byte_length": 6397,
+      "sha256": "5775f75d38c0d24da93e58d83148b32bbe989766973ffc67207d513fd12f5935"
+    },
+    {
+      "id": "polygon_finality",
+      "requested_url": "https://docs.polygon.technology/pos/concepts/finality/finality.md",
+      "final_url": "https://docs.polygon.technology/pos/concepts/finality/finality.md",
+      "retrieved_at_utc": "2026-08-09T10:17:00Z",
+      "content_type": "text/markdown; charset=utf-8",
+      "byte_length": 3571,
+      "sha256": "a66173c3f06327e556104b67495796d9e58b184d73b60ae514e8ae3f47ff1da3"
+    },
+    {
+      "id": "ethereum_json_rpc",
+      "requested_url": "https://ethereum.org/developers/docs/apis/json-rpc/",
+      "final_url": "https://ethereum.org/developers/docs/apis/json-rpc/",
+      "retrieved_at_utc": "2026-08-09T10:17:00Z",
+      "content_type": "text/html; charset=utf-8",
+      "byte_length": 1406846,
+      "sha256": "71ca87bb8f0a6cd95f3257b6e655f4b7e271da9d0f7f3d628fdb0dadb650803c"
+    },
+    {
+      "id": "eip_20",
+      "requested_url": "https://eips.ethereum.org/EIPS/eip-20",
+      "final_url": "https://eips.ethereum.org/EIPS/eip-20",
+      "retrieved_at_utc": "2026-08-09T10:17:00Z",
+      "content_type": "text/html; charset=utf-8",
+      "byte_length": 26125,
+      "sha256": "98bda5e4707841a68684879878c4c165fdaa47d89ed69ebf232ab9be06ff050e"
+    },
+    {
+      "id": "eip_1155",
+      "requested_url": "https://eips.ethereum.org/EIPS/eip-1155",
+      "final_url": "https://eips.ethereum.org/EIPS/eip-1155",
+      "retrieved_at_utc": "2026-08-09T10:17:00Z",
+      "content_type": "text/html; charset=utf-8",
+      "byte_length": 116269,
+      "sha256": "50eece6ce1ad417b39ae7183a5626c6f9e3b11fc16a00ba5f630bc6fed01cfd2"
+    }
+  ]
+}
