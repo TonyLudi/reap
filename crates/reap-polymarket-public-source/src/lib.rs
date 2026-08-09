@@ -14,7 +14,10 @@ pub use position::{
     PmConfiguredTokenPosition, PmDataApiPositionEvidence, PmDataApiPositionObservationCommitment,
     PmDataApiReceiveClockObservation, PmMonitoredPositionObservation,
 };
-pub use source::{MAX_POSITION_PAGE_BODY_BYTES, PmDataApiCurrentPositionSource};
+pub use source::{
+    MAX_POSITION_PAGE_BODY_BYTES, PmDataApiCurrentPositionSource, PmProductionDataApiPositionError,
+    PmProductionDataApiPositionObservation,
+};
 
 /// Public position reads can never authorize order entry.
 pub const PRODUCTION_ORDER_ENTRY_AUTHORIZED: bool = false;

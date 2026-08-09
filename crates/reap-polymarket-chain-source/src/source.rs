@@ -97,6 +97,16 @@ pub enum PmPolygonChainSourceError {
     FutureFinalizedBlock,
 }
 
+/// Errors specific to obtaining a production-origin proof around an otherwise
+/// unchanged finalized Polygon authorization cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum PmProductionPolygonFinalizedAuthorizationError {
+    #[error("production Polygon authorization evidence requires the fixed production origin")]
+    OriginRequired,
+    #[error(transparent)]
+    Source(#[from] PmPolygonChainSourceError),
+}
+
 #[derive(Clone, Copy)]
 enum ClockSource {
     System,
@@ -109,6 +119,76 @@ enum SourceMode {
     Production,
     #[cfg(any(test, feature = "loopback-evidence"))]
     LoopbackEvidence,
+}
+
+/// Move-only proof that one finalized Polygon authorization cut came from
+/// this source's fixed production-origin mode.
+///
+/// This remains read-only evidence. It is not a credential, signature,
+/// dispatch permit, or production order-entry authority.
+pub struct PmProductionPolygonFinalizedAuthorizationCut {
+    cut: PmPolygonFinalizedAuthorizationCut,
+}
+
+impl PmProductionPolygonFinalizedAuthorizationCut {
+    fn from_source(
+        _production_origin: ProductionPolygonOrigin,
+        cut: PmPolygonFinalizedAuthorizationCut,
+    ) -> Self {
+        Self { cut }
+    }
+
+    #[must_use]
+    pub const fn scope(&self) -> PmPolygonAuthorizationScope {
+        self.cut.scope()
+    }
+
+    #[must_use]
+    pub const fn block(&self) -> PmPolygonFinalizedBlock {
+        self.cut.block()
+    }
+
+    #[must_use]
+    pub const fn pusd_allowance(&self) -> U256 {
+        self.cut.pusd_allowance()
+    }
+
+    #[must_use]
+    pub const fn conditional_tokens_approval(&self) -> PmErc1155OperatorApproval {
+        self.cut.conditional_tokens_approval()
+    }
+
+    #[must_use]
+    pub const fn observed_clock(&self) -> PmPolygonSystemClockObservation {
+        self.cut.observed_clock()
+    }
+
+    #[must_use]
+    pub const fn commitment(&self) -> PmPolygonFinalizedAuthorizationCommitment {
+        self.cut.commitment()
+    }
+}
+
+impl std::fmt::Debug for PmProductionPolygonFinalizedAuthorizationCut {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "PmProductionPolygonFinalizedAuthorizationCut(<production-origin; read-only; sealed>)",
+        )
+    }
+}
+
+struct ProductionPolygonOrigin;
+
+impl ProductionPolygonOrigin {
+    fn verify(mode: SourceMode) -> Result<Self, PmProductionPolygonFinalizedAuthorizationError> {
+        match mode {
+            SourceMode::Production => Ok(Self),
+            #[cfg(any(test, feature = "loopback-evidence"))]
+            SourceMode::LoopbackEvidence => {
+                Err(PmProductionPolygonFinalizedAuthorizationError::OriginRequired)
+            }
+        }
+    }
 }
 
 impl ClockSource {
@@ -171,6 +251,24 @@ impl PmPolygonAuthorizationSource {
             clock: ClockSource::Fixed(clock),
             mode: SourceMode::LoopbackEvidence,
         })
+    }
+
+    /// Verify the private production mode before I/O, then read and seal one
+    /// exact finalized authorization cut as move-only production-origin
+    /// evidence.
+    pub async fn production_finalized_authorization_cut(
+        &self,
+        scope: PmPolygonAuthorizationScope,
+    ) -> Result<
+        PmProductionPolygonFinalizedAuthorizationCut,
+        PmProductionPolygonFinalizedAuthorizationError,
+    > {
+        let production_origin = ProductionPolygonOrigin::verify(self.mode)?;
+        let cut = self.finalized_authorization_cut(scope).await?;
+        Ok(PmProductionPolygonFinalizedAuthorizationCut::from_source(
+            production_origin,
+            cut,
+        ))
     }
 
     /// Reads the exact five-request cut in a fixed order and returns only

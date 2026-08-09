@@ -1670,6 +1670,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "tokio",
+ "trybuild",
  "url",
 ]
 
@@ -1708,6 +1709,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "tokio",
+ "trybuild",
 ]
 
 [[package]]

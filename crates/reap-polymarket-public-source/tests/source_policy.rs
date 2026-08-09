@@ -1,9 +1,159 @@
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
+
 const MANIFEST: &str = include_str!("../Cargo.toml");
 const LIB: &str = include_str!("../src/lib.rs");
 const CONFIG: &str = include_str!("../src/config.rs");
 const DECIMAL: &str = include_str!("../src/decimal.rs");
+const ERROR: &str = include_str!("../src/error.rs");
 const POSITION: &str = include_str!("../src/position.rs");
 const SOURCE: &str = include_str!("../src/source.rs");
+
+fn production_prefix(source: &str) -> &str {
+    [
+        "\n#[cfg(test)]\nmod tests",
+        "\n#[cfg(test)]\npub(crate) mod tests",
+    ]
+    .into_iter()
+    .filter_map(|marker| source.find(marker))
+    .min()
+    .map_or(source, |end| &source[..end])
+}
+
+fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    source
+        .split_once(start)
+        .and_then(|(_, tail)| tail.split_once(end).map(|(value, _)| value))
+        .expect("source-policy markers must exist in order")
+}
+
+fn production_modules(root: &Path) -> Vec<(String, String)> {
+    let mut modules = std::fs::read_dir(root.join("src"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("rs"))
+        .map(|path| {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let source = std::fs::read_to_string(path).unwrap();
+            (name, production_prefix(&source).to_owned())
+        })
+        .collect::<Vec<_>>();
+    modules.sort_by(|left, right| left.0.cmp(&right.0));
+    modules
+}
+
+fn inherent_function_names(source: &str) -> BTreeSet<String> {
+    source
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            (!line.starts_with("//")).then(|| {
+                line.split_once("fn ")
+                    .and_then(|(_, tail)| tail.split_once('(').map(|(name, _)| name.to_owned()))
+            })?
+        })
+        .collect()
+}
+
+fn assert_no_wrapper_trait_conversion(module: &str, source: &str, wrapper: &str) {
+    let normalized = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    let forbidden_trait_heads = [
+        "From<",
+        "Into<",
+        "TryFrom<",
+        "TryInto<",
+        "AsRef<",
+        "Deref",
+        "std::convert::From<",
+        "std::convert::Into<",
+        "std::convert::TryFrom<",
+        "std::convert::TryInto<",
+        "std::convert::AsRef<",
+        "core::convert::From<",
+        "core::convert::Into<",
+        "core::convert::TryFrom<",
+        "core::convert::TryInto<",
+        "core::convert::AsRef<",
+        "std::ops::Deref",
+        "core::ops::Deref",
+    ];
+    let allowed_inherent = format!("impl{wrapper}");
+    let allowed_debug = format!("implstd::fmt::Debugfor{wrapper}");
+    let mut remaining = normalized.as_str();
+    while let Some(index) = remaining.find("impl") {
+        let candidate = &remaining[index..];
+        let after_impl = &candidate["impl".len()..];
+        if after_impl.starts_with(' ') || after_impl.starts_with('<') {
+            let header = candidate
+                .split_once('{')
+                .map_or(candidate, |(head, _)| head);
+            if header.contains(wrapper) {
+                let compact = header
+                    .chars()
+                    .filter(|value| !value.is_whitespace())
+                    .collect::<String>();
+                for forbidden in forbidden_trait_heads {
+                    assert!(
+                        !compact.contains(forbidden),
+                        "{module} gained wrapper conversion or dereference {forbidden}: {header}"
+                    );
+                }
+                assert!(
+                    compact == allowed_inherent || compact == allowed_debug,
+                    "{module} gained an unreviewed wrapper trait implementation: {header}"
+                );
+            }
+        }
+        remaining = after_impl;
+    }
+}
+
+fn assert_authority_bool_methods_are_denied(module: &str, source: &str) {
+    let mut remaining = source;
+    while let Some(index) = remaining.find("fn ") {
+        let function = &remaining[index + 3..];
+        let Some((name, _)) = function.split_once('(') else {
+            break;
+        };
+        let Some(open_brace) = function.find('{') else {
+            break;
+        };
+        if let Some(semicolon) = function.find(';')
+            && semicolon < open_brace
+        {
+            remaining = &function[semicolon + 1..];
+            continue;
+        }
+        let signature = &function[..open_brace];
+        if signature.contains("-> bool")
+            && [
+                "authoriz",
+                "permit",
+                "allowed",
+                "can_place",
+                "can_cancel",
+                "can_dispatch",
+                "can_send",
+                "can_mutate",
+            ]
+            .iter()
+            .any(|keyword| name.contains(keyword))
+        {
+            let body = function[open_brace + 1..]
+                .split_once('}')
+                .map_or("", |(body, _)| body)
+                .split_whitespace()
+                .collect::<String>();
+            assert_eq!(
+                body, "false",
+                "{module} contains a positive or non-constant authority method {name}"
+            );
+        }
+        remaining = &function[open_brace + 1..];
+    }
+}
 
 #[test]
 fn dependency_surface_is_public_read_only_and_credential_free() {
@@ -179,4 +329,150 @@ fn arbitrary_origin_is_compile_excluded_outside_unit_tests() {
     assert!(CONFIG.contains("host.parse::<IpAddr>()"));
     assert!(CONFIG.contains("address.is_loopback()"));
     assert!(!MANIFEST.contains("loopback-evidence"));
+}
+
+#[test]
+fn production_origin_position_is_move_only_verified_before_io_and_has_no_carrier_escape() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let production = production_prefix(SOURCE);
+    for required in [
+        "pub enum PmProductionDataApiPositionError",
+        "OriginRequired",
+        "Source(#[from] PmPublicPositionError)",
+        "pub struct PmProductionDataApiPositionObservation",
+        "observation: PmMonitoredPositionObservation",
+        "_production_origin: ProductionDataApiPositionOrigin",
+        "struct ProductionDataApiPositionOrigin;",
+        "fn verify(mode: OriginMode) -> Result<Self, PmProductionDataApiPositionError>",
+        "OriginMode::Production => Ok(Self)",
+        "Err(PmProductionDataApiPositionError::OriginRequired)",
+        "pub async fn production_observe_configured_token(",
+        "ProductionDataApiPositionOrigin::verify(self.transport.mode)?",
+        "PmProductionDataApiPositionObservation::from_source(",
+        "impl std::fmt::Debug for PmProductionDataApiPositionObservation",
+        "<production-origin; monitored-only; sealed>",
+    ] {
+        assert!(
+            production.contains(required),
+            "production Data API origin proof lost {required}"
+        );
+    }
+    assert_eq!(
+        LIB.matches("PmProductionDataApiPositionObservation")
+            .count(),
+        1
+    );
+    assert_eq!(LIB.matches("PmProductionDataApiPositionError").count(), 1);
+    assert!(!ERROR.contains("OriginRequired"));
+    assert!(MANIFEST.contains("trybuild.workspace = true"));
+
+    let declaration = between(
+        production,
+        "pub struct PmProductionDataApiPositionObservation {",
+        "\n}\n\nimpl PmProductionDataApiPositionObservation",
+    );
+    assert_eq!(
+        declaration.trim(),
+        "observation: PmMonitoredPositionObservation,"
+    );
+    let wrapper_impl = between(
+        production,
+        "impl PmProductionDataApiPositionObservation {",
+        "\n}\n\nimpl std::fmt::Debug for PmProductionDataApiPositionObservation",
+    );
+    assert_eq!(
+        inherent_function_names(wrapper_impl),
+        BTreeSet::from([
+            "commitment".to_owned(),
+            "completed_clock".to_owned(),
+            "configured_token".to_owned(),
+            "from_source".to_owned(),
+            "pages_observed".to_owned(),
+            "rows_observed".to_owned(),
+            "scope".to_owned(),
+        ])
+    );
+
+    let method = between(
+        production,
+        "pub async fn production_observe_configured_token(",
+        "\n\n    pub async fn observe_configured_token(",
+    );
+    let verify = method
+        .find("ProductionDataApiPositionOrigin::verify(self.transport.mode)?")
+        .expect("private production-origin verification");
+    let fetch = method
+        .find("self.observe_configured_token().await?")
+        .expect("fixed configured-token read");
+    let seal = method
+        .find("PmProductionDataApiPositionObservation::from_source(")
+        .expect("production position seal");
+    assert!(verify < fetch && fetch < seal);
+    assert_eq!(
+        production
+            .matches("PmProductionDataApiPositionObservation::from_source(")
+            .count(),
+        1
+    );
+
+    let declaration_attributes = production
+        .split_once("pub struct PmProductionDataApiPositionObservation")
+        .unwrap()
+        .0
+        .rsplit("\n\n")
+        .next()
+        .unwrap();
+    for forbidden in ["Clone", "Copy", "Serialize", "Deserialize"] {
+        assert!(!declaration_attributes.contains(forbidden));
+        assert!(!production.contains(&format!(
+            "{forbidden} for PmProductionDataApiPositionObservation"
+        )));
+    }
+    for forbidden in [
+        "impl From<PmMonitoredPositionObservation> for PmProductionDataApiPositionObservation",
+        "impl TryFrom<PmMonitoredPositionObservation> for PmProductionDataApiPositionObservation",
+        "pub fn from_source(",
+        "pub fn observation(&self)",
+        "pub const fn observation(&self)",
+        "pub fn into_observation(",
+        "Deref for PmProductionDataApiPositionObservation",
+        "AsRef<PmMonitoredPositionObservation> for PmProductionDataApiPositionObservation",
+        "production_order_entry_authorized: true",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "production Data API proof gained carrier escape {forbidden}"
+        );
+    }
+    for test_pin in [
+        "numeric_loopback_source_cannot_issue_production_wrapper_before_io",
+        "production_origin_proof_accepts_only_production_mode",
+        "production_wrapper_preserves_the_exact_observation_and_redacts_debug",
+    ] {
+        assert!(SOURCE.contains(test_pin));
+    }
+
+    let modules = production_modules(&root);
+    for (module, contents) in &modules {
+        assert_no_wrapper_trait_conversion(
+            module,
+            contents,
+            "PmProductionDataApiPositionObservation",
+        );
+        assert_authority_bool_methods_are_denied(module, contents);
+        if module == "lib.rs" {
+            assert_eq!(
+                contents
+                    .matches("PmProductionDataApiPositionObservation")
+                    .count(),
+                1,
+                "lib.rs must contain only the exact wrapper re-export"
+            );
+        } else if module != "source.rs" {
+            assert!(
+                !contents.contains("PmProductionDataApiPositionObservation"),
+                "{module} gained production-wrapper extraction outside source.rs"
+            );
+        }
+    }
 }

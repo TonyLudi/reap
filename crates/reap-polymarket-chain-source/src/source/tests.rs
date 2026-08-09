@@ -276,6 +276,69 @@ async fn exact_five_request_bodies_produce_one_bound_cut() {
 }
 
 #[tokio::test]
+async fn production_wrapper_preserves_the_exact_cut_and_redacts_debug() {
+    let server = MockServer::spawn(successful_replies());
+    let source = loopback_source(&server.origin, BLOCK_TIMESTAMP + 10, Duration::from_secs(1));
+    let expected = source
+        .finalized_authorization_cut(proxy_scope(PmPolygonExchangeSpender::StandardV2))
+        .await
+        .unwrap();
+    let production = PmProductionPolygonFinalizedAuthorizationCut::from_source(
+        ProductionPolygonOrigin,
+        expected,
+    );
+
+    assert_eq!(production.scope(), expected.scope());
+    assert_eq!(production.block(), expected.block());
+    assert_eq!(production.pusd_allowance(), expected.pusd_allowance());
+    assert_eq!(
+        production.conditional_tokens_approval(),
+        expected.conditional_tokens_approval()
+    );
+    assert_eq!(production.observed_clock(), expected.observed_clock());
+    assert_eq!(production.commitment(), expected.commitment());
+    assert_eq!(
+        format!("{production:?}"),
+        "PmProductionPolygonFinalizedAuthorizationCut(<production-origin; read-only; sealed>)"
+    );
+    assert_eq!(server.finish().len(), 5);
+}
+
+#[tokio::test]
+async fn loopback_source_cannot_issue_production_wrapper_before_io() {
+    let source = loopback_source(
+        "http://127.0.0.1:9/",
+        BLOCK_TIMESTAMP,
+        Duration::from_millis(100),
+    );
+    assert!(matches!(
+        source
+            .production_finalized_authorization_cut(proxy_scope(
+                PmPolygonExchangeSpender::StandardV2
+            ))
+            .await,
+        Err(PmProductionPolygonFinalizedAuthorizationError::OriginRequired)
+    ));
+}
+
+#[test]
+fn production_origin_proof_accepts_only_production_mode() {
+    assert!(ProductionPolygonOrigin::verify(SourceMode::Production).is_ok());
+    assert!(matches!(
+        ProductionPolygonOrigin::verify(SourceMode::LoopbackEvidence),
+        Err(PmProductionPolygonFinalizedAuthorizationError::OriginRequired)
+    ));
+    assert_eq!(
+        PmProductionPolygonFinalizedAuthorizationError::from(
+            PmPolygonChainSourceError::WrongRpcChain
+        ),
+        PmProductionPolygonFinalizedAuthorizationError::Source(
+            PmPolygonChainSourceError::WrongRpcChain
+        )
+    );
+}
+
+#[tokio::test]
 async fn cut_commitment_binds_exact_scope_ordered_responses_values_and_receive_clock() {
     let standard_scope = proxy_scope(PmPolygonExchangeSpender::StandardV2);
     let exact = commitment_for(successful_replies(), standard_scope, BLOCK_TIMESTAMP + 10).await;

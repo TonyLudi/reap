@@ -1,5 +1,149 @@
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+fn production_prefix(source: &str) -> &str {
+    [
+        "\n#[cfg(test)]\nmod tests",
+        "\n#[cfg(test)]\npub(crate) mod tests",
+    ]
+    .into_iter()
+    .filter_map(|marker| source.find(marker))
+    .min()
+    .map_or(source, |end| &source[..end])
+}
+
+fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    source
+        .split_once(start)
+        .and_then(|(_, tail)| tail.split_once(end).map(|(value, _)| value))
+        .expect("source-policy markers must exist in order")
+}
+
+fn production_modules(root: &Path) -> Vec<(String, String)> {
+    let mut modules = std::fs::read_dir(root.join("src"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("rs"))
+        .map(|path| {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let source = std::fs::read_to_string(path).unwrap();
+            (name, production_prefix(&source).to_owned())
+        })
+        .collect::<Vec<_>>();
+    modules.sort_by(|left, right| left.0.cmp(&right.0));
+    modules
+}
+
+fn inherent_function_names(source: &str) -> BTreeSet<String> {
+    source
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            (!line.starts_with("//")).then(|| {
+                line.split_once("fn ")
+                    .and_then(|(_, tail)| tail.split_once('(').map(|(name, _)| name.to_owned()))
+            })?
+        })
+        .collect()
+}
+
+fn assert_no_wrapper_trait_conversion(module: &str, source: &str, wrapper: &str) {
+    let normalized = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    let forbidden_trait_heads = [
+        "From<",
+        "Into<",
+        "TryFrom<",
+        "TryInto<",
+        "AsRef<",
+        "Deref",
+        "std::convert::From<",
+        "std::convert::Into<",
+        "std::convert::TryFrom<",
+        "std::convert::TryInto<",
+        "std::convert::AsRef<",
+        "core::convert::From<",
+        "core::convert::Into<",
+        "core::convert::TryFrom<",
+        "core::convert::TryInto<",
+        "core::convert::AsRef<",
+        "std::ops::Deref",
+        "core::ops::Deref",
+    ];
+    let allowed_inherent = format!("impl{wrapper}");
+    let allowed_debug = format!("implstd::fmt::Debugfor{wrapper}");
+    let mut remaining = normalized.as_str();
+    while let Some(index) = remaining.find("impl") {
+        let candidate = &remaining[index..];
+        let after_impl = &candidate["impl".len()..];
+        if after_impl.starts_with(' ') || after_impl.starts_with('<') {
+            let header = candidate
+                .split_once('{')
+                .map_or(candidate, |(head, _)| head);
+            if header.contains(wrapper) {
+                let compact = header
+                    .chars()
+                    .filter(|value| !value.is_whitespace())
+                    .collect::<String>();
+                for forbidden in forbidden_trait_heads {
+                    assert!(
+                        !compact.contains(forbidden),
+                        "{module} gained wrapper conversion or dereference {forbidden}: {header}"
+                    );
+                }
+                assert!(
+                    compact == allowed_inherent || compact == allowed_debug,
+                    "{module} gained an unreviewed wrapper trait implementation: {header}"
+                );
+            }
+        }
+        remaining = after_impl;
+    }
+}
+
+fn assert_authority_bool_methods_are_denied(module: &str, source: &str) {
+    let mut remaining = source;
+    while let Some(index) = remaining.find("fn ") {
+        let function = &remaining[index + 3..];
+        let Some((name, _)) = function.split_once('(') else {
+            break;
+        };
+        let Some(open_brace) = function.find('{') else {
+            break;
+        };
+        if let Some(semicolon) = function.find(';')
+            && semicolon < open_brace
+        {
+            remaining = &function[semicolon + 1..];
+            continue;
+        }
+        let signature = &function[..open_brace];
+        if signature.contains("-> bool")
+            && [
+                "authoriz",
+                "permit",
+                "allowed",
+                "can_place",
+                "can_cancel",
+                "can_dispatch",
+                "can_send",
+                "can_mutate",
+            ]
+            .iter()
+            .any(|keyword| name.contains(keyword))
+        {
+            let body = function[open_brace + 1..]
+                .split_once('}')
+                .map_or("", |(body, _)| body)
+                .split_whitespace()
+                .collect::<String>();
+            assert_eq!(
+                body, "false",
+                "{module} contains a positive or non-constant authority method {name}"
+            );
+        }
+        remaining = &function[open_brace + 1..];
+    }
+}
 
 #[test]
 fn production_module_surface_is_closed_and_exact() {
@@ -89,6 +233,169 @@ fn origin_transport_and_clock_policy_cannot_be_widened_silently() {
     assert!(source.contains("ClockSource::System"));
     assert!(source.contains("MAX_FINALIZED_BLOCK_AGE_SECONDS: u64 = 30"));
     assert!(source.contains("MAX_FINALIZED_BLOCK_FUTURE_SECONDS: u64 = 5"));
+}
+
+#[test]
+fn production_origin_cut_is_move_only_verified_before_io_and_has_no_carrier_escape() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let source = std::fs::read_to_string(root.join("src/source.rs")).unwrap();
+    let source_tests = std::fs::read_to_string(root.join("src/source/tests.rs")).unwrap();
+    let library = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    let production = production_prefix(&source);
+
+    for required in [
+        "pub struct PmProductionPolygonFinalizedAuthorizationCut",
+        "cut: PmPolygonFinalizedAuthorizationCut",
+        "pub enum PmProductionPolygonFinalizedAuthorizationError",
+        "OriginRequired",
+        "Source(#[from] PmPolygonChainSourceError)",
+        "_production_origin: ProductionPolygonOrigin",
+        "struct ProductionPolygonOrigin;",
+        ") -> Result<Self, PmProductionPolygonFinalizedAuthorizationError>",
+        "SourceMode::Production => Ok(Self)",
+        "SourceMode::LoopbackEvidence =>",
+        "Err(PmProductionPolygonFinalizedAuthorizationError::OriginRequired)",
+        "pub async fn production_finalized_authorization_cut(",
+        "let production_origin = ProductionPolygonOrigin::verify(self.mode)?;",
+        "PmProductionPolygonFinalizedAuthorizationCut::from_source(",
+        "impl std::fmt::Debug for PmProductionPolygonFinalizedAuthorizationCut",
+        "<production-origin; read-only; sealed>",
+    ] {
+        assert!(
+            production.contains(required),
+            "production Polygon origin proof lost {required}"
+        );
+    }
+    assert_eq!(
+        library
+            .matches("PmProductionPolygonFinalizedAuthorizationCut")
+            .count(),
+        1
+    );
+    assert_eq!(
+        library
+            .matches("PmProductionPolygonFinalizedAuthorizationError")
+            .count(),
+        1
+    );
+    assert!(manifest.contains("trybuild.workspace = true"));
+    let raw_error = between(
+        production,
+        "pub enum PmPolygonChainSourceError {",
+        "\n}\n\n/// Errors specific to obtaining a production-origin proof",
+    );
+    assert!(!raw_error.contains("OriginRequired"));
+
+    let declaration = between(
+        production,
+        "pub struct PmProductionPolygonFinalizedAuthorizationCut {",
+        "\n}\n\nimpl PmProductionPolygonFinalizedAuthorizationCut",
+    );
+    assert_eq!(
+        declaration.trim(),
+        "cut: PmPolygonFinalizedAuthorizationCut,"
+    );
+    let wrapper_impl = between(
+        production,
+        "impl PmProductionPolygonFinalizedAuthorizationCut {",
+        "\n}\n\nimpl std::fmt::Debug for PmProductionPolygonFinalizedAuthorizationCut",
+    );
+    assert_eq!(
+        inherent_function_names(wrapper_impl),
+        BTreeSet::from([
+            "block".to_owned(),
+            "commitment".to_owned(),
+            "conditional_tokens_approval".to_owned(),
+            "from_source".to_owned(),
+            "observed_clock".to_owned(),
+            "pusd_allowance".to_owned(),
+            "scope".to_owned(),
+        ])
+    );
+
+    let method = between(
+        production,
+        "pub async fn production_finalized_authorization_cut(",
+        "\n\n    /// Reads the exact five-request cut",
+    );
+    let verify = method
+        .find("ProductionPolygonOrigin::verify(self.mode)?")
+        .expect("private production-origin verification");
+    let fetch = method
+        .find("self.finalized_authorization_cut(scope).await?")
+        .expect("fixed finalized authorization read");
+    let seal = method
+        .find("PmProductionPolygonFinalizedAuthorizationCut::from_source(")
+        .expect("production cut seal");
+    assert!(verify < fetch && fetch < seal);
+    assert_eq!(
+        production
+            .matches("PmProductionPolygonFinalizedAuthorizationCut::from_source(")
+            .count(),
+        1
+    );
+
+    let declaration_attributes = production
+        .split_once("pub struct PmProductionPolygonFinalizedAuthorizationCut")
+        .unwrap()
+        .0
+        .rsplit("\n\n")
+        .next()
+        .unwrap();
+    for forbidden in ["Clone", "Copy", "Serialize", "Deserialize"] {
+        assert!(!declaration_attributes.contains(forbidden));
+        assert!(!production.contains(&format!(
+            "{forbidden} for PmProductionPolygonFinalizedAuthorizationCut"
+        )));
+    }
+    for forbidden in [
+        "impl From<PmPolygonFinalizedAuthorizationCut> for PmProductionPolygonFinalizedAuthorizationCut",
+        "impl TryFrom<PmPolygonFinalizedAuthorizationCut> for PmProductionPolygonFinalizedAuthorizationCut",
+        "pub fn from_source(",
+        "pub fn cut(&self)",
+        "pub const fn cut(&self)",
+        "pub fn into_cut(",
+        "Deref for PmProductionPolygonFinalizedAuthorizationCut",
+        "AsRef<PmPolygonFinalizedAuthorizationCut> for PmProductionPolygonFinalizedAuthorizationCut",
+        "production_order_entry_authorized: true",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "production Polygon proof gained carrier escape {forbidden}"
+        );
+    }
+    for test_pin in [
+        "loopback_source_cannot_issue_production_wrapper_before_io",
+        "production_origin_proof_accepts_only_production_mode",
+        "production_wrapper_preserves_the_exact_cut_and_redacts_debug",
+    ] {
+        assert!(source_tests.contains(test_pin));
+    }
+
+    let modules = production_modules(&root);
+    for (module, contents) in &modules {
+        assert_no_wrapper_trait_conversion(
+            module,
+            contents,
+            "PmProductionPolygonFinalizedAuthorizationCut",
+        );
+        assert_authority_bool_methods_are_denied(module, contents);
+        if module == "lib.rs" {
+            assert_eq!(
+                contents
+                    .matches("PmProductionPolygonFinalizedAuthorizationCut")
+                    .count(),
+                1,
+                "lib.rs must contain only the exact wrapper re-export"
+            );
+        } else if module != "source.rs" {
+            assert!(
+                !contents.contains("PmProductionPolygonFinalizedAuthorizationCut"),
+                "{module} gained production-wrapper extraction outside source.rs"
+            );
+        }
+    }
 }
 
 #[test]

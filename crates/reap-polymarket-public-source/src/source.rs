@@ -48,6 +48,84 @@ struct PmDataApiPositionTransport {
     mode: OriginMode,
 }
 
+/// Errors specific to obtaining a production-origin proof around an otherwise
+/// unchanged bounded Data API position observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PmProductionDataApiPositionError {
+    #[error("production Data API position evidence requires the fixed production origin")]
+    OriginRequired,
+    #[error(transparent)]
+    Source(#[from] PmPublicPositionError),
+}
+
+/// Move-only proof that one bounded Data API position observation came from
+/// this source's fixed production-origin mode.
+///
+/// This remains a monitored public projection, not atomic inventory
+/// completeness or authority to sell, place, cancel, sign, or dispatch.
+pub struct PmProductionDataApiPositionObservation {
+    observation: PmMonitoredPositionObservation,
+}
+
+impl PmProductionDataApiPositionObservation {
+    fn from_source(
+        _production_origin: ProductionDataApiPositionOrigin,
+        observation: PmMonitoredPositionObservation,
+    ) -> Self {
+        Self { observation }
+    }
+
+    #[must_use]
+    pub const fn scope(&self) -> PmDataApiPositionScope {
+        self.observation.scope()
+    }
+
+    #[must_use]
+    pub const fn pages_observed(&self) -> u8 {
+        self.observation.pages_observed()
+    }
+
+    #[must_use]
+    pub const fn rows_observed(&self) -> u16 {
+        self.observation.rows_observed()
+    }
+
+    #[must_use]
+    pub const fn configured_token(&self) -> &PmConfiguredTokenPosition {
+        self.observation.configured_token()
+    }
+
+    #[must_use]
+    pub const fn completed_clock(&self) -> PmDataApiReceiveClockObservation {
+        self.observation.completed_clock()
+    }
+
+    #[must_use]
+    pub const fn commitment(&self) -> PmDataApiPositionObservationCommitment {
+        self.observation.commitment()
+    }
+}
+
+impl std::fmt::Debug for PmProductionDataApiPositionObservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "PmProductionDataApiPositionObservation(<production-origin; monitored-only; sealed>)",
+        )
+    }
+}
+
+struct ProductionDataApiPositionOrigin;
+
+impl ProductionDataApiPositionOrigin {
+    fn verify(mode: OriginMode) -> Result<Self, PmProductionDataApiPositionError> {
+        match mode {
+            OriginMode::Production => Ok(Self),
+            #[cfg(test)]
+            OriginMode::NumericLoopback => Err(PmProductionDataApiPositionError::OriginRequired),
+        }
+    }
+}
+
 impl PmDataApiPositionTransport {
     fn new(config: &PmDataApiPositionConfig) -> Result<Self, PmPublicPositionError> {
         let mut builder = Client::builder()
@@ -183,6 +261,20 @@ impl PmDataApiCurrentPositionSource {
     #[must_use]
     pub const fn production_order_entry_authorized(&self) -> bool {
         false
+    }
+
+    /// Verify the private production mode before I/O, then fetch and seal one
+    /// bounded configured-token observation as move-only production-origin
+    /// evidence.
+    pub async fn production_observe_configured_token(
+        &self,
+    ) -> Result<PmProductionDataApiPositionObservation, PmProductionDataApiPositionError> {
+        let production_origin = ProductionDataApiPositionOrigin::verify(self.transport.mode)?;
+        let observation = self.observe_configured_token().await?;
+        Ok(PmProductionDataApiPositionObservation::from_source(
+            production_origin,
+            observation,
+        ))
     }
 
     pub async fn observe_configured_token(
@@ -633,6 +725,67 @@ mod tests {
             assert!(!lowercase.contains("poly_"));
         }
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn production_wrapper_preserves_the_exact_observation_and_redacts_debug() {
+        let (origin, _, server) =
+            mock_server(vec![MockResponse::ok(format!("[{}]", row(501, "0")))]).await;
+        let observation = source(&origin, 501)
+            .observe_configured_token()
+            .await
+            .unwrap();
+        let expected_scope = observation.scope();
+        let expected_pages = observation.pages_observed();
+        let expected_rows = observation.rows_observed();
+        let expected_clock = observation.completed_clock();
+        let expected_commitment = observation.commitment();
+        let production = PmProductionDataApiPositionObservation::from_source(
+            ProductionDataApiPositionOrigin,
+            observation,
+        );
+
+        assert_eq!(production.scope(), expected_scope);
+        assert_eq!(production.pages_observed(), expected_pages);
+        assert_eq!(production.rows_observed(), expected_rows);
+        assert!(
+            production
+                .configured_token()
+                .as_present()
+                .unwrap()
+                .size()
+                .is_zero()
+        );
+        assert_eq!(production.completed_clock(), expected_clock);
+        assert_eq!(production.commitment(), expected_commitment);
+        assert_eq!(
+            format!("{production:?}"),
+            "PmProductionDataApiPositionObservation(<production-origin; monitored-only; sealed>)"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn numeric_loopback_source_cannot_issue_production_wrapper_before_io() {
+        assert!(matches!(
+            source("http://127.0.0.1:9", 501)
+                .production_observe_configured_token()
+                .await,
+            Err(PmProductionDataApiPositionError::OriginRequired)
+        ));
+    }
+
+    #[test]
+    fn production_origin_proof_accepts_only_production_mode() {
+        assert!(ProductionDataApiPositionOrigin::verify(OriginMode::Production).is_ok());
+        assert!(matches!(
+            ProductionDataApiPositionOrigin::verify(OriginMode::NumericLoopback),
+            Err(PmProductionDataApiPositionError::OriginRequired)
+        ));
+        assert_eq!(
+            PmProductionDataApiPositionError::from(PmPublicPositionError::DuplicateAsset),
+            PmProductionDataApiPositionError::Source(PmPublicPositionError::DuplicateAsset)
+        );
     }
 
     #[tokio::test]
