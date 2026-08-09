@@ -6,6 +6,7 @@ use crate::PmPublicPositionError;
 
 pub const MAX_POSITION_DECIMAL_BYTES: usize = 96;
 const MAX_ABSOLUTE_DECIMAL_EXPONENT: i32 = 256;
+const PM_PROTOCOL_DECIMAL_PLACES: i16 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PmExactPositionDecimal {
@@ -160,6 +161,45 @@ impl PmExactPositionDecimal {
     pub const fn decimal_exponent(&self) -> i16 {
         self.decimal_exponent
     }
+
+    /// Converts this exact decimal into Polymarket's six-decimal protocol
+    /// units without rounding or crossing binary floating point.
+    ///
+    /// Negative values, sub-unit fractions, and values whose scaled integer
+    /// exceeds `U256` are rejected. Zero remains representable because a
+    /// monitored position may be present with an exact zero size.
+    pub(crate) fn to_protocol_units_exact(
+        &self,
+        field: &'static str,
+    ) -> Result<U256, PmPublicPositionError> {
+        if self.negative {
+            return Err(PmPublicPositionError::NonRepresentableProtocolUnits(field));
+        }
+
+        let scaled_exponent = self
+            .decimal_exponent
+            .checked_add(PM_PROTOCOL_DECIMAL_PLACES)
+            .ok_or(PmPublicPositionError::NonRepresentableProtocolUnits(field))?;
+        let mut units = self.coefficient;
+        if scaled_exponent >= 0 {
+            for _ in 0..scaled_exponent {
+                units = units
+                    .checked_mul_u32(10)
+                    .map_err(|_| PmPublicPositionError::NonRepresentableProtocolUnits(field))?;
+            }
+        } else {
+            for _ in scaled_exponent..0 {
+                let (quotient, remainder) = units
+                    .checked_div_rem_u32(10)
+                    .map_err(|_| PmPublicPositionError::NonRepresentableProtocolUnits(field))?;
+                if remainder != 0 {
+                    return Err(PmPublicPositionError::NonRepresentableProtocolUnits(field));
+                }
+                units = quotient;
+            }
+        }
+        Ok(units)
+    }
 }
 
 impl fmt::Display for PmExactPositionDecimal {
@@ -196,6 +236,41 @@ mod tests {
         assert_eq!(
             PmExactPositionDecimal::parse("size", &oversized, true),
             Err(PmPublicPositionError::FieldTooLong("size"))
+        );
+    }
+
+    #[test]
+    fn converts_only_exact_six_decimal_protocol_units() {
+        let ordinary = PmExactPositionDecimal::parse("size", "12.3400e-2", true).unwrap();
+        assert_eq!(
+            ordinary.to_protocol_units_exact("size"),
+            Ok(U256::from_u64(123_400))
+        );
+
+        let precise = PmExactPositionDecimal::parse("size", "0.000001", true).unwrap();
+        assert_eq!(precise.to_protocol_units_exact("size"), Ok(U256::ONE));
+
+        let zero = PmExactPositionDecimal::parse("size", "0", true).unwrap();
+        assert_eq!(zero.to_protocol_units_exact("size"), Ok(U256::ZERO));
+
+        let subunit = PmExactPositionDecimal::parse("size", "0.0000001", true).unwrap();
+        assert_eq!(
+            subunit.to_protocol_units_exact("size"),
+            Err(PmPublicPositionError::NonRepresentableProtocolUnits("size"))
+        );
+
+        let negative = PmExactPositionDecimal::parse("cashPnl", "-1", false).unwrap();
+        assert_eq!(
+            negative.to_protocol_units_exact("cashPnl"),
+            Err(PmPublicPositionError::NonRepresentableProtocolUnits(
+                "cashPnl"
+            ))
+        );
+
+        let overflow = PmExactPositionDecimal::parse("size", "1e256", true).unwrap();
+        assert_eq!(
+            overflow.to_protocol_units_exact("size"),
+            Err(PmPublicPositionError::NonRepresentableProtocolUnits("size"))
         );
     }
 }

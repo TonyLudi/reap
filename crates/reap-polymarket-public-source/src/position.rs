@@ -132,6 +132,12 @@ impl PmDataApiPositionEvidence {
         &self.size
     }
 
+    /// Exact configured-token position size in the same six-decimal units
+    /// used by CLOB orders and conditional-token balance observations.
+    pub fn size_protocol_units(&self) -> Result<U256, PmPublicPositionError> {
+        self.size.to_protocol_units_exact("size")
+    }
+
     #[must_use]
     pub const fn average_price(&self) -> &PmExactPositionDecimal {
         &self.average_price
@@ -544,12 +550,20 @@ pub(crate) mod tests {
         assert_eq!(evidence.asset().units(), U256::from_u64(7));
         assert_eq!(evidence.size().lexeme(), "0");
         assert!(evidence.size().is_zero());
+        assert_eq!(evidence.size_protocol_units(), Ok(U256::ZERO));
         assert_eq!(evidence.average_price().lexeme(), "0.42");
         assert_eq!(evidence.cash_pnl().lexeme(), "-0.25");
         assert_eq!(evidence.total_bought().lexeme(), "3e0");
         assert_eq!(evidence.outcome_index(), 0);
         assert_eq!(evidence.outcome(), "Yes");
         assert_eq!(evidence.opposite_outcome(), "No");
+
+        let fractional = format!("[{}]", row(7, "12.3400e-2"));
+        let rows = parse_position_page(fractional.as_bytes(), scope(7)).unwrap();
+        assert_eq!(
+            rows[0].evidence.size_protocol_units(),
+            Ok(U256::from_u64(123_400))
+        );
     }
 
     #[test]
