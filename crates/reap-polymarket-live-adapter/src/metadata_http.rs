@@ -4,6 +4,7 @@ use reap_polymarket_wire::{
     MAX_PUBLIC_REST_BODY_BYTES, PmClobV2Metadata, PmClobV2RequestScope, PmLifecycleMetadata,
     PmLiveClobMarketLifecycle, PmLongMarketLifecycleDetails, PmWireScope,
     parse_live_clob_market_lifecycle_details, parse_live_clob_v2_metadata,
+    validate_live_clob_lifecycle_agreement,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -232,6 +233,7 @@ impl PmPublicMetadataHttpRole {
             &clob_v2_bytes,
             PmClobV2RequestScope::new(self.scope.condition(), self.scope.token()),
         )?;
+        validate_live_clob_lifecycle_agreement(&long_market, &clob)?;
         let details = PmTypedLiveMarketDetails { long_market, clob };
         let commitment = live_metadata_observation_commitment(
             self.mode,
@@ -363,7 +365,20 @@ fn live_metadata_observation_commitment(
         Some(value) => digest.update([1, u8::from(value)]),
         None => digest.update([0]),
     }
+    encode_optional_metadata_bool(&mut digest, clob.accepting_orders());
+    encode_optional_metadata_u64(&mut digest, clob.seconds_delay());
+    encode_optional_metadata_ascii(
+        &mut digest,
+        clob.game_start_time().map(|value| value.as_str()),
+    );
+    encode_optional_metadata_bool(&mut digest, clob.cancel_book_on_start());
+    encode_optional_metadata_ascii(
+        &mut digest,
+        clob.accepting_order_timestamp().map(|value| value.as_str()),
+    );
+    encode_optional_metadata_bool(&mut digest, clob.rfq_enabled());
     digest.update([u8::from(clob.take_only_delay_enabled())]);
+    encode_optional_metadata_bool(&mut digest, clob.bonding_curve_enabled());
     digest.update(clob.minimum_order_age_seconds().to_be_bytes());
 
     PmLiveMetadataObservationCommitment::from_source_bytes(digest.finalize().into())
@@ -383,6 +398,23 @@ fn encode_optional_metadata_ascii(digest: &mut Sha256, value: Option<&str>) {
         Some(value) => {
             digest.update([1]);
             encode_metadata_bytes(digest, value.as_bytes());
+        }
+        None => digest.update([0]),
+    }
+}
+
+fn encode_optional_metadata_bool(digest: &mut Sha256, value: Option<bool>) {
+    match value {
+        Some(value) => digest.update([1, u8::from(value)]),
+        None => digest.update([0]),
+    }
+}
+
+fn encode_optional_metadata_u64(digest: &mut Sha256, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            digest.update([1]);
+            digest.update(value.to_be_bytes());
         }
         None => digest.update([0]),
     }
@@ -510,7 +542,7 @@ mod tests {
 
     fn short_market() -> String {
         format!(
-            r#"{{"c":"{CONDITION}","t":[{{"t":"123","o":"Yes"}},{{"t":"456","o":"No"}}],"mts":0.01,"mos":5,"nr":false,"fd":{{"r":0.02,"e":2,"to":true}},"mbf":0,"tbf":0,"itode":false,"oas":0}}"#
+            r#"{{"c":"{CONDITION}","t":[{{"t":"123","o":"Yes"}},{{"t":"456","o":"No"}}],"mts":0.01,"mos":5,"nr":false,"fd":{{"r":0.02,"e":2,"to":true}},"mbf":0,"tbf":0,"ao":true,"sd":0,"gst":null,"cbos":true,"aot":"2026-08-08T00:00:00Z","rfqe":false,"itode":false,"ibce":true,"oas":0}}"#
         )
     }
 
@@ -607,6 +639,20 @@ mod tests {
         );
         assert_eq!(observation.lifecycle_details().game_start_time(), None);
         assert_eq!(observation.lifecycle_details().seconds_delay(), 0);
+        assert_eq!(observation.clob().accepting_orders(), Some(true));
+        assert_eq!(observation.clob().seconds_delay(), Some(0));
+        assert_eq!(observation.clob().game_start_time(), None);
+        assert_eq!(observation.clob().cancel_book_on_start(), Some(true));
+        assert_eq!(
+            observation
+                .clob()
+                .accepting_order_timestamp()
+                .unwrap()
+                .as_str(),
+            "2026-08-08T00:00:00Z"
+        );
+        assert_eq!(observation.clob().rfq_enabled(), Some(false));
+        assert_eq!(observation.clob().bonding_curve_enabled(), Some(true));
         assert_eq!(
             observation.clob().configured_outcome().token(),
             scope().token()
@@ -622,6 +668,43 @@ mod tests {
             requests.recv().await.unwrap(),
             format!("GET /clob-markets/{CONDITION} HTTP/1.1")
         );
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_source_rejects_every_cross_source_lifecycle_contradiction() {
+        let mutations = [
+            (r#""ao":true"#, r#""ao":false"#, "accepting_orders"),
+            (r#""sd":0"#, r#""sd":1"#, "seconds_delay"),
+            (
+                r#""aot":"2026-08-08T00:00:00Z""#,
+                r#""aot":"2026-08-08T00:00:01Z""#,
+                "accepting_order_timestamp",
+            ),
+            (
+                r#""gst":null"#,
+                r#""gst":"2026-12-31T00:00:00Z""#,
+                "game_start_time",
+            ),
+        ];
+        let mut responses = Vec::with_capacity(mutations.len() * 2);
+        for (needle, replacement, _) in mutations {
+            responses.push(MockResponse::ok(long_market()));
+            responses.push(MockResponse::ok(
+                short_market().replace(needle, replacement),
+            ));
+        }
+        let (origin, _requests, task) = mock_server(responses).await;
+        let role = local_role(&origin);
+
+        for (_, _, field) in mutations {
+            assert!(matches!(
+                role.refresh_typed_observation().await,
+                Err(PmLiveAdapterError::Wire(PmWireError::InvalidIdentity(
+                    observed
+                ))) if observed == field
+            ));
+        }
         task.await.unwrap();
     }
 
@@ -746,6 +829,40 @@ mod tests {
                     market.as_bytes(),
                     clob.as_bytes(),
                     &lifecycle_details,
+                    received,
+                )
+            );
+        }
+
+        for clob_mutation in [
+            clob.replace(r#""ao":true"#, r#""ao":false"#),
+            clob.replace(r#""sd":0"#, r#""sd":1"#),
+            clob.replace(r#""gst":null"#, r#""gst":"2026-12-31T00:00:00Z""#),
+            clob.replace(r#""cbos":true"#, r#""cbos":false"#),
+            clob.replace(
+                r#""aot":"2026-08-08T00:00:00Z""#,
+                r#""aot":"2026-08-08T00:00:01Z""#,
+            ),
+            clob.replace(r#""rfqe":false"#, r#""rfqe":true"#),
+            clob.replace(r#""ibce":true"#, r#""ibce":false"#),
+        ] {
+            let clob_details = PmTypedLiveMarketDetails {
+                long_market: parse_live_clob_market_lifecycle_details(market.as_bytes(), scope())
+                    .unwrap(),
+                clob: parse_live_clob_v2_metadata(
+                    clob_mutation.as_bytes(),
+                    PmClobV2RequestScope::new(scope().condition(), scope().token()),
+                )
+                .unwrap(),
+            };
+            assert_ne!(
+                base,
+                live_metadata_observation_commitment(
+                    OriginMode::LocalEvidence,
+                    scope(),
+                    market.as_bytes(),
+                    clob.as_bytes(),
+                    &clob_details,
                     received,
                 )
             );

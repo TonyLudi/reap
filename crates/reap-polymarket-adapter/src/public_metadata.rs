@@ -6,7 +6,7 @@ use reap_polymarket_wire::{
     PmBookMarketBinding, PmBookParserConfig, PmClobMetadata, PmClobV2Metadata,
     PmClobV2RequestScope, PmLifecycleMetadata, PmWireError, PmWireScope, parse_clob_metadata,
     parse_lifecycle_metadata, parse_live_clob_market_lifecycle_details,
-    parse_live_clob_v2_metadata,
+    parse_live_clob_v2_metadata, validate_live_clob_lifecycle_agreement,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -128,6 +128,8 @@ impl PmAuthoritativeMetadata {
             PmClobV2RequestScope::new(expected.condition(), expected.outcome().token()),
         )
         .map_err(PmMetadataJoinError::Wire)?;
+        validate_live_clob_lifecycle_agreement(&lifecycle, &clob)
+            .map_err(PmMetadataJoinError::Wire)?;
         validate_live_wire_join(expected, *lifecycle.metadata(), &clob)?;
         validate_goal_f_domain(expected)?;
         Ok(Self {

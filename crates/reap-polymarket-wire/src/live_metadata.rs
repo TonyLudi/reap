@@ -134,7 +134,14 @@ pub struct PmClobV2Metadata {
     maker_base_fee_bps: u64,
     taker_base_fee_bps: u64,
     fee_details: PmClobFeeDetails,
+    accepting_orders: Option<bool>,
+    seconds_delay: Option<u64>,
+    game_start_time: Option<PmLifecycleTimeString>,
+    cancel_book_on_start: Option<bool>,
+    accepting_order_timestamp: Option<PmLifecycleTimeString>,
+    rfq_enabled: Option<bool>,
     take_only_delay_enabled: bool,
+    bonding_curve_enabled: Option<bool>,
     minimum_order_age_seconds: u64,
 }
 
@@ -227,8 +234,43 @@ impl PmClobV2Metadata {
     }
 
     #[must_use]
+    pub const fn accepting_orders(&self) -> Option<bool> {
+        self.accepting_orders
+    }
+
+    #[must_use]
+    pub const fn seconds_delay(&self) -> Option<u64> {
+        self.seconds_delay
+    }
+
+    #[must_use]
+    pub const fn game_start_time(&self) -> Option<&PmLifecycleTimeString> {
+        self.game_start_time.as_ref()
+    }
+
+    #[must_use]
+    pub const fn cancel_book_on_start(&self) -> Option<bool> {
+        self.cancel_book_on_start
+    }
+
+    #[must_use]
+    pub const fn accepting_order_timestamp(&self) -> Option<&PmLifecycleTimeString> {
+        self.accepting_order_timestamp.as_ref()
+    }
+
+    #[must_use]
+    pub const fn rfq_enabled(&self) -> Option<bool> {
+        self.rfq_enabled
+    }
+
+    #[must_use]
     pub const fn take_only_delay_enabled(&self) -> bool {
         self.take_only_delay_enabled
+    }
+
+    #[must_use]
+    pub const fn bonding_curve_enabled(&self) -> Option<bool> {
+        self.bonding_curve_enabled
     }
 
     #[must_use]
@@ -389,10 +431,26 @@ pub fn parse_live_clob_v2_metadata(
             .transpose()?,
         taker_only: raw_fee_details.taker_only,
     };
+    let accepting_orders = optional_nonnull(wire.accepting_orders, "accepting_orders")?;
+    let seconds_delay = optional_nonnull(wire.seconds_delay, "seconds_delay")?;
+    let game_start_time = match wire.game_start_time {
+        PresentField::Missing | PresentField::Present(None) => None,
+        PresentField::Present(Some(value)) => {
+            Some(parse_lifecycle_time_string(value, "game_start_time")?)
+        }
+    };
+    let cancel_book_on_start = optional_nonnull(wire.cancel_book_on_start, "cancel_book_on_start")?;
+    let accepting_order_timestamp =
+        optional_nonnull(wire.accepting_order_timestamp, "accepting_order_timestamp")?
+            .map(|value| parse_lifecycle_time_string(value, "accepting_order_timestamp"))
+            .transpose()?;
+    let rfq_enabled = optional_nonnull(wire.rfq_enabled, "rfq_enabled")?;
     let take_only_delay_enabled = match wire.is_take_only_delay_enabled {
         PresentField::Missing => false,
         PresentField::Present(value) => value,
     };
+    let bonding_curve_enabled =
+        optional_nonnull(wire.is_bonding_curve_enabled, "is_bonding_curve_enabled")?;
     let minimum_order_age_seconds = wire
         .order_acceptance_status
         .ok_or(PmWireError::MissingField("minimum_order_age_seconds"))?;
@@ -408,9 +466,55 @@ pub fn parse_live_clob_v2_metadata(
         maker_base_fee_bps,
         taker_base_fee_bps,
         fee_details,
+        accepting_orders,
+        seconds_delay,
+        game_start_time,
+        cancel_book_on_start,
+        accepting_order_timestamp,
+        rfq_enabled,
         take_only_delay_enabled,
+        bonding_curve_enabled,
         minimum_order_age_seconds,
     })
+}
+
+/// Requires every abbreviated lifecycle fact that is present to agree with
+/// the independently parsed long-market authority.
+pub fn validate_live_clob_lifecycle_agreement(
+    long: &PmLiveClobMarketLifecycle,
+    short: &PmClobV2Metadata,
+) -> Result<(), PmWireError> {
+    let long_metadata = long.metadata();
+    let long_details = long.details();
+    if short
+        .accepting_orders()
+        .is_some_and(|value| value != long_metadata.lifecycle().accepting_orders())
+    {
+        return Err(PmWireError::InvalidIdentity("accepting_orders"));
+    }
+    if short
+        .seconds_delay()
+        .is_some_and(|value| value != long_details.seconds_delay())
+    {
+        return Err(PmWireError::InvalidIdentity("seconds_delay"));
+    }
+    if let Some(short_timestamp) = short.accepting_order_timestamp() {
+        let Some(long_timestamp) = long_details.accepting_order_timestamp() else {
+            return Err(PmWireError::InvalidIdentity("accepting_order_timestamp"));
+        };
+        if short_timestamp != long_timestamp {
+            return Err(PmWireError::InvalidIdentity("accepting_order_timestamp"));
+        }
+    }
+    if let Some(short_timestamp) = short.game_start_time() {
+        let Some(long_timestamp) = long_details.game_start_time() else {
+            return Err(PmWireError::InvalidIdentity("game_start_time"));
+        };
+        if short_timestamp != long_timestamp {
+            return Err(PmWireError::InvalidIdentity("game_start_time"));
+        }
+    }
+    Ok(())
 }
 
 fn parse_fee_decimal(
@@ -448,6 +552,17 @@ fn parse_lifecycle_time_string(
         return Err(PmWireError::InvalidIdentity(field));
     }
     Ok(PmLifecycleTimeString(value.into()))
+}
+
+fn optional_nonnull<T>(
+    value: PresentField<Option<T>>,
+    field: &'static str,
+) -> Result<Option<T>, PmWireError> {
+    match value {
+        PresentField::Missing => Ok(None),
+        PresentField::Present(None) => Err(PmWireError::NullField(field)),
+        PresentField::Present(Some(value)) => Ok(Some(value)),
+    }
 }
 
 fn check_rest_bound(raw: &[u8]) -> Result<(), PmWireError> {
@@ -593,21 +708,21 @@ struct RawShortClobMarket {
     #[serde(default, rename = "tbf")]
     taker_base_fee: Option<u64>,
     #[serde(default, rename = "ao")]
-    _accepting_orders: Option<Box<RawValue>>,
+    accepting_orders: PresentField<Option<bool>>,
     #[serde(default, rename = "sd")]
-    _seconds_delay: Option<Box<RawValue>>,
+    seconds_delay: PresentField<Option<u64>>,
     #[serde(default, rename = "gst")]
-    _game_start_time: Option<Box<RawValue>>,
+    game_start_time: PresentField<Option<String>>,
     #[serde(default, rename = "cbos")]
-    _cancel_book_on_start: Option<Box<RawValue>>,
+    cancel_book_on_start: PresentField<Option<bool>>,
     #[serde(default, rename = "aot")]
-    _accepting_order_timestamp: Option<Box<RawValue>>,
+    accepting_order_timestamp: PresentField<Option<String>>,
     #[serde(default, rename = "rfqe")]
-    _rfq_enabled: Option<Box<RawValue>>,
+    rfq_enabled: PresentField<Option<bool>>,
     #[serde(default, rename = "itode")]
     is_take_only_delay_enabled: PresentField<bool>,
     #[serde(default, rename = "ibce")]
-    _is_bonding_curve_enabled: Option<Box<RawValue>>,
+    is_bonding_curve_enabled: PresentField<Option<bool>>,
     #[serde(default, rename = "oas")]
     order_acceptance_status: Option<u64>,
 }

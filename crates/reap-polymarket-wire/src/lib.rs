@@ -33,7 +33,7 @@ pub use live_metadata::{
     PmClobFeeDecimal, PmClobFeeDetails, PmClobV2Metadata, PmClobV2RequestScope,
     PmLifecycleTimeString, PmLiveClobMarketLifecycle, PmLongMarketLifecycleDetails,
     parse_live_clob_market_lifecycle, parse_live_clob_market_lifecycle_details,
-    parse_live_clob_v2_metadata,
+    parse_live_clob_v2_metadata, validate_live_clob_lifecycle_agreement,
 };
 pub use live_private::{
     MAX_PM_LIVE_BODY_BYTES, MAX_PM_LIVE_CURSOR_BYTES, MAX_PM_LIVE_PAGE_ITEMS, PmCredentialOwner,

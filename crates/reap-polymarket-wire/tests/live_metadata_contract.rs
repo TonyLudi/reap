@@ -5,7 +5,7 @@ use reap_polymarket_wire::{
     PmBookMarketBinding, PmBookParserConfig, PmClobV2RequestScope, PmWireError,
     compute_snapshot_hash, parse_live_clob_market_lifecycle,
     parse_live_clob_market_lifecycle_details, parse_live_clob_v2_metadata,
-    parse_rest_book_snapshot,
+    parse_rest_book_snapshot, validate_live_clob_lifecycle_agreement,
 };
 
 // Contract sources:
@@ -89,6 +89,20 @@ fn short_market(condition: Option<&str>, tick: &str, minimum: &str, nr: Option<&
           {condition}{nr}
         }}"#
     )
+}
+
+fn short_market_without_optional_lifecycle_fields() -> String {
+    short_market(None, "0.01", "5", None)
+        .replace("          \"ao\":true,\n", "")
+        .replace("          \"sd\":0,\n", "")
+        .replace("          \"gst\":null,\n", "")
+        .replace("          \"cbos\":true,\n", "")
+        .replace("          \"aot\":\"2026-08-08T00:00:00Z\",\n", "")
+        .replace("          \"rfqe\":false,\n", "")
+        .replace(
+            "          \"oas\":0,\n          \"ibce\":true\n",
+            "          \"oas\":0\n",
+        )
 }
 
 #[test]
@@ -290,7 +304,17 @@ fn abbreviated_route_retains_request_provenance_without_fabricating_market_ident
     assert_eq!(omitted.fee_details().rate().unwrap().as_str(), "0.02");
     assert_eq!(omitted.fee_details().exponent().unwrap().as_str(), "2");
     assert_eq!(omitted.fee_details().taker_only(), Some(true));
+    assert_eq!(omitted.accepting_orders(), Some(true));
+    assert_eq!(omitted.seconds_delay(), Some(0));
+    assert_eq!(omitted.game_start_time(), None);
+    assert_eq!(omitted.cancel_book_on_start(), Some(true));
+    assert_eq!(
+        omitted.accepting_order_timestamp().unwrap().as_str(),
+        "2026-08-08T00:00:00Z"
+    );
+    assert_eq!(omitted.rfq_enabled(), Some(false));
     assert!(!omitted.take_only_delay_enabled());
+    assert_eq!(omitted.bonding_curve_enabled(), Some(true));
     assert_eq!(omitted.minimum_order_age_seconds(), 0);
 
     let reported = parse_live_clob_v2_metadata(
@@ -332,6 +356,176 @@ fn abbreviated_optional_fields_default_only_when_omitted() {
             "{field}"
         );
     }
+
+    let omitted = parse_live_clob_v2_metadata(
+        short_market_without_optional_lifecycle_fields().as_bytes(),
+        request_scope(),
+    )
+    .expect("reviewed abbreviated lifecycle fields may be omitted");
+    assert_eq!(omitted.accepting_orders(), None);
+    assert_eq!(omitted.seconds_delay(), None);
+    assert_eq!(omitted.game_start_time(), None);
+    assert_eq!(omitted.cancel_book_on_start(), None);
+    assert_eq!(omitted.accepting_order_timestamp(), None);
+    assert_eq!(omitted.rfq_enabled(), None);
+    assert_eq!(omitted.bonding_curve_enabled(), None);
+}
+
+#[test]
+fn abbreviated_lifecycle_fields_reject_null_wrong_types_duplicates_and_oversize() {
+    let valid = short_market(None, "0.01", "5", None);
+    for (needle, replacement, error) in [
+        (
+            r#""ao":true"#,
+            r#""ao":null"#,
+            PmWireError::NullField("accepting_orders"),
+        ),
+        (
+            r#""sd":0"#,
+            r#""sd":null"#,
+            PmWireError::NullField("seconds_delay"),
+        ),
+        (
+            r#""cbos":true"#,
+            r#""cbos":null"#,
+            PmWireError::NullField("cancel_book_on_start"),
+        ),
+        (
+            r#""aot":"2026-08-08T00:00:00Z""#,
+            r#""aot":null"#,
+            PmWireError::NullField("accepting_order_timestamp"),
+        ),
+        (
+            r#""rfqe":false"#,
+            r#""rfqe":null"#,
+            PmWireError::NullField("rfq_enabled"),
+        ),
+        (
+            r#""ibce":true"#,
+            r#""ibce":null"#,
+            PmWireError::NullField("is_bonding_curve_enabled"),
+        ),
+    ] {
+        let raw = valid.replace(needle, replacement);
+        assert_eq!(
+            parse_live_clob_v2_metadata(raw.as_bytes(), request_scope()),
+            Err(error),
+            "{needle}"
+        );
+    }
+
+    for (needle, replacement) in [
+        (r#""ao":true"#, r#""ao":"true""#),
+        (r#""sd":0"#, r#""sd":"0""#),
+        (r#""gst":null"#, r#""gst":7""#),
+        (r#""cbos":true"#, r#""cbos":1"#),
+        (r#""aot":"2026-08-08T00:00:00Z""#, r#""aot":false"#),
+        (r#""rfqe":false"#, r#""rfqe":0"#),
+        (r#""ibce":true"#, r#""ibce":"true""#),
+    ] {
+        let raw = valid.replace(needle, replacement);
+        assert_eq!(
+            parse_live_clob_v2_metadata(raw.as_bytes(), request_scope()),
+            Err(PmWireError::MalformedJson),
+            "{needle}"
+        );
+    }
+
+    for (needle, replacement) in [
+        (r#""ao":true"#, r#""ao":true,"ao":true"#),
+        (r#""sd":0"#, r#""sd":0,"sd":0"#),
+        (r#""gst":null"#, r#""gst":null,"gst":null"#),
+        (r#""cbos":true"#, r#""cbos":true,"cbos":true"#),
+        (
+            r#""aot":"2026-08-08T00:00:00Z""#,
+            r#""aot":"2026-08-08T00:00:00Z","aot":"2026-08-08T00:00:00Z""#,
+        ),
+        (r#""rfqe":false"#, r#""rfqe":false,"rfqe":false"#),
+        (r#""ibce":true"#, r#""ibce":true,"ibce":true"#),
+    ] {
+        let raw = valid.replace(needle, replacement);
+        assert_eq!(
+            parse_live_clob_v2_metadata(raw.as_bytes(), request_scope()),
+            Err(PmWireError::MalformedJson),
+            "{needle}"
+        );
+    }
+
+    let oversized = valid.replace(
+        r#""aot":"2026-08-08T00:00:00Z""#,
+        &format!(r#""aot":"{}""#, "x".repeat(129)),
+    );
+    assert_eq!(
+        parse_live_clob_v2_metadata(oversized.as_bytes(), request_scope()),
+        Err(PmWireError::FieldTooLong("accepting_order_timestamp"))
+    );
+}
+
+#[test]
+fn long_and_abbreviated_lifecycle_facts_must_agree_asymmetrically() {
+    let long = parse_live_clob_market_lifecycle_details(long_market().as_bytes(), support::scope())
+        .unwrap();
+    let exact = parse_live_clob_v2_metadata(
+        short_market(None, "0.01", "5", None).as_bytes(),
+        request_scope(),
+    )
+    .unwrap();
+    assert_eq!(
+        validate_live_clob_lifecycle_agreement(&long, &exact),
+        Ok(())
+    );
+
+    let omitted = parse_live_clob_v2_metadata(
+        short_market_without_optional_lifecycle_fields().as_bytes(),
+        request_scope(),
+    )
+    .unwrap();
+    assert_eq!(
+        validate_live_clob_lifecycle_agreement(&long, &omitted),
+        Ok(())
+    );
+
+    for (needle, replacement, field) in [
+        (r#""ao":true"#, r#""ao":false"#, "accepting_orders"),
+        (r#""sd":0"#, r#""sd":1"#, "seconds_delay"),
+        (
+            r#""aot":"2026-08-08T00:00:00Z""#,
+            r#""aot":"2026-08-08T00:00:01Z""#,
+            "accepting_order_timestamp",
+        ),
+        (
+            r#""gst":null"#,
+            r#""gst":"2026-12-31T00:00:00Z""#,
+            "game_start_time",
+        ),
+    ] {
+        let raw = short_market(None, "0.01", "5", None).replace(needle, replacement);
+        let short = parse_live_clob_v2_metadata(raw.as_bytes(), request_scope()).unwrap();
+        assert_eq!(
+            validate_live_clob_lifecycle_agreement(&long, &short),
+            Err(PmWireError::InvalidIdentity(field))
+        );
+    }
+
+    let long_with_game = long_market().replace(
+        r#""game_start_time":null"#,
+        r#""game_start_time":"2026-12-31T00:00:00Z""#,
+    );
+    let long_with_game =
+        parse_live_clob_market_lifecycle_details(long_with_game.as_bytes(), support::scope())
+            .unwrap();
+    assert_eq!(
+        validate_live_clob_lifecycle_agreement(&long_with_game, &omitted),
+        Ok(())
+    );
+    let short_with_game = short_market(None, "0.01", "5", None)
+        .replace(r#""gst":null"#, r#""gst":"2026-12-31T00:00:00Z""#);
+    let short_with_game =
+        parse_live_clob_v2_metadata(short_with_game.as_bytes(), request_scope()).unwrap();
+    assert_eq!(
+        validate_live_clob_lifecycle_agreement(&long_with_game, &short_with_game),
+        Ok(())
+    );
 }
 
 #[test]

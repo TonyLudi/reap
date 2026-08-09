@@ -62,7 +62,14 @@ fn short_market(
           "fd":{{"r":0.02,"e":2,"to":true}},
           "mbf":0,
           "tbf":0,
+          "ao":true,
+          "sd":0,
+          "gst":null,
+          "cbos":true,
+          "aot":"2026-08-08T00:00:00Z",
+          "rfqe":false,
           "itode":false,
+          "ibce":true,
           "oas":0
           {condition}
         }}"#
@@ -162,6 +169,32 @@ fn lifecycle_and_trading_contract_contradictions_remain_typed() {
             join(&long_market(), &short).unwrap_err().to_string(),
             expected.to_string()
         );
+    }
+}
+
+#[test]
+fn long_and_short_lifecycle_contradictions_fail_before_authority() {
+    for (needle, replacement, field) in [
+        (r#""ao":true"#, r#""ao":false"#, "accepting_orders"),
+        (r#""sd":0"#, r#""sd":1"#, "seconds_delay"),
+        (
+            r#""aot":"2026-08-08T00:00:00Z""#,
+            r#""aot":"2026-08-08T00:00:01Z""#,
+            "accepting_order_timestamp",
+        ),
+        (
+            r#""gst":null"#,
+            r#""gst":"2026-12-31T00:00:00Z""#,
+            "game_start_time",
+        ),
+    ] {
+        let short = short_market(None, "0.01", "5", false, "Yes").replace(needle, replacement);
+        assert!(matches!(
+            join(&long_market(), &short),
+            Err(PmMetadataJoinError::Wire(PmWireError::InvalidIdentity(
+                observed
+            ))) if observed == field
+        ));
     }
 }
 
