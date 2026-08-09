@@ -1,14 +1,14 @@
-error[E0599]: no method named `clone` found for struct `PmPendingMutationServerTime` in the current scope
+error[E0599]: no method named `clone` found for struct `PmPlaceMutationTimeProof` in the current scope
  --> tests/ui/server_time_proofs_are_move_only.rs:6:19
   |
 6 |     let _ = value.clone();
-  |                   ^^^^^ method not found in `PmPendingMutationServerTime`
+  |                   ^^^^^ method not found in `PmPlaceMutationTimeProof`
 
-error[E0599]: no method named `clone` found for struct `PmAuthorizedMutationServerTime` in the current scope
+error[E0599]: no method named `clone` found for struct `PmCancelMutationTimeProof` in the current scope
   --> tests/ui/server_time_proofs_are_move_only.rs:10:19
    |
 10 |     let _ = value.clone();
-   |                   ^^^^^ method not found in `PmAuthorizedMutationServerTime`
+   |                   ^^^^^ method not found in `PmCancelMutationTimeProof`
 
 error[E0599]: no method named `clone` found for struct `PmReadServerTime` in the current scope
   --> tests/ui/server_time_proofs_are_move_only.rs:14:19

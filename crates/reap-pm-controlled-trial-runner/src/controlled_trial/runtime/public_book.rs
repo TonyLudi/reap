@@ -28,9 +28,9 @@ use reap_polymarket_adapter::{
     PmSnapshotFlowToken,
 };
 use reap_polymarket_live_adapter::{
-    PmActorProductClock, PmHttpReceiveClock, PmLiveAuthoritativeMetadataError,
-    PmLiveAuthoritativeMetadataObservation, PmLiveMetadataObservationCommitment,
-    PmMutationServerTimeHttpRole, PmMutationServerTimeValidator, PmOkxProductClock,
+    PmActorProductClock, PmCancelMutationTimeOwner, PmHttpReceiveClock,
+    PmLiveAuthoritativeMetadataError, PmLiveAuthoritativeMetadataObservation,
+    PmLiveMetadataObservationCommitment, PmOkxProductClock, PmPlaceMutationTimeOwner,
     PmPrivateReadProductClock, PmProductClockError, PmPublicConnectivityRoles, PmPublicHttpRole,
     PmPublicMarketWsRole, PmPublicMetadataHttpRole, PmPublicWsActivityView, PmPublicWsConnection,
     PmPublicWsDisconnectReason, PmPublicWsEvent, PmPublicWsEventSink, PmPublicWsReconnect,
@@ -61,13 +61,12 @@ impl PmControlledTrialPublicConnectivity {
             book_http,
             read_server_time_http,
             private_read_clock,
-            place_server_time_http,
-            cancel_server_time_http,
+            place_mutation_time,
+            cancel_mutation_time,
             public_ws,
             user_ws_clock,
             actor_clock,
             okx_clock,
-            mutation_time_validator,
         ) = roles.into_roles();
         Self {
             book: PmPublicBookConnectivityBundle {
@@ -79,11 +78,10 @@ impl PmControlledTrialPublicConnectivity {
             companions: PmPublicBookCompanionRoles {
                 read_server_time_http,
                 private_read_clock,
-                place_server_time_http,
-                cancel_server_time_http,
+                place_mutation_time,
+                cancel_mutation_time,
                 user_ws_clock,
                 okx_clock,
-                mutation_time_validator,
             },
         }
     }
@@ -143,11 +141,10 @@ impl fmt::Debug for PmPublicBookConnectivityBundle {
 pub(super) struct PmPublicBookCompanionRoles {
     read_server_time_http: PmReadServerTimeHttpRole,
     private_read_clock: PmPrivateReadProductClock,
-    place_server_time_http: PmMutationServerTimeHttpRole,
-    cancel_server_time_http: PmMutationServerTimeHttpRole,
+    place_mutation_time: PmPlaceMutationTimeOwner,
+    cancel_mutation_time: PmCancelMutationTimeOwner,
     user_ws_clock: PmUserWsProductClock,
     okx_clock: PmOkxProductClock,
-    mutation_time_validator: PmMutationServerTimeValidator,
 }
 
 impl PmPublicBookCompanionRoles {
@@ -163,10 +160,9 @@ impl PmPublicBookCompanionRoles {
                 user_ws: self.user_ws_clock,
             },
             PmMutationCompanionRoles {
-                place_server_time_http: self.place_server_time_http,
-                cancel_server_time_http: self.cancel_server_time_http,
+                place_mutation_time: self.place_mutation_time,
+                cancel_mutation_time: self.cancel_mutation_time,
                 okx_clock: self.okx_clock,
-                mutation_time_validator: self.mutation_time_validator,
             },
         )
     }
@@ -220,10 +216,9 @@ impl fmt::Debug for PmPrivateReadClockBundle {
 /// Remaining exact mutation-time views. This carrier still has no request,
 /// signer, credential, journal grant, or transport capability.
 pub(super) struct PmMutationCompanionRoles {
-    place_server_time_http: PmMutationServerTimeHttpRole,
-    cancel_server_time_http: PmMutationServerTimeHttpRole,
+    place_mutation_time: PmPlaceMutationTimeOwner,
+    cancel_mutation_time: PmCancelMutationTimeOwner,
     okx_clock: PmOkxProductClock,
-    mutation_time_validator: PmMutationServerTimeValidator,
 }
 
 impl fmt::Debug for PmMutationCompanionRoles {

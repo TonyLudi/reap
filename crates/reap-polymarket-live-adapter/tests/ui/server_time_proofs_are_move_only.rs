@@ -1,12 +1,12 @@
 use reap_polymarket_live_adapter::{
-    PmAuthorizedMutationServerTime, PmPendingMutationServerTime, PmReadServerTime,
+    PmCancelMutationTimeProof, PmPlaceMutationTimeProof, PmReadServerTime,
 };
 
-fn clone_pending(value: PmPendingMutationServerTime) {
+fn clone_place(value: PmPlaceMutationTimeProof) {
     let _ = value.clone();
 }
 
-fn clone_authorized(value: PmAuthorizedMutationServerTime) {
+fn clone_cancel(value: PmCancelMutationTimeProof) {
     let _ = value.clone();
 }
 

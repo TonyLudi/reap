@@ -14,6 +14,13 @@ use reap_pm_controlled_trial::{
 use crate::{
     PmTrialLiveJournalError,
     hash::{ZERO_FINGERPRINT, canonical_json, hash_domain, validate_fingerprint},
+    live_dispatch::{
+        PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1, PmPhaseAPlaceDispatchBarrierWitnessV1,
+        PmPhaseAPlaceDispatchGrantV1, PmPhaseAPlaceDispatchMintEvidenceV1,
+        PmPhaseAPlaceLiveDispatchContextV1, PmPhaseAPlaceLiveDispatchProfileV1,
+        PmRevalidatedPhaseAPlaceDispatchGrantV1, grant_matches_v1_dispatch,
+        prepare_phase_a_place_dispatch_grant,
+    },
     protected::{ProtectedArtifactLease, ProtectedJournal},
     recovery::{
         PmTrialLiveRecoveryClassificationV1, PmTrialLiveRecoveryProjectionV1, revalidate_projection,
@@ -168,6 +175,7 @@ impl PmDurablePlaceResultAckV1 {
 pub struct PmDurablePlaceOutcomeBridgeAckV1 {
     core: DurableAckCore,
     dispatch: CounterpartLinkV1,
+    outcome: PmPlaceResultKindV1,
 }
 
 pub struct PmJournalOwnedVenueOrderV1 {
@@ -212,6 +220,41 @@ pub struct PmDurableCancelPreparedAckV1 {
     dispatch_class: PmCancelDispatchClassV1,
     exact_venue_order_id: String,
     preparation: PmCancelPreparationViewV1,
+}
+
+/// Positive place-provenance cancel intent. Its private inner acknowledgement
+/// cannot be downgraded into the legacy evidence-only cancel path.
+pub struct PmDurablePhaseALiveCancelIntentAckV1 {
+    intent: PmDurableCancelIntentAckV1,
+}
+
+/// Positive place-provenance cancel preparation. Only the live intent wrapper
+/// can mint this value.
+pub struct PmDurablePhaseALiveCancelPreparedAckV1 {
+    prepared: PmDurableCancelPreparedAckV1,
+}
+
+/// Positive place-provenance cancel dispatch evidence. A future live cancel
+/// authority join must require this type, never `PmDurableCancelDispatchAckV1`.
+pub struct PmDurablePhaseALiveCancelDispatchAckV1 {
+    dispatch: PmDurableCancelDispatchAckV1,
+}
+
+impl PmDurablePhaseALiveCancelDispatchAckV1 {
+    #[must_use]
+    pub const fn sequence(&self) -> u8 {
+        self.dispatch.core.sequence
+    }
+
+    #[must_use]
+    pub const fn dispatch_class(&self) -> PmCancelDispatchClassV1 {
+        self.dispatch.dispatch_class
+    }
+
+    #[must_use]
+    pub const fn preparation(&self) -> &PmCancelPreparationViewV1 {
+        &self.dispatch.preparation
+    }
 }
 
 impl PmDurableCancelDispatchAckV1 {
@@ -262,6 +305,270 @@ impl std::fmt::Debug for PmPreparedConsumedAuthorizationProofV1 {
     }
 }
 
+struct PmPhaseALiveDispatchEpoch;
+
+/// Sole move-only owner of the positive Phase-A place path before the runner
+/// barrier recheck. The V1 acknowledgement, positive grant, consumed
+/// authorization, and live journal epoch cannot be split by callers.
+///
+/// ```compile_fail
+/// use reap_pm_controlled_trial_live::PmPhaseAPlaceLiveDispatchOwnerV1;
+/// fn split(owner: PmPhaseAPlaceLiveDispatchOwnerV1) {
+///     let PmPhaseAPlaceLiveDispatchOwnerV1 { dispatch, .. } = owner;
+///     drop(dispatch);
+/// }
+/// ```
+pub struct PmPhaseAPlaceLiveDispatchOwnerV1 {
+    dispatch: PmDurablePlaceDispatchAckV1,
+    grant: PmPhaseAPlaceDispatchGrantV1,
+    authorization: ConsumedAuthorizationConsumption,
+    epoch: Arc<PmPhaseALiveDispatchEpoch>,
+}
+
+impl PmPhaseAPlaceLiveDispatchOwnerV1 {
+    /// Consume the entire combined owner and revalidate the durable barrier for
+    /// runner-side preparation. This is not the final network-boundary check.
+    pub fn revalidate_for_runner(
+        self,
+    ) -> Result<PmRevalidatedPhaseAPlaceLiveDispatchOwnerV1, PmTrialLiveJournalError> {
+        let grant = self.grant.revalidate_for_runner()?;
+        if !grant_matches_v1_dispatch(
+            &grant,
+            self.dispatch.core.sequence,
+            &self.dispatch.core.record_fingerprint,
+        ) {
+            return Err(PmTrialLiveJournalError::ForeignAcknowledgement);
+        }
+        Ok(PmRevalidatedPhaseAPlaceLiveDispatchOwnerV1 {
+            dispatch: self.dispatch,
+            grant,
+            authorization: self.authorization,
+            epoch: self.epoch,
+        })
+    }
+}
+
+impl std::fmt::Debug for PmPhaseAPlaceLiveDispatchOwnerV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PmPhaseAPlaceLiveDispatchOwnerV1")
+            .field("dispatch", &self.dispatch)
+            .field("grant", &self.grant)
+            .field("token_split_allowed", &false)
+            .finish()
+    }
+}
+
+/// Combined owner used for signer, HMAC, current-time, and other pre-send
+/// checks. It can be returned unchanged by every proven pre-send failure.
+pub struct PmRevalidatedPhaseAPlaceLiveDispatchOwnerV1 {
+    dispatch: PmDurablePlaceDispatchAckV1,
+    grant: PmRevalidatedPhaseAPlaceDispatchGrantV1,
+    authorization: ConsumedAuthorizationConsumption,
+    epoch: Arc<PmPhaseALiveDispatchEpoch>,
+}
+
+impl PmRevalidatedPhaseAPlaceLiveDispatchOwnerV1 {
+    #[must_use]
+    pub const fn profile(&self) -> &PmPhaseAPlaceLiveDispatchProfileV1 {
+        self.grant.profile()
+    }
+
+    /// Destroy all send authority for a proven pre-send failure. The returned
+    /// token can only enter the durable DND result exchange.
+    #[must_use]
+    pub fn into_definitely_not_dispatched(self) -> PmPhaseAPlaceDefinitelyNotDispatchedV1 {
+        PmPhaseAPlaceDefinitelyNotDispatchedV1 {
+            dispatch: self.dispatch,
+            grant: self.grant,
+            authorization: self.authorization,
+            epoch: self.epoch,
+        }
+    }
+}
+
+impl std::fmt::Debug for PmRevalidatedPhaseAPlaceLiveDispatchOwnerV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PmRevalidatedPhaseAPlaceLiveDispatchOwnerV1")
+            .field("profile", self.profile())
+            .field("final_network_boundary_revalidated", &false)
+            .field("token_split_allowed", &false)
+            .finish()
+    }
+}
+
+/// Final move-only typestate returned by the live journal immediately before
+/// the future network transport. It has passed a second exact barrier check and
+/// an in-memory outstanding-epoch join while the journal leases remain held.
+///
+/// The final owner borrows the journals, so no terminal/result transition can
+/// race between this check and the transport observation:
+///
+/// ```compile_fail
+/// use reap_pm_controlled_trial_live::{
+///     PmControlledTrialLiveJournals, PmIntentTerminalDispositionV1,
+///     PmRevalidatedPhaseAPlaceLiveDispatchOwnerV1,
+/// };
+/// fn cannot_advance_while_final_owner_is_live(
+///     journals: &mut PmControlledTrialLiveJournals,
+///     owner: PmRevalidatedPhaseAPlaceLiveDispatchOwnerV1,
+/// ) {
+///     let final_owner = journals
+///         .revalidate_phase_a_place_for_network_dispatch(owner)
+///         .unwrap();
+///     let _ = journals.record_terminal(
+///         "2026-08-09T12:05:05Z".into(),
+///         PmIntentTerminalDispositionV1::OperatorActionRequired,
+///     );
+///     let _ = final_owner.profile();
+/// }
+/// ```
+pub struct PmPhaseAPlaceNetworkDispatchOwnerV1<'journal> {
+    journals: &'journal mut PmControlledTrialLiveJournals,
+    dispatch: PmDurablePlaceDispatchAckV1,
+    grant: PmRevalidatedPhaseAPlaceDispatchGrantV1,
+    authorization: ConsumedAuthorizationConsumption,
+    epoch: Arc<PmPhaseALiveDispatchEpoch>,
+}
+
+impl PmPhaseAPlaceNetworkDispatchOwnerV1<'_> {
+    #[must_use]
+    pub const fn profile(&self) -> &PmPhaseAPlaceLiveDispatchProfileV1 {
+        self.grant.profile()
+    }
+
+    /// Consume the sole network-boundary owner once transport may have sent.
+    /// The observation contains no grant, making a later send impossible.
+    pub fn into_may_have_been_dispatched(
+        mut self,
+    ) -> Result<PmPhaseAPlaceMayHaveBeenDispatchedV1, PmTrialLiveJournalError> {
+        self.journals.require_phase_a_live_epoch(&self.epoch)?;
+        self.dispatch.core.require_runtime(&self.journals.runtime)?;
+        self.journals
+            .require_phase_a_live_dispatch_tail(&self.dispatch)?;
+        self.journals
+            .validate_phase_a_live_durable_set(&mut self.grant, &mut self.authorization)?;
+        Ok(PmPhaseAPlaceMayHaveBeenDispatchedV1 {
+            dispatch: self.dispatch,
+            barrier: self.grant.into_barrier_witness(),
+            authorization: self.authorization,
+            epoch: self.epoch,
+        })
+    }
+
+    /// A transport that proves no send occurred returns the combined owner to
+    /// the same DND-only exchange instead of producing an observation.
+    pub fn into_definitely_not_dispatched(
+        mut self,
+    ) -> Result<PmPhaseAPlaceDefinitelyNotDispatchedV1, PmTrialLiveJournalError> {
+        self.journals.require_phase_a_live_epoch(&self.epoch)?;
+        self.dispatch.core.require_runtime(&self.journals.runtime)?;
+        self.journals
+            .require_phase_a_live_dispatch_tail(&self.dispatch)?;
+        self.journals
+            .validate_phase_a_live_durable_set(&mut self.grant, &mut self.authorization)?;
+        Ok(PmPhaseAPlaceDefinitelyNotDispatchedV1 {
+            dispatch: self.dispatch,
+            grant: self.grant,
+            authorization: self.authorization,
+            epoch: self.epoch,
+        })
+    }
+}
+
+impl std::fmt::Debug for PmPhaseAPlaceNetworkDispatchOwnerV1<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PmPhaseAPlaceNetworkDispatchOwnerV1")
+            .field("profile", self.profile())
+            .field("final_network_boundary_revalidated", &true)
+            .field("token_split_allowed", &false)
+            .finish()
+    }
+}
+
+/// Move-only observation produced only by consuming the combined final owner
+/// at the future transport boundary. It contains no dispatch grant.
+pub struct PmPhaseAPlaceMayHaveBeenDispatchedV1 {
+    dispatch: PmDurablePlaceDispatchAckV1,
+    barrier: PmPhaseAPlaceDispatchBarrierWitnessV1,
+    authorization: ConsumedAuthorizationConsumption,
+    epoch: Arc<PmPhaseALiveDispatchEpoch>,
+}
+
+impl std::fmt::Debug for PmPhaseAPlaceMayHaveBeenDispatchedV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PmPhaseAPlaceMayHaveBeenDispatchedV1")
+            .field("dispatch_sequence", &self.dispatch.core.sequence)
+            .field("dispatch_grant_present", &false)
+            .finish()
+    }
+}
+
+/// Move-only proof that the combined owner was destroyed without crossing a
+/// may-have-sent boundary. It can only record the DND terminal place result.
+pub struct PmPhaseAPlaceDefinitelyNotDispatchedV1 {
+    dispatch: PmDurablePlaceDispatchAckV1,
+    grant: PmRevalidatedPhaseAPlaceDispatchGrantV1,
+    authorization: ConsumedAuthorizationConsumption,
+    epoch: Arc<PmPhaseALiveDispatchEpoch>,
+}
+
+impl std::fmt::Debug for PmPhaseAPlaceDefinitelyNotDispatchedV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PmPhaseAPlaceDefinitelyNotDispatchedV1")
+            .field("dispatch_sequence", &self.dispatch.core.sequence)
+            .field("dispatch_grant_present", &true)
+            .field("network_dispatch_observed", &false)
+            .finish()
+    }
+}
+
+/// Positive-path result acknowledgement emitted only after the combined grant
+/// was consumed by DND or by a typed may-have-been-dispatched observation.
+pub struct PmDurablePhaseAPlaceLiveResultAckV1 {
+    result: PmDurablePlaceResultAckV1,
+}
+
+impl PmDurablePhaseAPlaceLiveResultAckV1 {
+    #[must_use]
+    pub const fn outcome(&self) -> PmPlaceResultKindV1 {
+        self.result.outcome
+    }
+}
+
+/// Positive-path place bridge, kept distinct from legacy V1 evidence.
+pub struct PmPhaseAPlaceLiveOutcomeBridgeAckV1 {
+    bridge: PmDurablePlaceOutcomeBridgeAckV1,
+}
+
+/// Exact venue-order custody minted only from the positive barrier plus a
+/// consumed may-have-sent transport observation and Accepted result.
+pub struct PmPhaseAPlaceLiveOwnedVenueOrderV1 {
+    owned: PmJournalOwnedVenueOrderV1,
+}
+
+impl PmPhaseAPlaceLiveOwnedVenueOrderV1 {
+    pub fn exact_venue_order_id(
+        &self,
+    ) -> Result<reap_pm_controlled_trial::FixedOrderId, PmTrialLiveJournalError> {
+        self.owned.exact_venue_order_id()
+    }
+}
+
+impl std::fmt::Debug for PmPhaseAPlaceLiveOwnedVenueOrderV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PmPhaseAPlaceLiveOwnedVenueOrderV1")
+            .field("owned", &self.owned)
+            .field("positive_transport_provenance", &true)
+            .finish()
+    }
+}
+
 struct IntentWriter {
     file: ProtectedJournal,
     bytes: Vec<u8>,
@@ -279,6 +586,8 @@ pub struct PmControlledTrialLiveJournals {
     preflight: PmTrialLivePreflightBindingV1,
     place_identity: PlacePublicRequestIdentity,
     runtime: Arc<RuntimeIdentity>,
+    phase_a_live_dispatch_context: Option<PmPhaseAPlaceLiveDispatchContextV1>,
+    phase_a_live_dispatch_epoch: Option<Arc<PmPhaseALiveDispatchEpoch>>,
     artifact_lease: ProtectedArtifactLease,
     intent: IntentWriter,
     dispatch: DispatchWriter,
@@ -290,6 +599,7 @@ pub struct PmPendingTrialLiveJournalsV1 {
     scope: PmTrialLiveJournalScopeV1,
     place_identity: PlacePublicRequestIdentity,
     runtime: Arc<RuntimeIdentity>,
+    phase_a_live_dispatch_context: Option<PmPhaseAPlaceLiveDispatchContextV1>,
     artifact_lease: ProtectedArtifactLease,
     intent: IntentWriter,
     dispatch: DispatchWriter,
@@ -319,6 +629,8 @@ impl PmPendingTrialLiveJournalsV1 {
             preflight: preflight.clone(),
             place_identity: self.place_identity,
             runtime: self.runtime,
+            phase_a_live_dispatch_context: self.phase_a_live_dispatch_context,
+            phase_a_live_dispatch_epoch: None,
             artifact_lease: self.artifact_lease,
             intent: self.intent,
             dispatch: self.dispatch,
@@ -373,6 +685,12 @@ impl PmControlledTrialLiveJournals {
             consumption.latest_record_fingerprint.clone(),
         )?;
         let place_identity = config.exact_place_public_request_identity();
+        let phase_a_live_dispatch_context = PmPhaseAPlaceLiveDispatchContextV1::for_exact_phase_a(
+            config,
+            authorization,
+            runtime,
+            &scope,
+        )?;
         if consumption.binding_fingerprint != scope.expected_consumption.binding_fingerprint {
             return Err(PmTrialLiveJournalError::InvalidBinding);
         }
@@ -441,6 +759,7 @@ impl PmControlledTrialLiveJournals {
             scope,
             place_identity,
             runtime: Arc::new(RuntimeIdentity),
+            phase_a_live_dispatch_context,
             artifact_lease,
             intent: IntentWriter {
                 file: intent_file,
@@ -557,6 +876,65 @@ impl PmControlledTrialLiveJournals {
         ),
         PmTrialLiveJournalError,
     > {
+        let (dispatch, owner, _mint_evidence) =
+            self.record_place_dispatch_authorized_inner(proof)?;
+        Ok((dispatch, owner))
+    }
+
+    /// Append the unchanged evidence-only V1 acknowledgement, then fsync a
+    /// separate create-new positive Phase-A dispatch barrier. Only the latter
+    /// may mint the move-only runner grant.
+    pub fn record_phase_a_place_live_dispatch_authorized(
+        &mut self,
+        proof: PmPreparedConsumedAuthorizationProofV1,
+    ) -> Result<PmPhaseAPlaceLiveDispatchOwnerV1, PmTrialLiveJournalError> {
+        if self.phase_a_live_dispatch_context.is_none()
+            || self.phase_a_live_dispatch_epoch.is_some()
+        {
+            return Err(PmTrialLiveJournalError::InvalidBinding);
+        }
+        let (dispatch, mut authorization, mint_evidence) =
+            self.record_place_dispatch_authorized_inner(proof)?;
+        let context = self
+            .phase_a_live_dispatch_context
+            .take()
+            .ok_or(PmTrialLiveJournalError::InvalidBinding)?;
+        let epoch = Arc::new(PmPhaseALiveDispatchEpoch);
+        self.phase_a_live_dispatch_epoch = Some(Arc::clone(&epoch));
+        let pending_grant = prepare_phase_a_place_dispatch_grant(
+            context,
+            &self.scope,
+            &self.preflight,
+            mint_evidence,
+        )?;
+        // The positive barrier is the sole additional fixed directory entry.
+        // Refresh every already-held directory view before exposing authority.
+        self.artifact_lease.refresh_after_bound_create()?;
+        self.intent.file.refresh_parent_after_bound_create()?;
+        self.dispatch.file.refresh_parent_after_bound_create()?;
+        authorization
+            .refresh_after_bound_artifact_create()
+            .map_err(|_| PmTrialLiveJournalError::Protection)?;
+        self.artifact_lease.validate()?;
+        Ok(PmPhaseAPlaceLiveDispatchOwnerV1 {
+            dispatch,
+            grant: pending_grant.into_grant(),
+            authorization,
+            epoch,
+        })
+    }
+
+    fn record_place_dispatch_authorized_inner(
+        &mut self,
+        proof: PmPreparedConsumedAuthorizationProofV1,
+    ) -> Result<
+        (
+            PmDurablePlaceDispatchAckV1,
+            ConsumedAuthorizationConsumption,
+            PmPhaseAPlaceDispatchMintEvidenceV1,
+        ),
+        PmTrialLiveJournalError,
+    > {
         proof.prepared.core.require_runtime(&self.runtime)?;
         match self.dispatch.lines.last().map(|line| &line.body) {
             Some(DispatchRecordV1::PlacePrepared { .. }) => {}
@@ -565,21 +943,153 @@ impl PmControlledTrialLiveJournals {
         let prepared_sequence = proof.prepared.core.sequence;
         let prepared_record_fingerprint = proof.prepared.core.record_fingerprint.clone();
         let preparation = proof.prepared.preparation;
+        let mint_preparation = preparation.clone();
+        let mint_consumption = proof.consumption.clone();
         let core = self.append_dispatch(DispatchRecordV1::PlaceDispatchAuthorized {
             prepared_sequence,
-            prepared_record_fingerprint,
+            prepared_record_fingerprint: prepared_record_fingerprint.clone(),
             consumption: proof.consumption,
             production_order_entry_authorized: false,
             real_order_submission_authorized: false,
             place_dispatch_allowance: 0,
         })?;
+        let mint_evidence = PmPhaseAPlaceDispatchMintEvidenceV1 {
+            preparation: mint_preparation,
+            prepared_sequence,
+            prepared_record_fingerprint,
+            consumption: mint_consumption,
+            v1_dispatch_authorized_sequence: core.sequence,
+            v1_dispatch_authorized_fingerprint: core.record_fingerprint.clone(),
+        };
         Ok((
             PmDurablePlaceDispatchAckV1 { core, preparation },
             proof.owner,
+            mint_evidence,
         ))
     }
 
     pub fn record_place_result(
+        &mut self,
+        dispatch: PmDurablePlaceDispatchAckV1,
+        outcome: PmPlaceResultKindV1,
+        observed_order_id: Option<String>,
+    ) -> Result<PmDurablePlaceResultAckV1, PmTrialLiveJournalError> {
+        if self.phase_a_live_dispatch_epoch.is_some()
+            || outcome == PmPlaceResultKindV1::DefinitelyNotDispatched
+        {
+            return Err(PmTrialLiveJournalError::InvalidTransition);
+        }
+        self.record_place_result_inner(dispatch, outcome, observed_order_id)
+    }
+
+    /// Perform the second consuming recheck at the actual future transport
+    /// boundary. The journal must still own the matching outstanding epoch and
+    /// all fixed leases; no terminal or generic result can have advanced.
+    pub fn revalidate_phase_a_place_for_network_dispatch<'journal>(
+        &'journal mut self,
+        mut owner: PmRevalidatedPhaseAPlaceLiveDispatchOwnerV1,
+    ) -> Result<PmPhaseAPlaceNetworkDispatchOwnerV1<'journal>, PmTrialLiveJournalError> {
+        self.require_phase_a_live_epoch(&owner.epoch)?;
+        owner.dispatch.core.require_runtime(&self.runtime)?;
+        self.require_phase_a_live_dispatch_tail(&owner.dispatch)?;
+        self.validate_phase_a_live_durable_set(&mut owner.grant, &mut owner.authorization)?;
+        if !grant_matches_v1_dispatch(
+            &owner.grant,
+            owner.dispatch.core.sequence,
+            &owner.dispatch.core.record_fingerprint,
+        ) {
+            return Err(PmTrialLiveJournalError::ForeignAcknowledgement);
+        }
+        let PmRevalidatedPhaseAPlaceLiveDispatchOwnerV1 {
+            dispatch,
+            grant,
+            authorization,
+            epoch,
+        } = owner;
+        Ok(PmPhaseAPlaceNetworkDispatchOwnerV1 {
+            journals: self,
+            dispatch,
+            grant,
+            authorization,
+            epoch,
+        })
+    }
+
+    /// Consume the sole combined DND token, durably record the terminal no-send
+    /// result, and release the in-memory outstanding epoch only after fsync.
+    pub fn record_phase_a_place_definitely_not_dispatched(
+        &mut self,
+        mut definitely_not_dispatched: PmPhaseAPlaceDefinitelyNotDispatchedV1,
+    ) -> Result<
+        (
+            PmDurablePhaseAPlaceLiveResultAckV1,
+            ConsumedAuthorizationConsumption,
+        ),
+        PmTrialLiveJournalError,
+    > {
+        self.require_phase_a_live_epoch(&definitely_not_dispatched.epoch)?;
+        definitely_not_dispatched
+            .dispatch
+            .core
+            .require_runtime(&self.runtime)?;
+        self.require_phase_a_live_dispatch_tail(&definitely_not_dispatched.dispatch)?;
+        self.validate_phase_a_live_durable_set(
+            &mut definitely_not_dispatched.grant,
+            &mut definitely_not_dispatched.authorization,
+        )?;
+        if !grant_matches_v1_dispatch(
+            &definitely_not_dispatched.grant,
+            definitely_not_dispatched.dispatch.core.sequence,
+            &definitely_not_dispatched.dispatch.core.record_fingerprint,
+        ) {
+            return Err(PmTrialLiveJournalError::ForeignAcknowledgement);
+        }
+        let result = self.record_place_result_inner(
+            definitely_not_dispatched.dispatch,
+            PmPlaceResultKindV1::DefinitelyNotDispatched,
+            None,
+        )?;
+        self.complete_phase_a_live_epoch(&definitely_not_dispatched.epoch)?;
+        Ok((
+            PmDurablePhaseAPlaceLiveResultAckV1 { result },
+            definitely_not_dispatched.authorization,
+        ))
+    }
+
+    /// Consume a typed may-have-been-dispatched observation before recording
+    /// any caller-supplied venue outcome. The observation contains no grant.
+    pub fn record_phase_a_place_live_result(
+        &mut self,
+        mut observation: PmPhaseAPlaceMayHaveBeenDispatchedV1,
+        outcome: PmPlaceResultKindV1,
+        observed_order_id: Option<String>,
+    ) -> Result<
+        (
+            PmDurablePhaseAPlaceLiveResultAckV1,
+            ConsumedAuthorizationConsumption,
+        ),
+        PmTrialLiveJournalError,
+    > {
+        if outcome == PmPlaceResultKindV1::DefinitelyNotDispatched {
+            return Err(PmTrialLiveJournalError::InvalidTransition);
+        }
+        self.require_phase_a_live_epoch(&observation.epoch)?;
+        observation.dispatch.core.require_runtime(&self.runtime)?;
+        self.require_phase_a_live_dispatch_tail(&observation.dispatch)?;
+        self.validate_phase_a_live_post_dispatch_set(
+            &mut observation.barrier,
+            &mut observation.authorization,
+        )?;
+        let result =
+            self.record_place_result_inner(observation.dispatch, outcome, observed_order_id)?;
+        self.complete_phase_a_live_epoch(&observation.epoch)?;
+        Ok((
+            PmDurablePhaseAPlaceLiveResultAckV1 { result },
+            observation.authorization,
+        ))
+    }
+
+    fn record_place_result_inner(
         &mut self,
         dispatch: PmDurablePlaceDispatchAckV1,
         outcome: PmPlaceResultKindV1,
@@ -620,6 +1130,42 @@ impl PmControlledTrialLiveJournals {
         ),
         PmTrialLiveJournalError,
     > {
+        if self.phase_a_live_dispatch_epoch.is_some() {
+            return Err(PmTrialLiveJournalError::InvalidTransition);
+        }
+        self.record_place_outcome_bridge_inner(result)
+    }
+
+    pub fn record_phase_a_place_live_outcome_bridge(
+        &mut self,
+        result: PmDurablePhaseAPlaceLiveResultAckV1,
+    ) -> Result<
+        (
+            PmPhaseAPlaceLiveOutcomeBridgeAckV1,
+            Option<PmPhaseAPlaceLiveOwnedVenueOrderV1>,
+        ),
+        PmTrialLiveJournalError,
+    > {
+        if self.phase_a_live_dispatch_epoch.is_some() {
+            return Err(PmTrialLiveJournalError::InvalidTransition);
+        }
+        let (bridge, owned) = self.record_place_outcome_bridge_inner(result.result)?;
+        Ok((
+            PmPhaseAPlaceLiveOutcomeBridgeAckV1 { bridge },
+            owned.map(|owned| PmPhaseAPlaceLiveOwnedVenueOrderV1 { owned }),
+        ))
+    }
+
+    fn record_place_outcome_bridge_inner(
+        &mut self,
+        result: PmDurablePlaceResultAckV1,
+    ) -> Result<
+        (
+            PmDurablePlaceOutcomeBridgeAckV1,
+            Option<PmJournalOwnedVenueOrderV1>,
+        ),
+        PmTrialLiveJournalError,
+    > {
         result.core.require_runtime(&self.runtime)?;
         let dispatch = result.core.link();
         let outcome = result.outcome;
@@ -638,7 +1184,91 @@ impl PmControlledTrialLiveJournals {
             }
             _ => None,
         };
-        Ok((PmDurablePlaceOutcomeBridgeAckV1 { core, dispatch }, owned))
+        Ok((
+            PmDurablePlaceOutcomeBridgeAckV1 {
+                core,
+                dispatch,
+                outcome,
+            },
+            owned,
+        ))
+    }
+
+    fn require_phase_a_live_epoch(
+        &self,
+        candidate: &Arc<PmPhaseALiveDispatchEpoch>,
+    ) -> Result<(), PmTrialLiveJournalError> {
+        match &self.phase_a_live_dispatch_epoch {
+            Some(active)
+                if Arc::ptr_eq(active, candidate)
+                    && Arc::strong_count(active) == 2
+                    && Arc::strong_count(candidate) == 2 =>
+            {
+                Ok(())
+            }
+            _ => Err(PmTrialLiveJournalError::ForeignAcknowledgement),
+        }
+    }
+
+    fn require_phase_a_live_dispatch_tail(
+        &self,
+        dispatch: &PmDurablePlaceDispatchAckV1,
+    ) -> Result<(), PmTrialLiveJournalError> {
+        let line = self
+            .dispatch
+            .lines
+            .last()
+            .ok_or(PmTrialLiveJournalError::InvalidTransition)?;
+        if line.sequence != dispatch.core.sequence
+            || dispatch_fingerprint(line)? != dispatch.core.record_fingerprint
+            || !matches!(line.body, DispatchRecordV1::PlaceDispatchAuthorized { .. })
+        {
+            return Err(PmTrialLiveJournalError::InvalidTransition);
+        }
+        Ok(())
+    }
+
+    fn validate_phase_a_live_journal_files(&mut self) -> Result<(), PmTrialLiveJournalError> {
+        self.intent.file.validate_exact_bytes(&self.intent.bytes)?;
+        self.dispatch
+            .file
+            .validate_exact_bytes(&self.dispatch.bytes)?;
+        self.artifact_lease.validate()
+    }
+
+    fn validate_phase_a_live_durable_set(
+        &mut self,
+        grant: &mut PmRevalidatedPhaseAPlaceDispatchGrantV1,
+        authorization: &mut ConsumedAuthorizationConsumption,
+    ) -> Result<(), PmTrialLiveJournalError> {
+        self.validate_phase_a_live_journal_files()?;
+        authorization
+            .revalidate_held_consumption_evidence()
+            .map_err(|_| PmTrialLiveJournalError::Protection)?;
+        grant.validate_held_barrier()?;
+        self.artifact_lease.validate()
+    }
+
+    fn validate_phase_a_live_post_dispatch_set(
+        &mut self,
+        barrier: &mut PmPhaseAPlaceDispatchBarrierWitnessV1,
+        authorization: &mut ConsumedAuthorizationConsumption,
+    ) -> Result<(), PmTrialLiveJournalError> {
+        self.validate_phase_a_live_journal_files()?;
+        authorization
+            .revalidate_held_consumption_evidence()
+            .map_err(|_| PmTrialLiveJournalError::Protection)?;
+        barrier.validate_held_barrier()?;
+        self.artifact_lease.validate()
+    }
+
+    fn complete_phase_a_live_epoch(
+        &mut self,
+        candidate: &Arc<PmPhaseALiveDispatchEpoch>,
+    ) -> Result<(), PmTrialLiveJournalError> {
+        self.require_phase_a_live_epoch(candidate)?;
+        self.phase_a_live_dispatch_epoch = None;
+        Ok(())
     }
 
     fn append_intent(
@@ -713,6 +1343,24 @@ impl PmControlledTrialLiveJournals {
 }
 
 impl PmControlledTrialLiveJournals {
+    /// Positive live-cancel custody seam. Legacy V1 owned-order evidence cannot
+    /// enter this method.
+    pub fn record_phase_a_live_primary_cancel_intent(
+        &mut self,
+        place_bridge: PmPhaseAPlaceLiveOutcomeBridgeAckV1,
+        owned: PmPhaseAPlaceLiveOwnedVenueOrderV1,
+        created_at_utc: String,
+    ) -> Result<PmDurablePhaseALiveCancelIntentAckV1, PmTrialLiveJournalError> {
+        place_bridge.bridge.core.require_runtime(&self.runtime)?;
+        let intent = self.record_cancel_intent_inner(
+            place_bridge.bridge.core,
+            owned.owned,
+            PmCancelDispatchClassV1::Primary,
+            created_at_utc,
+        )?;
+        Ok(PmDurablePhaseALiveCancelIntentAckV1 { intent })
+    }
+
     pub fn record_primary_cancel_intent(
         &mut self,
         place_bridge: PmDurablePlaceOutcomeBridgeAckV1,
@@ -806,6 +1454,16 @@ impl PmControlledTrialLiveJournals {
         })
     }
 
+    /// Preserve positive place/custody provenance through cancel preparation.
+    pub fn record_phase_a_live_cancel_prepared(
+        &mut self,
+        intent: PmDurablePhaseALiveCancelIntentAckV1,
+        preparation: PmCancelPreparationV1,
+    ) -> Result<PmDurablePhaseALiveCancelPreparedAckV1, PmTrialLiveJournalError> {
+        let prepared = self.record_cancel_prepared(intent.intent, preparation)?;
+        Ok(PmDurablePhaseALiveCancelPreparedAckV1 { prepared })
+    }
+
     pub fn record_cancel_dispatch_authorized(
         &mut self,
         prepared: PmDurableCancelPreparedAckV1,
@@ -833,6 +1491,16 @@ impl PmControlledTrialLiveJournals {
             exact_venue_order_id: prepared.exact_venue_order_id,
             preparation,
         })
+    }
+
+    /// Preserve positive place/custody provenance through the final durable
+    /// cancel-dispatch evidence consumed by a future live cancel join.
+    pub fn record_phase_a_live_cancel_dispatch_authorized(
+        &mut self,
+        prepared: PmDurablePhaseALiveCancelPreparedAckV1,
+    ) -> Result<PmDurablePhaseALiveCancelDispatchAckV1, PmTrialLiveJournalError> {
+        let dispatch = self.record_cancel_dispatch_authorized(prepared.prepared)?;
+        Ok(PmDurablePhaseALiveCancelDispatchAckV1 { dispatch })
     }
 
     pub fn record_cancel_result(
@@ -874,6 +1542,38 @@ impl PmControlledTrialLiveJournals {
         Ok(PmDurableCancelOutcomeBridgeAckV1 { core, dispatch })
     }
 
+    pub fn record_phase_a_place_live_reconciliation(
+        &mut self,
+        place_bridge: PmPhaseAPlaceLiveOutcomeBridgeAckV1,
+        observed_at_utc: String,
+        state: PmReconciliationOrderStateV1,
+        exact_venue_order_id: Option<String>,
+    ) -> Result<
+        (
+            PmDurableReconciliationAckV1,
+            Option<PmPhaseAPlaceLiveOwnedVenueOrderV1>,
+        ),
+        PmTrialLiveJournalError,
+    > {
+        if self.phase_a_live_dispatch_epoch.is_some() {
+            return Err(PmTrialLiveJournalError::InvalidTransition);
+        }
+        place_bridge.bridge.core.require_runtime(&self.runtime)?;
+        if place_bridge.bridge.outcome == PmPlaceResultKindV1::DefinitelyNotDispatched {
+            return Err(PmTrialLiveJournalError::InvalidTransition);
+        }
+        let (ack, owned) = self.record_reconciliation_inner(
+            place_bridge.bridge.dispatch,
+            observed_at_utc,
+            state,
+            exact_venue_order_id,
+        )?;
+        Ok((
+            ack,
+            owned.map(|owned| PmPhaseAPlaceLiveOwnedVenueOrderV1 { owned }),
+        ))
+    }
+
     pub fn record_place_reconciliation(
         &mut self,
         place_bridge: PmDurablePlaceOutcomeBridgeAckV1,
@@ -887,7 +1587,13 @@ impl PmControlledTrialLiveJournals {
         ),
         PmTrialLiveJournalError,
     > {
+        if self.phase_a_live_dispatch_epoch.is_some() {
+            return Err(PmTrialLiveJournalError::InvalidTransition);
+        }
         place_bridge.core.require_runtime(&self.runtime)?;
+        if place_bridge.outcome == PmPlaceResultKindV1::DefinitelyNotDispatched {
+            return Err(PmTrialLiveJournalError::InvalidTransition);
+        }
         self.record_reconciliation_inner(
             place_bridge.dispatch,
             observed_at_utc,
@@ -909,6 +1615,9 @@ impl PmControlledTrialLiveJournals {
         ),
         PmTrialLiveJournalError,
     > {
+        if self.phase_a_live_dispatch_epoch.is_some() {
+            return Err(PmTrialLiveJournalError::InvalidTransition);
+        }
         cancel_bridge.core.require_runtime(&self.runtime)?;
         self.record_reconciliation_inner(
             cancel_bridge.dispatch,
@@ -956,6 +1665,17 @@ impl PmControlledTrialLiveJournals {
         terminal_at_utc: String,
         disposition: PmIntentTerminalDispositionV1,
     ) -> Result<PmDurableIntentTerminalAckV1, PmTrialLiveJournalError> {
+        let place_dispatch_recorded = self
+            .dispatch
+            .lines
+            .iter()
+            .any(|line| matches!(&line.body, DispatchRecordV1::PlaceDispatchAuthorized { .. }));
+        if self.phase_a_live_dispatch_epoch.is_some()
+            || (place_dispatch_recorded
+                && !phase_a_live_terminal_is_safe(&self.intent.lines, &self.dispatch.lines))
+        {
+            return Err(PmTrialLiveJournalError::InvalidTransition);
+        }
         validate_utc(&terminal_at_utc)?;
         if self.intent.lines.len() <= 1
             || self.dispatch.lines.len() <= 1
@@ -996,6 +1716,46 @@ impl PmControlledTrialLiveJournals {
             record_fingerprint: intent_fingerprint(line)?,
         })
     }
+}
+
+fn phase_a_live_terminal_is_safe(intent: &[IntentLineV1], dispatch: &[DispatchLineV1]) -> bool {
+    if dispatch.iter().rev().any(|line| {
+        matches!(
+            &line.body,
+            DispatchRecordV1::PlaceResult {
+                outcome: PmPlaceResultKindV1::DefinitelyNotDispatched,
+                ..
+            }
+        )
+    }) {
+        return true;
+    }
+    let Some((state, target_sequence)) = intent.iter().rev().find_map(|line| match &line.body {
+        IntentRecordV1::Reconciliation {
+            state, dispatch, ..
+        } => Some((*state, dispatch.sequence)),
+        _ => None,
+    }) else {
+        return false;
+    };
+    let Some(latest_exposure_sequence) = dispatch.iter().rev().find_map(|line| {
+        matches!(
+            &line.body,
+            DispatchRecordV1::PlaceDispatchAuthorized { .. }
+                | DispatchRecordV1::PlaceResult { .. }
+                | DispatchRecordV1::CancelDispatchAuthorized { .. }
+                | DispatchRecordV1::CancelResult { .. }
+        )
+        .then_some(line.sequence)
+    }) else {
+        return false;
+    };
+    matches!(
+        state,
+        PmReconciliationOrderStateV1::Absent
+            | PmReconciliationOrderStateV1::ExactCanceled
+            | PmReconciliationOrderStateV1::ExactFilled
+    ) && target_sequence >= latest_exposure_sequence
 }
 
 fn validate_cancel_class(
@@ -1106,6 +1866,7 @@ pub(crate) fn build_scope(
     ];
     if consumption_files.contains(&PM_TRIAL_LIVE_INTENT_FILE_V1)
         || consumption_files.contains(&PM_TRIAL_LIVE_DISPATCH_FILE_V1)
+        || consumption_files.contains(&PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1)
     {
         return Err(PmTrialLiveJournalError::InvalidBinding);
     }
@@ -1336,6 +2097,7 @@ fn validate_place_result(
         PmPlaceResultKindV1::Rejected
         | PmPlaceResultKindV1::OutOfProfile
         | PmPlaceResultKindV1::AcknowledgementUnknown
+        | PmPlaceResultKindV1::DefinitelyNotDispatched
             if observed_order_id.is_some() =>
         {
             return Err(PmTrialLiveJournalError::InvalidTransition);
@@ -1423,6 +2185,8 @@ impl PmControlledTrialLiveRecoveryJournals {
             preflight,
             place_identity: config.exact_place_public_request_identity(),
             runtime: Arc::new(RuntimeIdentity),
+            phase_a_live_dispatch_context: None,
+            phase_a_live_dispatch_epoch: None,
             artifact_lease,
             intent: IntentWriter {
                 file: intent_file,
@@ -1480,6 +2244,49 @@ impl PmControlledTrialLiveRecoveryJournals {
         Ok(result)
     }
 
+    /// Positive-barrier recovery reconciliation. Only this seam can mint the
+    /// live-owned order required by future production recovery cancel.
+    pub fn record_phase_a_live_reconciliation(
+        &mut self,
+        observed_at_utc: String,
+        state: PmReconciliationOrderStateV1,
+        exact_venue_order_id: Option<String>,
+    ) -> Result<
+        (
+            PmDurableReconciliationAckV1,
+            Option<PmPhaseAPlaceLiveOwnedVenueOrderV1>,
+        ),
+        PmTrialLiveJournalError,
+    > {
+        if !self.initial_reconciliation_available
+            || self
+                .projection
+                .phase_a_live_dispatch_barrier_fingerprint
+                .is_none()
+        {
+            return Err(PmTrialLiveJournalError::RecoveryOperationForbidden);
+        }
+        if let PmTrialLiveRecoveryClassificationV1::RecoveryCancelOnly {
+            exact_venue_order_id: expected,
+        } = &self.projection.classification
+            && (state != PmReconciliationOrderStateV1::ExactLive
+                || exact_venue_order_id.as_deref() != Some(expected))
+        {
+            return Err(PmTrialLiveJournalError::InvalidBinding);
+        }
+        let (ack, owned) = self.inner.record_reconciliation_inner(
+            self.projection.reconciliation_target.clone(),
+            observed_at_utc,
+            state,
+            exact_venue_order_id,
+        )?;
+        self.initial_reconciliation_available = false;
+        Ok((
+            ack,
+            owned.map(|owned| PmPhaseAPlaceLiveOwnedVenueOrderV1 { owned }),
+        ))
+    }
+
     pub fn record_recovery_cancel_intent(
         &mut self,
         reconciliation: PmDurableReconciliationAckV1,
@@ -1491,6 +2298,22 @@ impl PmControlledTrialLiveRecoveryJournals {
             .record_recovery_cancel_intent(reconciliation, owned, ordinal, created_at_utc)
     }
 
+    pub fn record_phase_a_live_recovery_cancel_intent(
+        &mut self,
+        reconciliation: PmDurableReconciliationAckV1,
+        owned: PmPhaseAPlaceLiveOwnedVenueOrderV1,
+        created_at_utc: String,
+    ) -> Result<PmDurablePhaseALiveCancelIntentAckV1, PmTrialLiveJournalError> {
+        let ordinal = next_recovery_ordinal(&self.inner.dispatch.lines)?;
+        let intent = self.inner.record_recovery_cancel_intent(
+            reconciliation,
+            owned.owned,
+            ordinal,
+            created_at_utc,
+        )?;
+        Ok(PmDurablePhaseALiveCancelIntentAckV1 { intent })
+    }
+
     pub fn record_cancel_prepared(
         &mut self,
         intent: PmDurableCancelIntentAckV1,
@@ -1499,11 +2322,28 @@ impl PmControlledTrialLiveRecoveryJournals {
         self.inner.record_cancel_prepared(intent, preparation)
     }
 
+    pub fn record_phase_a_live_cancel_prepared(
+        &mut self,
+        intent: PmDurablePhaseALiveCancelIntentAckV1,
+        preparation: PmCancelPreparationV1,
+    ) -> Result<PmDurablePhaseALiveCancelPreparedAckV1, PmTrialLiveJournalError> {
+        self.inner
+            .record_phase_a_live_cancel_prepared(intent, preparation)
+    }
+
     pub fn record_cancel_dispatch_authorized(
         &mut self,
         prepared: PmDurableCancelPreparedAckV1,
     ) -> Result<PmDurableCancelDispatchAckV1, PmTrialLiveJournalError> {
         self.inner.record_cancel_dispatch_authorized(prepared)
+    }
+
+    pub fn record_phase_a_live_cancel_dispatch_authorized(
+        &mut self,
+        prepared: PmDurablePhaseALiveCancelPreparedAckV1,
+    ) -> Result<PmDurablePhaseALiveCancelDispatchAckV1, PmTrialLiveJournalError> {
+        self.inner
+            .record_phase_a_live_cancel_dispatch_authorized(prepared)
     }
 
     pub fn record_cancel_result(

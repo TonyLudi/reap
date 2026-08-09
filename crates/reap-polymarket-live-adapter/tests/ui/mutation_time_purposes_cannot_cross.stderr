@@ -1,0 +1,27 @@
+error[E0308]: mismatched types
+  --> tests/ui/mutation_time_purposes_cannot_cross.rs:33:36
+   |
+33 |     let _ = finalizer.consume_with(proof, &mut PlaceProvider);
+   |                       ------------ ^^^^^ expected `PmPlaceMutationTimeProof`, found `PmCancelMutationTimeProof`
+   |                       |
+   |                       arguments to this method are incorrect
+   |
+note: method defined here
+  --> src/product_clock.rs
+   |
+   |     pub fn consume_with(
+   |            ^^^^^^^^^^^^
+
+error[E0308]: mismatched types
+  --> tests/ui/mutation_time_purposes_cannot_cross.rs:40:36
+   |
+40 |     let _ = finalizer.consume_with(proof, &mut CancelProvider);
+   |                       ------------ ^^^^^ expected `PmCancelMutationTimeProof`, found `PmPlaceMutationTimeProof`
+   |                       |
+   |                       arguments to this method are incorrect
+   |
+note: method defined here
+  --> src/product_clock.rs
+   |
+   |     pub fn consume_with(
+   |            ^^^^^^^^^^^^

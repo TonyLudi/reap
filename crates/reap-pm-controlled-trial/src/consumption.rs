@@ -158,6 +158,8 @@ impl PreparedAuthorizationConsumption {
 pub struct ConsumedAuthorizationConsumption {
     journal: DurableCreateNewFile,
     ledger_bytes: Vec<u8>,
+    claim: DurableCreateNewFile,
+    claim_bytes: Vec<u8>,
     consumed_record: AuthorizationConsumptionEvidence,
     binding: AuthorizationConsumptionBindingEvidence,
     consumed_at_utc: String,
@@ -169,11 +171,45 @@ impl ConsumedAuthorizationConsumption {
         &self.consumed_record
     }
 
+    /// Revalidate the held fixed ledger and atomic-claim descriptors, their
+    /// recoverable path identities, lengths, and exact durable bytes. This is
+    /// evidence custody only and does not grant dispatch authority.
+    pub fn revalidate_held_consumption_evidence(
+        &mut self,
+    ) -> Result<(), PmAuthorizationConsumptionError> {
+        self.claim
+            .validate_exact_bytes(&self.claim_bytes)
+            .and_then(|()| self.journal.validate_exact_bytes(&self.ledger_bytes))
+            .map_err(|_| {
+                PmAuthorizationConsumptionError::Ambiguous(
+                    "held authorization-consumption ledger or claim changed",
+                )
+            })
+    }
+
+    /// Refresh both held parent-directory snapshots after the caller durably
+    /// creates one separately bound artifact, then immediately revalidate the
+    /// fixed ledger and claim identities and bytes.
+    pub fn refresh_after_bound_artifact_create(
+        &mut self,
+    ) -> Result<(), PmAuthorizationConsumptionError> {
+        self.claim
+            .refresh_parent_after_bound_create()
+            .and_then(|()| self.journal.refresh_parent_after_bound_create())
+            .map_err(|_| {
+                PmAuthorizationConsumptionError::Ambiguous(
+                    "authorization-consumption parent changed after bound artifact creation",
+                )
+            })?;
+        self.revalidate_held_consumption_evidence()
+    }
+
     pub fn terminal(
         mut self,
         terminal_at_utc: String,
         disposition: TerminalDisposition,
     ) -> Result<TerminalAuthorizationConsumption, PmAuthorizationConsumptionError> {
+        self.revalidate_held_consumption_evidence()?;
         let consumed_at = parse_canonical_utc(&self.consumed_at_utc)?;
         let terminal_at = parse_canonical_utc(&terminal_at_utc)?;
         if terminal_at < consumed_at {
@@ -438,6 +474,8 @@ fn consume_prepared(
     Ok(ConsumedAuthorizationConsumption {
         journal: prepared.journal,
         ledger_bytes: prepared.ledger_bytes,
+        claim: claim_file,
+        claim_bytes,
         consumed_record: record,
         binding,
         consumed_at_utc: runtime.observed_at_utc.clone(),

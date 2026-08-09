@@ -269,13 +269,17 @@ fn server_time_and_type_one_account_observations_are_sealed_and_source_clocked()
     let source = [PUBLIC_HTTP, PRIVATE_HTTP, ACCOUNT].join("\n");
     for required in [
         "pub struct PmReadServerTimeObservation",
-        "pub struct PmMutationServerTimeObservation",
+        "pub struct PmPlaceServerTimeObservation",
+        "pub struct PmCancelServerTimeObservation",
         "pub async fn fresh_read_server_time_observation(",
-        "pub async fn fresh_mutation_server_time_observation(",
+        "pub async fn fresh_place_time_observation(",
+        "pub async fn fresh_cancel_time_observation(",
         "pub fn into_read_server_time(self) -> PmReadServerTime",
-        "pub fn into_pending_mutation_server_time(self) -> PmPendingMutationServerTime",
+        "pub fn into_proof(self) -> PmPlaceMutationTimeProof",
+        "pub fn into_proof(self) -> PmCancelMutationTimeProof",
         "READ_SERVER_TIME_OBSERVATION_COMMITMENT_DOMAIN",
-        "MUTATION_SERVER_TIME_OBSERVATION_COMMITMENT_DOMAIN",
+        "PLACE_SERVER_TIME_OBSERVATION_COMMITMENT_DOMAIN",
+        "CANCEL_SERVER_TIME_OBSERVATION_COMMITMENT_DOMAIN",
         "encode_server_time_bytes(&mut digest, &fetched.raw_response);",
         "fetched.parsed_l2_timestamp.unix_seconds()",
         "fetched.receive_clock.local_wall_receive_ns()",
@@ -831,13 +835,25 @@ fn authenticated_public_bundle_owns_one_clock_domain_and_no_default_clock_escape
     for required in [
         "pub struct PmProductClockOwner",
         "Arc<ProductClockDomain>",
-        "Arc::ptr_eq(&self.domain, &pending.domain)",
+        "Arc::ptr_eq(expected, &proof.authority)",
+        "Arc::ptr_eq(&expected.domain, &proof.authority.domain)",
         "PM_MUTATION_SERVER_TIME_MAX_AGE",
-        "pub struct PmPendingMutationServerTime",
-        "pub struct PmAuthorizedMutationServerTime",
+        "pub struct PmPlaceMutationTimeProof",
+        "pub struct PmCancelMutationTimeProof",
+        "pub struct PmPlaceMutationTimeFinalizer",
+        "pub struct PmCancelMutationTimeFinalizer",
+        "pub enum PmPlaceMutationAuthenticationError",
+        "pub enum PmCancelMutationAuthenticationError",
+        "pub struct PmFinalPlaceMutationTime<'proof>",
+        "pub struct PmFinalCancelMutationTime<'proof>",
+        "pub trait PmPlaceMutationTimeProvider",
+        "pub trait PmCancelMutationTimeProvider",
         "pub struct PmReadServerTime",
         "validate_age(&domain, received)?",
+        "validate_age(&expected.domain, proof.received)",
         "pub struct PmPublicConnectivityOwner",
+        "place_mutation_time: PmPlaceMutationTimeOwner",
+        "cancel_mutation_time: PmCancelMutationTimeOwner",
         "PmPublicHttpRole::with_product_clock(",
         "PmPublicMarketWsRole::with_clock_source(public_ws_config, public_ws_clock)",
     ] {
@@ -851,6 +867,8 @@ fn authenticated_public_bundle_owns_one_clock_domain_and_no_default_clock_escape
         "Arc<Mutex",
         "pub fn into_l2_timestamp",
         "pub const fn into_l2_timestamp",
+        "pub fn l2_timestamp",
+        "pub const fn l2_timestamp",
         "pub fn timestamp(",
         "pub fn server_time_seconds",
     ] {
@@ -858,6 +876,177 @@ fn authenticated_public_bundle_owns_one_clock_domain_and_no_default_clock_escape
         assert!(
             !source.contains(forbidden),
             "raw clock/time capability escape: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn production_mutation_time_is_purpose_closed_and_legacy_is_feature_gated() {
+    for required in [
+        "pub struct PmPlaceMutationTimeOwner",
+        "pub struct PmCancelMutationTimeOwner",
+        "pub struct PmPlaceServerTimeHttpRole",
+        "pub struct PmCancelServerTimeHttpRole",
+        "pub const fn observed_l2_timestamp_seconds(&self) -> u64",
+        "MutationTimePurpose::Place",
+        "MutationTimePurpose::Cancel",
+        "provider.consume_final_place_time(PmFinalPlaceMutationTime { core: &proof.core })",
+        "provider.consume_final_cancel_time(PmFinalCancelMutationTime { core: &proof.core })",
+        "#[cfg(any(test, feature = \"loopback-evidence\"))]",
+        "Purpose-erased proof retained only for literal-loopback compatibility.",
+    ] {
+        let source = [PRODUCT_CLOCK, PUBLIC_HTTP, PUBLIC_CONNECTIVITY, LIB].join("\n");
+        assert!(
+            source.contains(required),
+            "missing purpose-closed mutation-time invariant: {required}"
+        );
+    }
+
+    let place_observation = PUBLIC_HTTP
+        .split("pub struct PmPlaceServerTimeObservation {")
+        .nth(1)
+        .unwrap()
+        .split("pub struct PmCancelServerTimeObservation {")
+        .next()
+        .unwrap();
+    let cancel_observation = PUBLIC_HTTP
+        .split("pub struct PmCancelServerTimeObservation {")
+        .nth(1)
+        .unwrap()
+        .split("struct FetchedServerTime")
+        .next()
+        .unwrap();
+    for carrier in [place_observation, cancel_observation] {
+        for forbidden in [
+            "parsed_l2_timestamp",
+            "pub fn timestamp",
+            "pub const fn timestamp",
+            "pub fn l2_timestamp",
+            "pub const fn l2_timestamp",
+        ] {
+            assert!(
+                !carrier.contains(forbidden),
+                "production mutation-time observation exposes raw time: {forbidden}"
+            );
+        }
+    }
+
+    assert!(!PUBLIC_CONNECTIVITY.contains("PmMutationServerTimeHttpRole"));
+    assert!(!PUBLIC_CONNECTIVITY.contains("PmMutationServerTimeValidator"));
+}
+
+#[test]
+fn place_hmac_bridge_uses_hidden_source_time_and_rechecks_at_the_auth_boundary() {
+    let bridge = PRODUCT_CLOCK
+        .split("pub fn authenticate_exact_place(")
+        .nth(1)
+        .unwrap()
+        .split("pub fn consume_with(")
+        .next()
+        .unwrap();
+    for required in [
+        "proof: PmPlaceMutationTimeProof",
+        "expected_seconds: u64",
+        "credentials: &L2Credentials",
+        "request: SerializedPlaceRequest",
+        "Result<AuthenticatedPlaceRequest, PmPlaceMutationAuthenticationError>",
+        "validate_final_mutation_time(&self.authority, &proof.core, MutationTimePurpose::Place)?",
+        "proof.core.timestamp.unix_seconds() != expected_seconds",
+        "PmPlaceMutationAuthenticationError::ObservedTimestampMismatch",
+        "PmFinalPlaceMutationTime { core: &proof.core }.consume_l2_timestamp()?",
+        "credentials.authenticate_place(timestamp, request)",
+    ] {
+        assert!(
+            bridge.contains(required),
+            "missing exact place-HMAC bridge invariant: {required}"
+        );
+    }
+    for forbidden in [
+        "L2Timestamp::from_unix_seconds(expected_seconds)",
+        "pub fn timestamp",
+        "pub fn l2_timestamp",
+        "pub fn credentials",
+        "pub fn request",
+    ] {
+        assert!(
+            !bridge.contains(forbidden),
+            "place-HMAC bridge exposes or reconstructs authority: {forbidden}"
+        );
+    }
+
+    let observation = PUBLIC_HTTP
+        .split("impl PmPlaceServerTimeObservation {")
+        .nth(1)
+        .unwrap()
+        .split("impl std::fmt::Debug for PmPlaceServerTimeObservation")
+        .next()
+        .unwrap();
+    for required in [
+        "pub const fn observed_l2_timestamp_seconds(&self) -> u64",
+        "self.proof.observed_l2_timestamp_seconds()",
+        "This value grants no authentication authority.",
+    ] {
+        assert!(
+            observation.contains(required),
+            "missing evidence-only source timestamp invariant: {required}"
+        );
+    }
+}
+
+#[test]
+fn cancel_hmac_bridge_uses_hidden_source_time_and_rechecks_at_the_auth_boundary() {
+    let bridge = PRODUCT_CLOCK
+        .split("pub fn authenticate_exact_owned_cancel(")
+        .nth(1)
+        .unwrap()
+        .split("pub fn consume_with(")
+        .next()
+        .unwrap();
+    for required in [
+        "proof: PmCancelMutationTimeProof",
+        "expected_seconds: u64",
+        "credentials: &L2Credentials",
+        "request: SerializedOwnedCancelRequest",
+        "Result<AuthenticatedOwnedCancelRequest, PmCancelMutationAuthenticationError>",
+        "validate_final_mutation_time(&self.authority, &proof.core, MutationTimePurpose::Cancel)?",
+        "proof.core.timestamp.unix_seconds() != expected_seconds",
+        "PmCancelMutationAuthenticationError::ObservedTimestampMismatch",
+        "PmFinalCancelMutationTime { core: &proof.core }.consume_l2_timestamp()?",
+        "credentials.authenticate_owned_cancel(timestamp, request)",
+    ] {
+        assert!(
+            bridge.contains(required),
+            "missing exact-owned cancel-HMAC bridge invariant: {required}"
+        );
+    }
+    for forbidden in [
+        "L2Timestamp::from_unix_seconds(expected_seconds)",
+        "pub fn timestamp",
+        "pub fn l2_timestamp",
+        "pub fn credentials",
+        "pub fn request",
+    ] {
+        assert!(
+            !bridge.contains(forbidden),
+            "cancel-HMAC bridge exposes or reconstructs authority: {forbidden}"
+        );
+    }
+
+    let observation = PUBLIC_HTTP
+        .split("impl PmCancelServerTimeObservation {")
+        .nth(1)
+        .unwrap()
+        .split("impl std::fmt::Debug for PmCancelServerTimeObservation")
+        .next()
+        .unwrap();
+    for required in [
+        "pub const fn observed_l2_timestamp_seconds(&self) -> u64",
+        "self.proof.observed_l2_timestamp_seconds()",
+        "This value grants no authentication authority.",
+    ] {
+        assert!(
+            observation.contains(required),
+            "missing evidence-only cancel timestamp invariant: {required}"
         );
     }
 }

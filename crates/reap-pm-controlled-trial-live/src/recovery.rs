@@ -10,6 +10,10 @@ use crate::{
     PmTrialLiveJournalError,
     hash::{ZERO_FINGERPRINT, canonical_json, hash_domain, validate_fingerprint},
     journal::{bound_paths, build_scope},
+    live_dispatch::{
+        live_dispatch_barrier_fingerprint, load_phase_a_live_dispatch_barrier,
+        validate_recovered_phase_a_live_dispatch_barrier,
+    },
     protected::read_protected,
     schema::{
         CounterpartLinkV1, DispatchLineV1, DispatchRecordV1, IntentLineV1, IntentRecordV1,
@@ -40,9 +44,9 @@ pub enum PmTrialLiveRecoveryClassificationV1 {
     TerminalEvidenceOnly,
 }
 
-/// Move-only, secret-free projection of two exact journal snapshots and the
-/// separately bound take-once consumption state. It is evidence, not a place
-/// retry permit or network-send grant.
+/// Move-only, secret-free projection of two exact V1 journal snapshots, the
+/// optional separate positive Phase-A barrier, and the bound take-once
+/// consumption state. It is evidence, never a place retry permit.
 pub struct PmTrialLiveRecoveryProjectionV1 {
     pub(crate) classification: PmTrialLiveRecoveryClassificationV1,
     pub(crate) scope: PmTrialLiveJournalScopeV1,
@@ -51,6 +55,7 @@ pub struct PmTrialLiveRecoveryProjectionV1 {
     pub(crate) dispatch_bytes: Vec<u8>,
     pub(crate) intent_lines: Vec<IntentLineV1>,
     pub(crate) dispatch_lines: Vec<DispatchLineV1>,
+    pub(crate) phase_a_live_dispatch_barrier_fingerprint: Option<String>,
     pub(crate) consumption: ConsumptionSnapshot,
     pub(crate) reconciliation_target: CounterpartLinkV1,
 }
@@ -93,6 +98,16 @@ impl PmTrialLiveRecoveryProjectionV1 {
     }
 
     #[must_use]
+    pub const fn phase_a_live_dispatch_barrier_durable(&self) -> bool {
+        self.phase_a_live_dispatch_barrier_fingerprint.is_some()
+    }
+
+    #[must_use]
+    pub fn phase_a_live_dispatch_barrier_fingerprint(&self) -> Option<&str> {
+        self.phase_a_live_dispatch_barrier_fingerprint.as_deref()
+    }
+
+    #[must_use]
     pub const fn production_order_entry_authorized(&self) -> bool {
         false
     }
@@ -121,6 +136,10 @@ impl std::fmt::Debug for PmTrialLiveRecoveryProjectionV1 {
             .field("scope_fingerprint", &self.scope.scope_fingerprint)
             .field("intent_record_count", &self.intent_lines.len())
             .field("dispatch_record_count", &self.dispatch_lines.len())
+            .field(
+                "phase_a_live_dispatch_barrier_durable",
+                &self.phase_a_live_dispatch_barrier_durable(),
+            )
             .field("production_order_entry_authorized", &false)
             .field("real_order_submission_authorized", &false)
             .field("place_dispatch_allowance", &0_u8)
@@ -150,12 +169,16 @@ pub fn verify_controlled_trial_live_recovery(
     config: &CanonicalTrialConfig,
     authorization: &CanonicalAuthorization,
 ) -> Result<PmTrialLiveRecoveryProjectionV1, PmTrialLiveJournalError> {
+    let live_dispatch_barrier = load_phase_a_live_dispatch_barrier(config)?;
     let (intent_path, dispatch_path) = bound_paths(config);
     let intent_bytes = read_protected(&intent_path, MAX_JOURNAL_BYTES)?;
     let intent_lines = parse_intent(&intent_bytes)?;
     let dispatch_bytes = match read_protected(&dispatch_path, MAX_JOURNAL_BYTES) {
         Ok(bytes) => bytes,
         Err(PmTrialLiveJournalError::Absent) => {
+            if live_dispatch_barrier.is_some() {
+                return Err(PmTrialLiveJournalError::InvalidRecord);
+            }
             return verify_intent_header_without_dispatch_records(
                 config,
                 authorization,
@@ -170,6 +193,9 @@ pub fn verify_controlled_trial_live_recovery(
     // header append leaves an exact protected zero-byte dispatch file. Since
     // no preparation can exist at that boundary, it is definitely unsent.
     if dispatch_bytes.is_empty() {
+        if live_dispatch_barrier.is_some() {
+            return Err(PmTrialLiveJournalError::InvalidRecord);
+        }
         return verify_intent_header_without_dispatch_records(
             config,
             authorization,
@@ -183,7 +209,45 @@ pub fn verify_controlled_trial_live_recovery(
     let consumption = load_consumption(config, authorization)?;
     validate_consumption_scope(&scope, &consumption)?;
     let facts = validate_records(&scope, &intent_lines, &dispatch_lines, &consumption)?;
-    let classification = classify(&facts, &consumption);
+    let phase_a_live_dispatch_barrier_fingerprint = live_dispatch_barrier
+        .as_ref()
+        .map(|record| {
+            validate_recovered_phase_a_live_dispatch_barrier(
+                record,
+                config,
+                authorization,
+                &scope,
+                facts
+                    .preflight
+                    .as_ref()
+                    .ok_or(PmTrialLiveJournalError::InvalidRecord)?,
+                &dispatch_lines,
+            )?;
+            Ok(live_dispatch_barrier_fingerprint(record).to_owned())
+        })
+        .transpose()?;
+    if matches!(
+        facts.place_result,
+        Some((PmPlaceResultKindV1::DefinitelyNotDispatched, None))
+    ) && phase_a_live_dispatch_barrier_fingerprint.is_none()
+    {
+        return Err(PmTrialLiveJournalError::InvalidRecord);
+    }
+    if facts.place_dispatch.is_some()
+        && facts.dispatch_terminal
+        && !phase_a_live_terminal_is_safe(&facts)
+    {
+        // Barrier absence cannot distinguish legacy/pre-barrier evidence from
+        // unlink after a possible send. Old writers or hand-authored tails
+        // must never turn unresolved dispatch evidence into
+        // TerminalEvidenceOnly and suppress cleanup.
+        return Err(PmTrialLiveJournalError::InvalidRecord);
+    }
+    let classification = classify(
+        &facts,
+        &consumption,
+        phase_a_live_dispatch_barrier_fingerprint.is_some(),
+    );
     Ok(PmTrialLiveRecoveryProjectionV1 {
         classification,
         scope,
@@ -192,6 +256,7 @@ pub fn verify_controlled_trial_live_recovery(
         dispatch_bytes,
         intent_lines,
         dispatch_lines,
+        phase_a_live_dispatch_barrier_fingerprint,
         consumption,
         reconciliation_target: facts.reconciliation_target,
     })
@@ -251,6 +316,7 @@ fn verify_intent_header_without_dispatch_records(
         dispatch_bytes,
         intent_lines,
         dispatch_lines: Vec::new(),
+        phase_a_live_dispatch_barrier_fingerprint: None,
         consumption,
         reconciliation_target: CounterpartLinkV1 {
             sequence: 0,
@@ -448,6 +514,8 @@ pub(crate) fn revalidate_projection(
         || current.dispatch_bytes != expected.dispatch_bytes
         || current.intent_lines != expected.intent_lines
         || current.dispatch_lines != expected.dispatch_lines
+        || current.phase_a_live_dispatch_barrier_fingerprint
+            != expected.phase_a_live_dispatch_barrier_fingerprint
         || current.consumption != expected.consumption
         || current.reconciliation_target != expected.reconciliation_target
     {
@@ -649,6 +717,10 @@ fn validate_records(
                     &mut latest_cross_dispatch_sequence,
                 )?;
                 match dispatch_body(target, dispatch)? {
+                    DispatchRecordV1::PlaceResult {
+                        outcome: PmPlaceResultKindV1::DefinitelyNotDispatched,
+                        ..
+                    } => return Err(PmTrialLiveJournalError::InvalidRecord),
                     DispatchRecordV1::PlaceDispatchAuthorized { .. }
                     | DispatchRecordV1::PlaceResult { .. }
                     | DispatchRecordV1::CancelDispatchAuthorized { .. }
@@ -1069,6 +1141,7 @@ fn validate_recorded_consumption(
 fn classify(
     facts: &JournalFacts,
     consumption: &ConsumptionSnapshot,
+    phase_a_live_dispatch_barrier_durable: bool,
 ) -> PmTrialLiveRecoveryClassificationV1 {
     if facts.dispatch_terminal {
         return PmTrialLiveRecoveryClassificationV1::TerminalEvidenceOnly;
@@ -1087,6 +1160,21 @@ fn classify(
                 PmTrialLiveRecoveryClassificationV1::PrePreparedDefinitelyUnsent
             }
         };
+    }
+    if facts.place_result.is_none() && !phase_a_live_dispatch_barrier_durable {
+        // The V1 record remains literal false/false/0 evidence, but an absent
+        // positive barrier cannot distinguish "never created" from unlink
+        // after a possible send. Recovery therefore conservatively forbids a
+        // resend and requires reconciliation, including for legacy writers.
+        return PmTrialLiveRecoveryClassificationV1::PlaceMayHaveBeenSentNoResend;
+    }
+    if matches!(
+        facts.place_result,
+        Some((PmPlaceResultKindV1::DefinitelyNotDispatched, None))
+    ) {
+        // The positive grant was consumed by the terminal pre-send path. The
+        // authorization stays burned and placement can never resume.
+        return PmTrialLiveRecoveryClassificationV1::AuthorizationBurnedNoPlace;
     }
     if let Some((state, order_id, target_sequence)) = &facts.latest_reconciliation
         && *target_sequence >= facts.reconciliation_target.sequence
@@ -1119,6 +1207,24 @@ fn classify(
         };
     }
     PmTrialLiveRecoveryClassificationV1::PlaceMayHaveBeenSentNoResend
+}
+
+fn phase_a_live_terminal_is_safe(facts: &JournalFacts) -> bool {
+    if matches!(
+        facts.place_result,
+        Some((PmPlaceResultKindV1::DefinitelyNotDispatched, None))
+    ) {
+        return true;
+    }
+    let Some((state, _, target_sequence)) = &facts.latest_reconciliation else {
+        return false;
+    };
+    matches!(
+        *state,
+        PmReconciliationOrderStateV1::Absent
+            | PmReconciliationOrderStateV1::ExactCanceled
+            | PmReconciliationOrderStateV1::ExactFilled
+    ) && *target_sequence >= facts.reconciliation_target.sequence
 }
 
 fn intent_line<'a>(

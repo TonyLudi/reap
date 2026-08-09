@@ -1517,6 +1517,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "libc",
+ "reap-pm-controlled-trial-live",
  "reap-pm-core",
  "reap-pm-state",
  "reap-polymarket-adapter",

@@ -3,10 +3,10 @@ use std::fmt;
 use reap_polymarket_wire::PmBookParserConfig;
 
 use crate::{
-    PmActorProductClock, PmLiveAdapterError, PmMutationServerTimeHttpRole,
-    PmMutationServerTimeValidator, PmOkxProductClock, PmPrivateReadProductClock,
-    PmProductClockOwner, PmPublicHttpConfig, PmPublicHttpRole, PmPublicMarketWsRole,
-    PmPublicMetadataHttpRole, PmPublicWsConfig, PmReadServerTimeHttpRole, PmUserWsProductClock,
+    PmActorProductClock, PmCancelMutationTimeOwner, PmLiveAdapterError, PmOkxProductClock,
+    PmPlaceMutationTimeOwner, PmPrivateReadProductClock, PmProductClockOwner, PmPublicHttpConfig,
+    PmPublicHttpRole, PmPublicMarketWsRole, PmPublicMetadataHttpRole, PmPublicWsConfig,
+    PmReadServerTimeHttpRole, PmUserWsProductClock,
 };
 
 /// One cold, move-only constructor for all public connectivity and every
@@ -21,13 +21,12 @@ pub struct PmPublicConnectivityOwner {
     book_http: PmPublicHttpRole,
     read_server_time_http: PmReadServerTimeHttpRole,
     private_read_clock: PmPrivateReadProductClock,
-    place_server_time_http: PmMutationServerTimeHttpRole,
-    cancel_server_time_http: PmMutationServerTimeHttpRole,
+    place_mutation_time: PmPlaceMutationTimeOwner,
+    cancel_mutation_time: PmCancelMutationTimeOwner,
     public_ws: PmPublicMarketWsRole,
     user_ws_clock: PmUserWsProductClock,
     actor_clock: PmActorProductClock,
     okx_clock: PmOkxProductClock,
-    mutation_time_validator: PmMutationServerTimeValidator,
 }
 
 impl PmPublicConnectivityOwner {
@@ -49,10 +48,11 @@ impl PmPublicConnectivityOwner {
             read_server_time_clock,
             private_read_clock,
             place_server_time_clock,
+            place_mutation_time_finalizer,
             cancel_server_time_clock,
+            cancel_mutation_time_finalizer,
             actor_clock,
             okx_clock,
-            mutation_time_validator,
         ) = clock_owner.split().into_views();
         let metadata_http =
             PmPublicMetadataHttpRole::new(http_config.clone(), parser_config.scope())?;
@@ -65,13 +65,15 @@ impl PmPublicConnectivityOwner {
             http_config.clone(),
             read_server_time_clock,
         )?;
-        let place_server_time_http = PmMutationServerTimeHttpRole::with_product_clock(
+        let place_mutation_time = PmPlaceMutationTimeOwner::with_product_clock(
             http_config.clone(),
             place_server_time_clock,
+            place_mutation_time_finalizer,
         )?;
-        let cancel_server_time_http = PmMutationServerTimeHttpRole::with_product_clock(
+        let cancel_mutation_time = PmCancelMutationTimeOwner::with_product_clock(
             http_config,
             cancel_server_time_clock,
+            cancel_mutation_time_finalizer,
         )?;
         let public_ws = PmPublicMarketWsRole::with_clock_source(public_ws_config, public_ws_clock)?;
         Ok(Self {
@@ -79,13 +81,12 @@ impl PmPublicConnectivityOwner {
             book_http,
             read_server_time_http,
             private_read_clock,
-            place_server_time_http,
-            cancel_server_time_http,
+            place_mutation_time,
+            cancel_mutation_time,
             public_ws,
             user_ws_clock,
             actor_clock,
             okx_clock,
-            mutation_time_validator,
         })
     }
 
@@ -101,13 +102,12 @@ impl PmPublicConnectivityOwner {
             book_http: self.book_http,
             read_server_time_http: self.read_server_time_http,
             private_read_clock: self.private_read_clock,
-            place_server_time_http: self.place_server_time_http,
-            cancel_server_time_http: self.cancel_server_time_http,
+            place_mutation_time: self.place_mutation_time,
+            cancel_mutation_time: self.cancel_mutation_time,
             public_ws: self.public_ws,
             user_ws_clock: self.user_ws_clock,
             actor_clock: self.actor_clock,
             okx_clock: self.okx_clock,
-            mutation_time_validator: self.mutation_time_validator,
         }
     }
 }
@@ -123,13 +123,12 @@ pub struct PmPublicConnectivityRoles {
     book_http: PmPublicHttpRole,
     read_server_time_http: PmReadServerTimeHttpRole,
     private_read_clock: PmPrivateReadProductClock,
-    place_server_time_http: PmMutationServerTimeHttpRole,
-    cancel_server_time_http: PmMutationServerTimeHttpRole,
+    place_mutation_time: PmPlaceMutationTimeOwner,
+    cancel_mutation_time: PmCancelMutationTimeOwner,
     public_ws: PmPublicMarketWsRole,
     user_ws_clock: PmUserWsProductClock,
     actor_clock: PmActorProductClock,
     okx_clock: PmOkxProductClock,
-    mutation_time_validator: PmMutationServerTimeValidator,
 }
 
 impl PmPublicConnectivityRoles {
@@ -141,26 +140,24 @@ impl PmPublicConnectivityRoles {
         PmPublicHttpRole,
         PmReadServerTimeHttpRole,
         PmPrivateReadProductClock,
-        PmMutationServerTimeHttpRole,
-        PmMutationServerTimeHttpRole,
+        PmPlaceMutationTimeOwner,
+        PmCancelMutationTimeOwner,
         PmPublicMarketWsRole,
         PmUserWsProductClock,
         PmActorProductClock,
         PmOkxProductClock,
-        PmMutationServerTimeValidator,
     ) {
         (
             self.metadata_http,
             self.book_http,
             self.read_server_time_http,
             self.private_read_clock,
-            self.place_server_time_http,
-            self.cancel_server_time_http,
+            self.place_mutation_time,
+            self.cancel_mutation_time,
             self.public_ws,
             self.user_ws_clock,
             self.actor_clock,
             self.okx_clock,
-            self.mutation_time_validator,
         )
     }
 }
@@ -258,16 +255,21 @@ mod tests {
             book,
             _read_time,
             _private_read_clock,
-            _place_time,
-            _cancel_time,
+            place_time,
+            cancel_time,
             public_ws,
             _user_clock,
             _actor,
             _okx,
-            _validator,
         ) = owner.into_roles().into_roles();
         assert_eq!(metadata.configured_scope(), exact_scope);
         assert_eq!(book.parser_config().scope(), exact_scope);
         assert_eq!(public_ws.scope(), exact_scope);
+        let (place_http, place_finalizer) = place_time.into_roles();
+        let (cancel_http, cancel_finalizer) = cancel_time.into_roles();
+        assert!(format!("{place_http:?}").contains("fixed-GET-/time"));
+        assert!(format!("{place_finalizer:?}").contains("place-authority"));
+        assert!(format!("{cancel_http:?}").contains("fixed-GET-/time"));
+        assert!(format!("{cancel_finalizer:?}").contains("cancel-authority"));
     }
 }

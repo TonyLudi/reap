@@ -11,6 +11,7 @@ path = "src/main.rs"
 async-trait.workspace = true
 libc.workspace = true
 reap-pm-core.workspace = true
+reap-pm-controlled-trial-live.workspace = true
 reap-pm-state.workspace = true
 reap-polymarket-adapter.workspace = true
 reap-polymarket-auth.workspace = true

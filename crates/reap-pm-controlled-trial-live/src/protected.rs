@@ -226,6 +226,28 @@ impl ProtectedJournal {
         self.directory.finish(&self.parent)
     }
 
+    pub(crate) fn validate_exact_bytes(
+        &mut self,
+        expected: &[u8],
+    ) -> Result<(), PmTrialLiveJournalError> {
+        if expected.len() > self.maximum_bytes {
+            return Err(PmTrialLiveJournalError::BoundExceeded);
+        }
+        self.validate_identity(expected.len() as u64)?;
+        self.file
+            .rewind()
+            .map_err(|_| PmTrialLiveJournalError::Protection)?;
+        let mut actual = Vec::with_capacity(expected.len());
+        std::io::Read::by_ref(&mut self.file)
+            .take((self.maximum_bytes + 1) as u64)
+            .read_to_end(&mut actual)
+            .map_err(|_| PmTrialLiveJournalError::Protection)?;
+        if actual != expected {
+            return Err(PmTrialLiveJournalError::Protection);
+        }
+        self.validate_identity(expected.len() as u64)
+    }
+
     fn validate_identity(&self, expected_length: u64) -> Result<(), PmTrialLiveJournalError> {
         let held = self
             .file

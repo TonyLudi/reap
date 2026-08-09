@@ -862,7 +862,7 @@ mod tests {
 
     fn private_read_clock(readings: &[(u64, u64)]) -> PmPrivateReadProductClock {
         let owner = crate::PmProductClockOwner::test_support_scripted(readings).unwrap();
-        let (_, _, _, _, private_read, _, _, _, _, _) = owner.split().into_views();
+        let (_, _, _, _, private_read, _, _, _, _, _, _) = owner.split().into_views();
         private_read
     }
 

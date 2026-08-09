@@ -79,18 +79,31 @@ pub use private_http::{
 pub use product_clock::PmLoopbackServerTimeScript;
 pub use product_clock::{
     PM_MUTATION_SERVER_TIME_MAX_AGE, PmActorClockObservation, PmActorProductClock,
+    PmCancelMutationAuthenticationError, PmCancelMutationTimeFinalizer, PmCancelMutationTimeProof,
+    PmCancelMutationTimeProvider, PmFinalCancelMutationTime, PmFinalPlaceMutationTime,
+    PmMutationTimeConsumeError, PmMutationTimeProviderError, PmOkxProductClock,
+    PmPlaceMutationAuthenticationError, PmPlaceMutationTimeFinalizer, PmPlaceMutationTimeProof,
+    PmPlaceMutationTimeProvider, PmPrivateReadEdgeClock, PmPrivateReadProductClock,
+    PmProductClockError, PmProductClockOwner, PmPublicHttpProductClock, PmPublicWsProductClock,
+    PmReadServerTime, PmReadServerTimeProductClock, PmRestResponseClock, PmUserWsProductClock,
+};
+#[cfg(any(test, feature = "loopback-evidence"))]
+pub use product_clock::{
     PmAuthorizedMutationServerTime, PmMutationServerTimeProductClock,
-    PmMutationServerTimeValidator, PmOkxProductClock, PmPendingMutationServerTime,
-    PmPrivateReadEdgeClock, PmPrivateReadProductClock, PmProductClockError, PmProductClockOwner,
-    PmProductClockViews, PmPublicHttpProductClock, PmPublicWsProductClock, PmReadServerTime,
-    PmReadServerTimeProductClock, PmRestResponseClock, PmUserWsProductClock,
+    PmMutationServerTimeValidator, PmPendingMutationServerTime,
 };
 pub use public_connectivity::{PmPublicConnectivityOwner, PmPublicConnectivityRoles};
 pub use public_http::{
+    PmCancelMutationTimeOwner, PmCancelServerTimeHttpRole, PmCancelServerTimeObservation,
+    PmCancelServerTimeObservationCommitment, PmPlaceMutationTimeOwner, PmPlaceServerTimeHttpRole,
+    PmPlaceServerTimeObservation, PmPlaceServerTimeObservationCommitment, PmPublicHttpRole,
+    PmReadServerTimeHttpRole, PmReadServerTimeObservation, PmReadServerTimeObservationCommitment,
+    PmRestBookPurpose, PmRestBookSnapshotSink,
+};
+#[cfg(any(test, feature = "loopback-evidence"))]
+pub use public_http::{
     PmMutationServerTimeHttpRole, PmMutationServerTimeObservation,
-    PmMutationServerTimeObservationCommitment, PmPublicHttpRole, PmReadServerTimeHttpRole,
-    PmReadServerTimeObservation, PmReadServerTimeObservationCommitment, PmRestBookPurpose,
-    PmRestBookSnapshotSink,
+    PmMutationServerTimeObservationCommitment,
 };
 pub use public_ws::{
     PmPublicMarketWsRole, PmPublicWsActivityView, PmPublicWsClockError, PmPublicWsClockSource,

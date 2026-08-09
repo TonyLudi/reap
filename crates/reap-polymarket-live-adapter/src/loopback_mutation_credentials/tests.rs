@@ -653,7 +653,8 @@ async fn bounded_time_response_is_the_exact_retained_l2_header_timestamp() {
         (1_700_000_000_000_000_101, 101),
     ])
     .unwrap();
-    let (_, _, http_clock, _, _, _, _, _, _, mut validator) = clock.split().into_views();
+    let (_, _, http_clock, _, _, _, _, _, _, mut validator) =
+        clock.split().into_loopback_mutation_views();
     let time_role = PmPublicHttpRole::with_product_clock(
         http_config,
         PmBookParserConfig::new_condition_bound(

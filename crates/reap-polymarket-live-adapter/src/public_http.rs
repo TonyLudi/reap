@@ -5,18 +5,27 @@ use reap_polymarket_wire::{
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    PM_CLOB_PRODUCTION_ORIGIN, PmLiveAdapterError, PmMutationServerTimeProductClock,
-    PmPendingMutationServerTime, PmProductClockError, PmPublicHttpConfig, PmPublicHttpProductClock,
-    PmReadServerTime, PmReadServerTimeProductClock, PmRestBookDeliveryError, PmRestResponseClock,
+    PM_CLOB_PRODUCTION_ORIGIN, PmCancelMutationTimeFinalizer, PmCancelMutationTimeProof,
+    PmLiveAdapterError, PmPlaceMutationTimeFinalizer, PmPlaceMutationTimeProof,
+    PmProductClockError, PmPublicHttpConfig, PmPublicHttpProductClock, PmReadServerTime,
+    PmReadServerTimeProductClock, PmRestBookDeliveryError, PmRestResponseClock,
     config::OriginMode,
     http_transport::{PmHttpTransport, PmPublicRoute},
+    product_clock::{PmCancelServerTimeProductClock, PmPlaceServerTimeProductClock},
 };
+#[cfg(any(test, feature = "loopback-evidence"))]
+use crate::{PmMutationServerTimeProductClock, PmPendingMutationServerTime};
 
 const MAX_SERVER_TIME_BODY_BYTES: usize = 64;
 const READ_SERVER_TIME_OBSERVATION_COMMITMENT_DOMAIN: &[u8] =
     b"reap.pm.live-adapter.read-server-time-observation.v1\0";
+#[cfg(any(test, feature = "loopback-evidence"))]
 const MUTATION_SERVER_TIME_OBSERVATION_COMMITMENT_DOMAIN: &[u8] =
     b"reap.pm.live-adapter.mutation-server-time-observation.v1\0";
+const PLACE_SERVER_TIME_OBSERVATION_COMMITMENT_DOMAIN: &[u8] =
+    b"reap.pm.live-adapter.place-server-time-observation.v1\0";
+const CANCEL_SERVER_TIME_OBSERVATION_COMMITMENT_DOMAIN: &[u8] =
+    b"reap.pm.live-adapter.cancel-server-time-observation.v1\0";
 
 /// SHA-256 commitment to one fixed `/time` response used for an authenticated
 /// read. Construction is private to the source role.
@@ -37,9 +46,41 @@ impl PmReadServerTimeObservationCommitment {
 /// SHA-256 commitment to one fixed `/time` response reserved for mutation
 /// admission. Its distinct type/domain prevents read-time substitution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg(any(test, feature = "loopback-evidence"))]
 pub struct PmMutationServerTimeObservationCommitment([u8; 32]);
 
+#[cfg(any(test, feature = "loopback-evidence"))]
 impl PmMutationServerTimeObservationCommitment {
+    const fn from_source_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+/// SHA-256 commitment to one fixed place-purpose `/time` response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PmPlaceServerTimeObservationCommitment([u8; 32]);
+
+impl PmPlaceServerTimeObservationCommitment {
+    const fn from_source_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+/// SHA-256 commitment to one fixed cancel-purpose `/time` response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PmCancelServerTimeObservationCommitment([u8; 32]);
+
+impl PmCancelServerTimeObservationCommitment {
     const fn from_source_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
@@ -114,6 +155,7 @@ impl std::fmt::Debug for PmReadServerTimeObservation {
 ///
 /// Consuming this carrier yields only the existing pending proof, which must
 /// still pass the same-domain freshness validator before mutation admission.
+#[cfg(any(test, feature = "loopback-evidence"))]
 pub struct PmMutationServerTimeObservation {
     parsed_l2_timestamp: L2Timestamp,
     receive_clock: PmRestResponseClock,
@@ -121,6 +163,7 @@ pub struct PmMutationServerTimeObservation {
     proof: PmPendingMutationServerTime,
 }
 
+#[cfg(any(test, feature = "loopback-evidence"))]
 impl PmMutationServerTimeObservation {
     fn from_source(
         parsed_l2_timestamp: L2Timestamp,
@@ -157,6 +200,7 @@ impl PmMutationServerTimeObservation {
     }
 }
 
+#[cfg(any(test, feature = "loopback-evidence"))]
 impl std::fmt::Debug for PmMutationServerTimeObservation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -165,6 +209,124 @@ impl std::fmt::Debug for PmMutationServerTimeObservation {
             .field("receive_clock", &self.receive_clock)
             .field("commitment", &self.commitment)
             .field("proof", &"<opaque>")
+            .finish()
+    }
+}
+
+/// Sealed place-only `/time` observation. Its authority remains inside the
+/// move-only proof; only source evidence, receive edge and commitment are
+/// inspectable.
+pub struct PmPlaceServerTimeObservation {
+    receive_clock: PmRestResponseClock,
+    commitment: PmPlaceServerTimeObservationCommitment,
+    proof: PmPlaceMutationTimeProof,
+}
+
+impl PmPlaceServerTimeObservation {
+    fn from_source(
+        receive_clock: PmRestResponseClock,
+        commitment: PmPlaceServerTimeObservationCommitment,
+        proof: PmPlaceMutationTimeProof,
+    ) -> Self {
+        Self {
+            receive_clock,
+            commitment,
+            proof,
+        }
+    }
+
+    #[must_use]
+    pub const fn receive_clock(&self) -> PmRestResponseClock {
+        self.receive_clock
+    }
+
+    #[must_use]
+    pub const fn commitment(&self) -> PmPlaceServerTimeObservationCommitment {
+        self.commitment
+    }
+
+    /// Return the exact parsed `/time` seconds for source-evidence correlation.
+    ///
+    /// This value grants no authentication authority. Only consuming the
+    /// retained proof through [`PmPlaceMutationTimeFinalizer`] can authorize
+    /// its hidden [`L2Timestamp`] for one exact place request.
+    #[must_use]
+    pub const fn observed_l2_timestamp_seconds(&self) -> u64 {
+        self.proof.observed_l2_timestamp_seconds()
+    }
+
+    #[must_use]
+    pub fn into_proof(self) -> PmPlaceMutationTimeProof {
+        self.proof
+    }
+}
+
+impl std::fmt::Debug for PmPlaceServerTimeObservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PmPlaceServerTimeObservation")
+            .field("receive_clock", &self.receive_clock)
+            .field("commitment", &self.commitment)
+            .field("proof", &"<opaque-place-time>")
+            .finish()
+    }
+}
+
+/// Sealed cancel-only `/time` observation. Its authority remains inside the
+/// move-only proof; only source evidence, receive edge and commitment are
+/// inspectable.
+pub struct PmCancelServerTimeObservation {
+    receive_clock: PmRestResponseClock,
+    commitment: PmCancelServerTimeObservationCommitment,
+    proof: PmCancelMutationTimeProof,
+}
+
+impl PmCancelServerTimeObservation {
+    fn from_source(
+        receive_clock: PmRestResponseClock,
+        commitment: PmCancelServerTimeObservationCommitment,
+        proof: PmCancelMutationTimeProof,
+    ) -> Self {
+        Self {
+            receive_clock,
+            commitment,
+            proof,
+        }
+    }
+
+    #[must_use]
+    pub const fn receive_clock(&self) -> PmRestResponseClock {
+        self.receive_clock
+    }
+
+    #[must_use]
+    pub const fn commitment(&self) -> PmCancelServerTimeObservationCommitment {
+        self.commitment
+    }
+
+    /// Return the exact parsed `/time` seconds for source-evidence correlation.
+    ///
+    /// This value grants no authentication authority. Only consuming the
+    /// retained proof through [`PmCancelMutationTimeFinalizer`] can authorize
+    /// its hidden [`L2Timestamp`] for one exact-owned cancel request.
+    #[must_use]
+    pub const fn observed_l2_timestamp_seconds(&self) -> u64 {
+        self.proof.observed_l2_timestamp_seconds()
+    }
+
+    #[must_use]
+    pub fn into_proof(self) -> PmCancelMutationTimeProof {
+        self.proof
+    }
+}
+
+impl std::fmt::Debug for PmCancelServerTimeObservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PmCancelServerTimeObservation")
+            .field("receive_clock", &self.receive_clock)
+            .field("commitment", &self.commitment)
+            .field("proof", &"<opaque-cancel-time>")
             .finish()
     }
 }
@@ -236,17 +398,185 @@ impl PmReadServerTimeHttpRole {
     }
 }
 
-/// Exact `/time` capability for one mutation path.
-///
-/// The public connectivity owner creates independent move-only instances for
-/// place and cancel. This role has no read-time, book, or raw-client API.
+/// One move-only place-time source/finalizer pair. Only the public
+/// connectivity root can construct it; splitting is the explicit boundary
+/// that sends the HTTP source and finalizer to their independently supervised
+/// owners.
+pub struct PmPlaceMutationTimeOwner {
+    http: PmPlaceServerTimeHttpRole,
+    finalizer: PmPlaceMutationTimeFinalizer,
+}
+
+impl PmPlaceMutationTimeOwner {
+    pub(crate) fn with_product_clock(
+        config: PmPublicHttpConfig,
+        clock: PmPlaceServerTimeProductClock,
+        finalizer: PmPlaceMutationTimeFinalizer,
+    ) -> Result<Self, PmLiveAdapterError> {
+        Ok(Self {
+            http: PmPlaceServerTimeHttpRole::with_product_clock(config, clock)?,
+            finalizer,
+        })
+    }
+
+    #[must_use]
+    pub fn into_roles(self) -> (PmPlaceServerTimeHttpRole, PmPlaceMutationTimeFinalizer) {
+        (self.http, self.finalizer)
+    }
+}
+
+impl std::fmt::Debug for PmPlaceMutationTimeOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PmPlaceMutationTimeOwner(<fixed-place-time>)")
+    }
+}
+
+/// One move-only cancel-time source/finalizer pair.
+pub struct PmCancelMutationTimeOwner {
+    http: PmCancelServerTimeHttpRole,
+    finalizer: PmCancelMutationTimeFinalizer,
+}
+
+impl PmCancelMutationTimeOwner {
+    pub(crate) fn with_product_clock(
+        config: PmPublicHttpConfig,
+        clock: PmCancelServerTimeProductClock,
+        finalizer: PmCancelMutationTimeFinalizer,
+    ) -> Result<Self, PmLiveAdapterError> {
+        Ok(Self {
+            http: PmCancelServerTimeHttpRole::with_product_clock(config, clock)?,
+            finalizer,
+        })
+    }
+
+    #[must_use]
+    pub fn into_roles(self) -> (PmCancelServerTimeHttpRole, PmCancelMutationTimeFinalizer) {
+        (self.http, self.finalizer)
+    }
+}
+
+impl std::fmt::Debug for PmCancelMutationTimeOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PmCancelMutationTimeOwner(<fixed-cancel-time>)")
+    }
+}
+
+/// Exact `/time` capability for place only.
+pub struct PmPlaceServerTimeHttpRole {
+    transport: PmHttpTransport,
+    clock: PmPlaceServerTimeProductClock,
+    mode: OriginMode,
+}
+
+impl PmPlaceServerTimeHttpRole {
+    fn with_product_clock(
+        config: PmPublicHttpConfig,
+        clock: PmPlaceServerTimeProductClock,
+    ) -> Result<Self, PmLiveAdapterError> {
+        let mode = config.mode();
+        Ok(Self {
+            transport: PmHttpTransport::new(&config)?,
+            clock,
+            mode,
+        })
+    }
+
+    pub async fn fresh_place_time(&self) -> Result<PmPlaceMutationTimeProof, PmLiveAdapterError> {
+        Ok(self.fresh_place_time_observation().await?.into_proof())
+    }
+
+    pub async fn fresh_place_time_observation(
+        &self,
+    ) -> Result<PmPlaceServerTimeObservation, PmLiveAdapterError> {
+        let fetched = fetch_server_time(&self.transport, || self.clock.observe_rest_edge()).await?;
+        let commitment = PmPlaceServerTimeObservationCommitment::from_source_bytes(
+            server_time_observation_commitment(
+                PLACE_SERVER_TIME_OBSERVATION_COMMITMENT_DOMAIN,
+                self.mode,
+                &fetched,
+            ),
+        );
+        let proof = self
+            .clock
+            .place_time_proof(fetched.parsed_l2_timestamp, fetched.receive_clock);
+        Ok(PmPlaceServerTimeObservation::from_source(
+            fetched.receive_clock,
+            commitment,
+            proof,
+        ))
+    }
+}
+
+impl std::fmt::Debug for PmPlaceServerTimeHttpRole {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PmPlaceServerTimeHttpRole(<fixed-GET-/time>)")
+    }
+}
+
+/// Exact `/time` capability for cancel only.
+pub struct PmCancelServerTimeHttpRole {
+    transport: PmHttpTransport,
+    clock: PmCancelServerTimeProductClock,
+    mode: OriginMode,
+}
+
+impl PmCancelServerTimeHttpRole {
+    fn with_product_clock(
+        config: PmPublicHttpConfig,
+        clock: PmCancelServerTimeProductClock,
+    ) -> Result<Self, PmLiveAdapterError> {
+        let mode = config.mode();
+        Ok(Self {
+            transport: PmHttpTransport::new(&config)?,
+            clock,
+            mode,
+        })
+    }
+
+    pub async fn fresh_cancel_time(&self) -> Result<PmCancelMutationTimeProof, PmLiveAdapterError> {
+        Ok(self.fresh_cancel_time_observation().await?.into_proof())
+    }
+
+    pub async fn fresh_cancel_time_observation(
+        &self,
+    ) -> Result<PmCancelServerTimeObservation, PmLiveAdapterError> {
+        let fetched = fetch_server_time(&self.transport, || self.clock.observe_rest_edge()).await?;
+        let commitment = PmCancelServerTimeObservationCommitment::from_source_bytes(
+            server_time_observation_commitment(
+                CANCEL_SERVER_TIME_OBSERVATION_COMMITMENT_DOMAIN,
+                self.mode,
+                &fetched,
+            ),
+        );
+        let proof = self
+            .clock
+            .cancel_time_proof(fetched.parsed_l2_timestamp, fetched.receive_clock);
+        Ok(PmCancelServerTimeObservation::from_source(
+            fetched.receive_clock,
+            commitment,
+            proof,
+        ))
+    }
+}
+
+impl std::fmt::Debug for PmCancelServerTimeHttpRole {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PmCancelServerTimeHttpRole(<fixed-GET-/time>)")
+    }
+}
+
+/// Purpose-erased `/time` capability retained only for literal-loopback
+/// compatibility. Production connectivity never constructs or returns it.
+#[cfg(any(test, feature = "loopback-evidence"))]
 pub struct PmMutationServerTimeHttpRole {
     transport: PmHttpTransport,
     clock: PmMutationServerTimeProductClock,
     mode: OriginMode,
 }
 
+#[cfg(any(test, feature = "loopback-evidence"))]
 impl PmMutationServerTimeHttpRole {
+    #[cfg(test)]
     pub(crate) fn with_product_clock(
         config: PmPublicHttpConfig,
         clock: PmMutationServerTimeProductClock,
@@ -452,12 +782,14 @@ impl PmPublicHttpRole {
         ))
     }
 
-    /// Fetch one pending CLOB server time for mutation admission.
+    /// Fetch one pending CLOB server time for literal-loopback mutation
+    /// evidence. Production callers receive purpose-specific roles instead.
     ///
     /// The authenticated root must pass this value through its same-domain
     /// [`crate::PmMutationServerTimeValidator`] immediately before removing a
     /// Goal-F dispatch. Only the resulting authorized proof may enter the
     /// credential authority.
+    #[cfg(any(test, feature = "loopback-evidence"))]
     pub async fn fresh_mutation_server_time(
         &self,
     ) -> Result<PmPendingMutationServerTime, PmLiveAdapterError> {
@@ -467,6 +799,7 @@ impl PmPublicHttpRole {
             .into_pending_mutation_server_time())
     }
 
+    #[cfg(any(test, feature = "loopback-evidence"))]
     pub async fn fresh_mutation_server_time_observation(
         &self,
     ) -> Result<PmMutationServerTimeObservation, PmLiveAdapterError> {
@@ -698,6 +1031,38 @@ mod tests {
 
     struct EdgeSink;
 
+    #[derive(Default)]
+    struct PlaceTimeCapture(Option<L2Timestamp>);
+
+    impl crate::PmPlaceMutationTimeProvider for PlaceTimeCapture {
+        fn consume_final_place_time(
+            &mut self,
+            time: crate::PmFinalPlaceMutationTime<'_>,
+        ) -> Result<(), crate::PmMutationTimeProviderError> {
+            self.0 = Some(
+                time.consume_l2_timestamp()
+                    .map_err(crate::PmMutationTimeProviderError::FinalClock)?,
+            );
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CancelTimeCapture(Option<L2Timestamp>);
+
+    impl crate::PmCancelMutationTimeProvider for CancelTimeCapture {
+        fn consume_final_cancel_time(
+            &mut self,
+            time: crate::PmFinalCancelMutationTime<'_>,
+        ) -> Result<(), crate::PmMutationTimeProviderError> {
+            self.0 = Some(
+                time.consume_l2_timestamp()
+                    .map_err(crate::PmMutationTimeProviderError::FinalClock)?,
+            );
+            Ok(())
+        }
+    }
+
     #[async_trait::async_trait]
     impl PmRestBookSnapshotSink for EdgeSink {
         type Output = PmRestResponseClock;
@@ -817,16 +1182,28 @@ mod tests {
             (1_003, 13),
             (1_004, 14),
             (1_005, 15),
+            (1_006, 16),
+            (1_007, 17),
         ])
         .unwrap();
-        let (_, _, _, read_clock, _, place_clock, cancel_clock, _, _, mut validator) =
-            clock.split().into_views();
+        let (
+            _,
+            _,
+            _,
+            read_clock,
+            _,
+            place_clock,
+            mut place_finalizer,
+            cancel_clock,
+            mut cancel_finalizer,
+            _,
+            _,
+        ) = clock.split().into_views();
         let read =
             PmReadServerTimeHttpRole::with_product_clock(config.clone(), read_clock).unwrap();
         let place =
-            PmMutationServerTimeHttpRole::with_product_clock(config.clone(), place_clock).unwrap();
-        let cancel =
-            PmMutationServerTimeHttpRole::with_product_clock(config, cancel_clock).unwrap();
+            PmPlaceServerTimeHttpRole::with_product_clock(config.clone(), place_clock).unwrap();
+        let cancel = PmCancelServerTimeHttpRole::with_product_clock(config, cancel_clock).unwrap();
 
         assert_eq!(
             read.fresh_read_server_time()
@@ -837,22 +1214,33 @@ mod tests {
                 .unix_seconds(),
             1_234_567_890
         );
+        let mut place_capture = PlaceTimeCapture::default();
+        let place_observation = place.fresh_place_time_observation().await.unwrap();
+        assert_eq!(place_observation.receive_clock().monotonic_receive_ns(), 12);
         assert_eq!(
-            validator
-                .authorize(place.fresh_mutation_server_time().await.unwrap())
-                .unwrap()
-                .into_l2_timestamp()
-                .unix_seconds(),
+            place_observation.observed_l2_timestamp_seconds(),
             1_234_567_891
         );
+        let place_commitment = place_observation.commitment().bytes();
+        place_finalizer
+            .consume_with(place_observation.into_proof(), &mut place_capture)
+            .unwrap();
+        assert_eq!(place_capture.0.unwrap().unix_seconds(), 1_234_567_891);
+        let mut cancel_capture = CancelTimeCapture::default();
+        let cancel_observation = cancel.fresh_cancel_time_observation().await.unwrap();
         assert_eq!(
-            validator
-                .authorize(cancel.fresh_mutation_server_time().await.unwrap())
-                .unwrap()
-                .into_l2_timestamp()
-                .unix_seconds(),
+            cancel_observation.receive_clock().monotonic_receive_ns(),
+            15
+        );
+        assert_eq!(
+            cancel_observation.observed_l2_timestamp_seconds(),
             1_234_567_892
         );
+        assert_ne!(place_commitment, cancel_observation.commitment().bytes());
+        cancel_finalizer
+            .consume_with(cancel_observation.into_proof(), &mut cancel_capture)
+            .unwrap();
+        assert_eq!(cancel_capture.0.unwrap().unix_seconds(), 1_234_567_892);
         for _ in 0..3 {
             assert_eq!(requests.recv().await.unwrap(), "GET /time HTTP/1.1");
         }
@@ -880,7 +1268,7 @@ mod tests {
         ])
         .unwrap();
         let (_, _, _, read_clock, _, mutation_clock, _, _, _, mut validator) =
-            clock.split().into_views();
+            clock.split().into_loopback_mutation_views();
         let read =
             PmReadServerTimeHttpRole::with_product_clock(config.clone(), read_clock).unwrap();
         let mutation =
@@ -1143,7 +1531,8 @@ mod tests {
             (1_700_000_000_000_000_200, 200),
         ])
         .unwrap();
-        let (mut public_ws_clock, _, http_clock, _, _, _, _, _, _, _) = clock.split().into_views();
+        let (mut public_ws_clock, _, http_clock, _, _, _, _, _, _, _, _) =
+            clock.split().into_views();
         let config = PmPublicHttpConfig::local_evidence(
             &origin,
             Duration::from_secs(1),

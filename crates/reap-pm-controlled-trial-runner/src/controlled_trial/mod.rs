@@ -9,10 +9,8 @@ mod runtime;
 use std::fmt;
 
 use reap_polymarket_auth::{
-    AuthenticatedL2Headers, AuthenticatedOwnedCancelRequest, AuthenticatedPlaceRequest,
-    FixedOrderId, L2Timestamp, PlacePublicRequestIdentity, PmClobDomain,
+    AuthenticatedL2Headers, AuthenticatedOwnedCancelRequest, FixedOrderId, L2Timestamp,
 };
-use reap_polymarket_wire::PmUnsignedClobV2Order;
 
 /// An L2 timestamp admitted by the future in-process freshness/session join.
 ///
@@ -34,36 +32,6 @@ impl AuthorizedL2Timestamp {
 impl fmt::Debug for AuthorizedL2Timestamp {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("AuthorizedL2Timestamp(<opaque>)")
-    }
-}
-
-/// Move-only parent-sealed inputs for the sole fresh proxy place attempt.
-struct SealedFreshPlaceAuthentication {
-    domain: PmClobDomain,
-    unsigned_order: PmUnsignedClobV2Order,
-    timestamp: AuthorizedL2Timestamp,
-    expected_public_identity: PlacePublicRequestIdentity,
-}
-
-impl SealedFreshPlaceAuthentication {
-    fn new(
-        domain: PmClobDomain,
-        unsigned_order: PmUnsignedClobV2Order,
-        timestamp: AuthorizedL2Timestamp,
-        expected_public_identity: PlacePublicRequestIdentity,
-    ) -> Self {
-        Self {
-            domain,
-            unsigned_order,
-            timestamp,
-            expected_public_identity,
-        }
-    }
-}
-
-impl fmt::Debug for SealedFreshPlaceAuthentication {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("SealedFreshPlaceAuthentication(<opaque>)")
     }
 }
 
@@ -107,29 +75,6 @@ impl SealedExactOwnedCancelAuthentication {
 impl fmt::Debug for SealedExactOwnedCancelAuthentication {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("SealedExactOwnedCancelAuthentication(<opaque>)")
-    }
-}
-
-/// Authenticated place carrier returned only after the task-local signer has
-/// been destroyed. It grants no network operation by itself.
-struct SignerDroppedAuthenticatedPlace {
-    request: AuthenticatedPlaceRequest,
-    timestamp: L2Timestamp,
-}
-
-impl SignerDroppedAuthenticatedPlace {
-    const fn new(request: AuthenticatedPlaceRequest, timestamp: L2Timestamp) -> Self {
-        Self { request, timestamp }
-    }
-
-    fn into_parts(self) -> (AuthenticatedPlaceRequest, L2Timestamp) {
-        (self.request, self.timestamp)
-    }
-}
-
-impl fmt::Debug for SignerDroppedAuthenticatedPlace {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("SignerDroppedAuthenticatedPlace([REDACTED])")
     }
 }
 

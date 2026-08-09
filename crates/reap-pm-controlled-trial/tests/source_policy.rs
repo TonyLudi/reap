@@ -128,6 +128,9 @@ fn take_once_consumption_is_fixed_path_atomic_durable_and_never_a_permit() {
     assert!(CONSUMPTION.contains("crash_allows_recovery_cancel_only: true"));
     assert!(PROTECTED.contains(".create_new(true)"));
     assert!(PROTECTED.contains(".sync_all()"));
+    assert!(CONSUMPTION.contains("claim: DurableCreateNewFile"));
+    assert!(CONSUMPTION.contains("revalidate_held_consumption_evidence"));
+    assert!(PROTECTED.contains("fn validate_exact_bytes("));
     assert!(!CONSUMPTION.contains("DispatchAuthorized"));
     assert!(!CONSUMPTION.contains("SignedClobV2Order"));
     assert!(!CONSUMPTION.contains("AuthenticatedPlaceRequest"));

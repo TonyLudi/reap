@@ -346,6 +346,28 @@ impl DurableCreateNewFile {
         Ok(())
     }
 
+    pub(crate) fn validate_exact_bytes(
+        &mut self,
+        expected: &[u8],
+    ) -> Result<(), ProtectedFileError> {
+        if expected.len() > self.maximum_bytes {
+            return Err(ProtectedFileError::TooLarge(self.kind));
+        }
+        self.validate_path_and_metadata(expected.len() as u64)?;
+        self.file
+            .rewind()
+            .map_err(|_| ProtectedFileError::Read(self.kind))?;
+        let mut actual = Vec::with_capacity(expected.len());
+        std::io::Read::by_ref(&mut self.file)
+            .take((self.maximum_bytes + 1) as u64)
+            .read_to_end(&mut actual)
+            .map_err(|_| ProtectedFileError::Read(self.kind))?;
+        if actual != expected {
+            return Err(ProtectedFileError::FileChanged(self.kind));
+        }
+        self.validate_path_and_metadata(expected.len() as u64)
+    }
+
     fn validate_path_and_metadata(&self, expected_length: u64) -> Result<(), ProtectedFileError> {
         let held = self
             .file

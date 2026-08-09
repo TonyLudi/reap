@@ -1574,7 +1574,7 @@ mod tests {
 
     fn private_read_edges(readings: &[(u64, u64)]) -> Vec<PmPrivateReadEdgeClock> {
         let owner = crate::PmProductClockOwner::test_support_scripted(readings).unwrap();
-        let (_, _, _, _, mut clock, _, _, _, _, _) = owner.split().into_views();
+        let (_, _, _, _, mut clock, _, _, _, _, _, _) = owner.split().into_views();
         readings
             .iter()
             .map(|_| clock.observe_authenticated_read_complete().unwrap())

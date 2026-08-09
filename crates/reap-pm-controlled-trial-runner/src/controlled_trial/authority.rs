@@ -1,21 +1,26 @@
 use std::{
     fmt,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
 use async_trait::async_trait;
+use reap_pm_controlled_trial_live::{
+    PmDurablePlacePreparedAckV1, PmRevalidatedPhaseAPlaceLiveDispatchOwnerV1,
+};
 use reap_pm_core::PmConditionId;
 use reap_polymarket_auth::{
     AuthenticatedL2Headers, AuthenticatedPlaceRequest, AuthenticatedUserSubscription,
-    CredentialOwnedUserFrame, FixedEoaSigner, L2Credentials, L2Timestamp, PmAuthError,
+    CredentialOwnedUserFrame, FixedEoaSigner, L2Credentials, L2Timestamp,
+    PlacePublicRequestIdentity, PmAuthError, PmClobDomain, SerializedPlaceRequest,
     derive_place_public_request_identity,
 };
 use reap_polymarket_live_adapter::{
-    PmHttpReadAuthorityProvider, PmLiveAdapterError, PmUserWsReadAuthorityProvider,
+    PmHttpReadAuthorityProvider, PmLiveAdapterError, PmPlaceMutationAuthenticationError,
+    PmPlaceMutationTimeFinalizer, PmPlaceMutationTimeProof, PmUserWsReadAuthorityProvider,
 };
 use reap_polymarket_wire::{
     PmClobV2SignatureType, PmLiveOpenOrderPage, PmLiveOrder, PmLiveTradePage, PmLiveUserFrame,
@@ -29,7 +34,6 @@ use tokio::{
 use super::{
     AuthenticatedExactOwnedCancel, AuthenticatedExactOwnedOrderRead, AuthorizedL2Timestamp,
     SealedExactOwnedCancelAuthentication, SealedExactOwnedOrderReadAuthentication,
-    SealedFreshPlaceAuthentication, SignerDroppedAuthenticatedPlace,
 };
 use crate::credentials::{
     FreshPlaceCredentialHandoff, FreshPlaceCredentialTeardown, RecoveryOnlyCredentialHandoff,
@@ -41,6 +45,20 @@ const PLACE_AUTHORITY_CAPACITY: usize = 1;
 const MAX_EXACT_CANCEL_AUTHENTICATIONS_PER_AUTHORITY: u8 = 3;
 const MAX_JOIN_TIMEOUT: Duration = Duration::from_secs(60);
 
+#[cfg(test)]
+struct PlaceRequestTestPause {
+    admitted: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+impl PlaceRequestTestPause {
+    fn wait(self) {
+        let _ = self.admitted.send(());
+        let _ = self.release.recv();
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub(super) enum CredentialAuthorityError {
     #[error("credential authority requires an active Tokio runtime")]
@@ -51,10 +69,18 @@ pub(super) enum CredentialAuthorityError {
     AuthorityClosed,
     #[error("the sole fresh-place signing attempt was already consumed")]
     PlaceAlreadyConsumed,
+    #[error("the later place dispatch authorization does not match the retained prepared identity")]
+    PlaceDispatchBindingMismatch,
+    #[error("no successfully retained place identity is available for staged key removal")]
+    PlacePreparedIdentityUnavailable,
+    #[error("the staged key removal identity does not match the retained prepared place")]
+    PlacePreparedIdentityMismatch,
     #[error("fresh-place authentication requires the closed PM-T2 proxy signature profile")]
     PlaceProfileMismatch,
     #[error("fresh-place public identity does not match the sealed unsigned order and domain")]
     PlacePublicIdentityMismatch,
+    #[error(transparent)]
+    PlaceAuthentication(#[from] PmPlaceMutationAuthenticationError),
     #[error("the L2 signer does not match the sealed proxy order signer")]
     PlaceSignerMismatch,
     #[error("the fixed local exact-cancel authentication ceiling was exhausted")]
@@ -147,17 +173,29 @@ impl CredentialAuthorityShutdownOutcome {
 
 struct AuthorityIdentity {
     signer_dropped: AtomicBool,
+    prepared_public_identity: OnceLock<PlacePublicRequestIdentity>,
 }
 
 impl AuthorityIdentity {
     fn new() -> Self {
         Self {
             signer_dropped: AtomicBool::new(false),
+            prepared_public_identity: OnceLock::new(),
         }
     }
 
     fn signer_dropped(&self) -> bool {
         self.signer_dropped.load(Ordering::Acquire)
+    }
+
+    fn publish_prepared_public_identity(&self, identity: PlacePublicRequestIdentity) {
+        if self.prepared_public_identity.set(identity).is_err() {
+            std::process::abort();
+        }
+    }
+
+    fn prepared_public_identity(&self) -> Option<PlacePublicRequestIdentity> {
+        self.prepared_public_identity.get().copied()
     }
 }
 
@@ -181,6 +219,10 @@ impl TaskSignerCustody {
     fn publish_signer_dropped(&self) {
         self.identity.signer_dropped.store(true, Ordering::Release);
     }
+
+    fn publish_prepared_public_identity(&self, identity: PlacePublicRequestIdentity) {
+        self.identity.publish_prepared_public_identity(identity);
+    }
 }
 
 impl Drop for TaskSignerCustody {
@@ -202,7 +244,10 @@ impl FreshCredentialAuthorityOwner {
         Self { custody }
     }
 
-    pub(super) fn spawn(self) -> Result<FreshCredentialAuthorityRoles, CredentialAuthorityError> {
+    pub(super) fn spawn(
+        self,
+        place_time_finalizer: PmPlaceMutationTimeFinalizer,
+    ) -> Result<FreshCredentialAuthorityRoles, CredentialAuthorityError> {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| CredentialAuthorityError::ActiveRuntimeRequired)?;
         let (signer, credentials, teardown) = self.custody.into_authorities_and_teardown();
@@ -213,6 +258,7 @@ impl FreshCredentialAuthorityOwner {
         let task = runtime.spawn(run_fresh_authority(
             TaskSignerCustody::new(signer, Arc::clone(&identity)),
             credentials,
+            place_time_finalizer,
             common_receiver,
             place_receiver,
             shutdown_receiver,
@@ -396,15 +442,28 @@ impl fmt::Debug for RecoveryCredentialAuthorityRoles {
 /// the task independently consumes its `Option<FixedEoaSigner>` as defense
 /// in depth against an accidentally duplicated sender.
 pub(super) struct FreshPlaceAuthenticationOnce {
-    sender: mpsc::Sender<PlaceAuthenticationRequest>,
+    sender: mpsc::Sender<PlaceAuthorityRequest>,
 }
 
 impl FreshPlaceAuthenticationOnce {
-    pub(super) async fn authenticate_place_once(
+    /// Consume the sole public preparation handle. The authority validates the
+    /// closed PM-T2 proxy profile, consumes and destroys its only EOA signer,
+    /// signs and serializes exactly once, and retains the serialized request
+    /// inside the supervised L2 task. No L2 HMAC is computed at this stage.
+    pub(super) async fn prepare_place_once(
         self,
-        request: SealedFreshPlaceAuthentication,
-    ) -> Result<SignerDroppedAuthenticatedPlace, CredentialAuthorityError> {
-        request_place(&self.sender, request).await
+        request: SealedPmT2ProxyPlacePreparation,
+    ) -> Result<SignerDroppedPlacePreparation, CredentialAuthorityError> {
+        let sender = self.sender;
+        let public_identity = request_place(&sender, |response| PlaceAuthorityRequest::Prepare {
+            request,
+            response,
+        })
+        .await?;
+        Ok(SignerDroppedPlacePreparation {
+            public_identity,
+            sender,
+        })
     }
 
     #[cfg(test)]
@@ -418,6 +477,184 @@ impl FreshPlaceAuthenticationOnce {
 impl fmt::Debug for FreshPlaceAuthenticationOnce {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("FreshPlaceAuthenticationOnce(<opaque>)")
+    }
+}
+
+/// Public, move-only inputs for the sole fixed PM-T2 proxy preparation. The
+/// expected identity is independently derived by the non-secret session owner
+/// and re-derived by the signer-owning task before signing.
+pub(super) struct SealedPmT2ProxyPlacePreparation {
+    domain: PmClobDomain,
+    unsigned_order: reap_polymarket_wire::PmUnsignedClobV2Order,
+    expected_public_identity: PlacePublicRequestIdentity,
+    #[cfg(test)]
+    test_pause: Option<PlaceRequestTestPause>,
+}
+
+impl SealedPmT2ProxyPlacePreparation {
+    pub(super) const fn new(
+        domain: PmClobDomain,
+        unsigned_order: reap_polymarket_wire::PmUnsignedClobV2Order,
+        expected_public_identity: PlacePublicRequestIdentity,
+    ) -> Self {
+        Self {
+            domain,
+            unsigned_order,
+            expected_public_identity,
+            #[cfg(test)]
+            test_pause: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_test_pause(mut self, pause: PlaceRequestTestPause) -> Self {
+        self.test_pause = Some(pause);
+        self
+    }
+
+    fn wait_for_test_pause(&mut self) {
+        #[cfg(test)]
+        if let Some(pause) = self.test_pause.take() {
+            pause.wait();
+        }
+    }
+}
+
+impl fmt::Debug for SealedPmT2ProxyPlacePreparation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SealedPmT2ProxyPlacePreparation(<public; opaque>)")
+    }
+}
+
+/// The only continuation produced by successful preparation. It exposes the
+/// public journal identity and nothing from the signed body or L2 bundle. Its
+/// finalize method consumes both this continuation and a later private
+/// authorization/time proof.
+#[must_use = "the signer-dropped prepared place must be durably joined or shut down"]
+pub(super) struct SignerDroppedPlacePreparation {
+    public_identity: PlacePublicRequestIdentity,
+    sender: mpsc::Sender<PlaceAuthorityRequest>,
+}
+
+impl SignerDroppedPlacePreparation {
+    pub(super) const fn public_identity(&self) -> PlacePublicRequestIdentity {
+        self.public_identity
+    }
+
+    pub(super) async fn finalize_place_once(
+        self,
+        dispatch: &PmRevalidatedPhaseAPlaceLiveDispatchOwnerV1,
+        proof: PmPlaceMutationTimeProof,
+    ) -> Result<OpaqueAuthenticatedPlaceRequest, CredentialAuthorityError> {
+        let profile = dispatch.profile();
+        if profile.public_request_identity() != self.public_identity {
+            return Err(CredentialAuthorityError::PlaceDispatchBindingMismatch);
+        }
+        let authorization = PlaceHmacAdmission {
+            public_identity: profile.public_request_identity(),
+            expected_l2_timestamp_seconds: profile.l2_timestamp_seconds(),
+            proof,
+            #[cfg(test)]
+            test_pause: None,
+        };
+        self.finalize_with_admission(authorization).await
+    }
+
+    async fn finalize_with_admission(
+        self,
+        authorization: PlaceHmacAdmission,
+    ) -> Result<OpaqueAuthenticatedPlaceRequest, CredentialAuthorityError> {
+        request_place(&self.sender, |response| PlaceAuthorityRequest::Finalize {
+            authorization,
+            response,
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    async fn finalize_place_once_for_test(
+        self,
+        public_identity: PlacePublicRequestIdentity,
+        expected_l2_timestamp_seconds: u64,
+        proof: PmPlaceMutationTimeProof,
+    ) -> Result<OpaqueAuthenticatedPlaceRequest, CredentialAuthorityError> {
+        self.finalize_with_admission(PlaceHmacAdmission {
+            public_identity,
+            expected_l2_timestamp_seconds,
+            proof,
+            test_pause: None,
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    async fn finalize_place_once_paused_for_test(
+        self,
+        public_identity: PlacePublicRequestIdentity,
+        expected_l2_timestamp_seconds: u64,
+        proof: PmPlaceMutationTimeProof,
+        test_pause: PlaceRequestTestPause,
+    ) -> Result<OpaqueAuthenticatedPlaceRequest, CredentialAuthorityError> {
+        self.finalize_with_admission(PlaceHmacAdmission {
+            public_identity,
+            expected_l2_timestamp_seconds,
+            proof,
+            test_pause: Some(test_pause),
+        })
+        .await
+    }
+}
+
+impl fmt::Debug for SignerDroppedPlacePreparation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SignerDroppedPlacePreparation")
+            .field("public_identity", &self.public_identity)
+            .field("signer_dropped", &true)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Task-bound join of one positive durable Phase-A dispatch owner and the
+/// source-issued place-time proof. Construction is private to
+/// `SignerDroppedPlacePreparation::finalize_place_once`, which borrows the
+/// unsplittable durable owner while the caller retains it for the later final
+/// network-boundary recheck or a definitely-not-dispatched exchange.
+struct PlaceHmacAdmission {
+    public_identity: PlacePublicRequestIdentity,
+    expected_l2_timestamp_seconds: u64,
+    proof: PmPlaceMutationTimeProof,
+    #[cfg(test)]
+    test_pause: Option<PlaceRequestTestPause>,
+}
+
+impl PlaceHmacAdmission {
+    fn wait_for_test_pause(&mut self) {
+        #[cfg(test)]
+        if let Some(pause) = self.test_pause.take() {
+            pause.wait();
+        }
+    }
+}
+
+impl fmt::Debug for PlaceHmacAdmission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PlaceHmacAdmission(<opaque>)")
+    }
+}
+
+/// Final L2-authenticated place request. The signed body, exact runtime body
+/// commitment, credentials, sender, and admitted timestamp remain sealed.
+/// This slice intentionally provides no production dispatch/decomposition
+/// method, so it does not enable transport.
+#[must_use = "the authenticated place remains a linear mutation authority"]
+pub(super) struct OpaqueAuthenticatedPlaceRequest {
+    request: AuthenticatedPlaceRequest,
+}
+
+impl fmt::Debug for OpaqueAuthenticatedPlaceRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OpaqueAuthenticatedPlaceRequest([REDACTED])")
     }
 }
 
@@ -745,22 +982,54 @@ pub(super) struct FreshCredentialAuthoritySupervisor {
 impl FreshCredentialAuthoritySupervisor {
     /// The future journal/session owner may call this only after durable
     /// A3 `PlacePrepared`. This lower authority neither validates nor mints
-    /// that durable ack; it only requires proof that the task-local signer was
-    /// destroyed before the place reply and reports staged-file teardown.
-    ///
-    /// TODO(A3 runner integration): make the private session owner consume
-    /// its durable Prepared ack immediately before invoking this method.
+    /// that durable ack; it requires the caller to borrow the exact move-only
+    /// durable acknowledgement, verifies its public request identity against
+    /// the supervised task's retained identity, and requires the task-local
+    /// signer to be destroyed. The acknowledgement remains owned by the A3
+    /// flow for the later authorization-consumption transition.
     pub(super) fn remove_private_key_after_prepared(
         &mut self,
+        prepared: &PmDurablePlacePreparedAckV1,
+    ) -> Result<(), CredentialAuthorityError> {
+        let durable = prepared.preparation();
+        self.remove_private_key_after_prepared_identity(
+            durable.expected_order_id(),
+            durable.semantic_request_commitment(),
+        )
+    }
+
+    fn remove_private_key_after_prepared_identity(
+        &mut self,
+        expected_order_id: reap_polymarket_auth::ExpectedOrderId,
+        semantic_request_commitment: reap_polymarket_auth::PlaceSemanticRequestCommitment,
     ) -> Result<(), CredentialAuthorityError> {
         if !self.identity.signer_dropped() {
             return Err(CredentialAuthorityError::SignerStillOwned);
+        }
+        let Some(prepared_identity) = self.identity.prepared_public_identity() else {
+            return Err(CredentialAuthorityError::PlacePreparedIdentityUnavailable);
+        };
+        if prepared_identity.expected_order_id() != expected_order_id
+            || prepared_identity.semantic_request_commitment() != semantic_request_commitment
+        {
+            return Err(CredentialAuthorityError::PlacePreparedIdentityMismatch);
         }
         self.teardown
             .remove_private_key()
             .map_err(|_| CredentialAuthorityError::StagedCredentialTeardownFailed)?;
         self.private_key_removed = true;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn remove_private_key_after_prepared_for_test(
+        &mut self,
+        identity: PlacePublicRequestIdentity,
+    ) -> Result<(), CredentialAuthorityError> {
+        self.remove_private_key_after_prepared_identity(
+            identity.expected_order_id(),
+            identity.semantic_request_commitment(),
+        )
     }
 
     pub(super) async fn shutdown_bounded(
@@ -909,9 +1178,21 @@ impl TaskJoinOutcome {
     }
 }
 
-struct PlaceAuthenticationRequest {
-    request: SealedFreshPlaceAuthentication,
-    response: oneshot::Sender<Result<SignerDroppedAuthenticatedPlace, CredentialAuthorityError>>,
+enum PlaceAuthorityRequest {
+    Prepare {
+        request: SealedPmT2ProxyPlacePreparation,
+        response: oneshot::Sender<Result<PlacePublicRequestIdentity, CredentialAuthorityError>>,
+    },
+    Finalize {
+        authorization: PlaceHmacAdmission,
+        response:
+            oneshot::Sender<Result<OpaqueAuthenticatedPlaceRequest, CredentialAuthorityError>>,
+    },
+}
+
+struct RetainedPreparedPlace {
+    serialized: SerializedPlaceRequest,
+    public_identity: PlacePublicRequestIdentity,
 }
 
 enum CommonAuthorityRequest {
@@ -965,12 +1246,14 @@ enum CommonAuthorityRequest {
 async fn run_fresh_authority(
     mut signer: TaskSignerCustody,
     credentials: L2Credentials,
+    mut place_time_finalizer: PmPlaceMutationTimeFinalizer,
     mut common: mpsc::Receiver<CommonAuthorityRequest>,
-    mut place: mpsc::Receiver<PlaceAuthenticationRequest>,
+    mut place: mpsc::Receiver<PlaceAuthorityRequest>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let mut common_open = true;
     let mut place_open = true;
+    let mut retained_place = None;
     loop {
         tokio::select! {
             biased;
@@ -984,7 +1267,13 @@ async fn run_fresh_authority(
                 None => common_open = false,
             },
             request = place.recv(), if place_open => match request {
-                Some(request) => respond_place(request, &mut signer, &credentials),
+                Some(request) => handle_place_request(
+                    request,
+                    &mut signer,
+                    &credentials,
+                    &mut place_time_finalizer,
+                    &mut retained_place,
+                ),
                 None => place_open = false,
             },
             else => return,
@@ -1016,33 +1305,63 @@ async fn run_recovery_authority(
 }
 // END RECOVERY_TASK
 
-fn respond_place(
-    request: PlaceAuthenticationRequest,
+fn handle_place_request(
+    request: PlaceAuthorityRequest,
     signer: &mut TaskSignerCustody,
     credentials: &L2Credentials,
+    place_time_finalizer: &mut PmPlaceMutationTimeFinalizer,
+    retained_place: &mut Option<RetainedPreparedPlace>,
 ) {
-    let PlaceAuthenticationRequest { request, response } = request;
+    match request {
+        PlaceAuthorityRequest::Prepare { request, response } => {
+            respond_place_preparation(request, response, signer, credentials, retained_place);
+        }
+        PlaceAuthorityRequest::Finalize {
+            authorization,
+            response,
+        } => {
+            respond_place_finalization(
+                authorization,
+                response,
+                credentials,
+                place_time_finalizer,
+                retained_place,
+            );
+        }
+    }
+}
+
+fn respond_place_preparation(
+    mut request: SealedPmT2ProxyPlacePreparation,
+    response: oneshot::Sender<Result<PlacePublicRequestIdentity, CredentialAuthorityError>>,
+    signer: &mut TaskSignerCustody,
+    credentials: &L2Credentials,
+    retained_place: &mut Option<RetainedPreparedPlace>,
+) {
+    request.wait_for_test_pause();
     let Some(signer_value) = signer.take() else {
         let _ = response.send(Err(CredentialAuthorityError::PlaceAlreadyConsumed));
         return;
     };
-    let timestamp = request.timestamp.into_inner();
-    let authenticated = authenticate_place(&signer_value, credentials, request, timestamp);
+    let prepared = prepare_place(&signer_value, credentials, request);
     drop(signer_value);
     signer.publish_signer_dropped();
-    // Constructing and sending the reply happens strictly after the signer
-    // value is dropped and that fact is published with Release ordering.
-    let value =
-        authenticated.map(|request| SignerDroppedAuthenticatedPlace::new(request, timestamp));
+    // Retention and the reply both happen strictly after the signer value is
+    // destroyed and that fact is published with Release ordering.
+    let value = prepared.map(|prepared| {
+        let public_identity = prepared.public_identity;
+        *retained_place = Some(prepared);
+        signer.publish_prepared_public_identity(public_identity);
+        public_identity
+    });
     let _ = response.send(value);
 }
 
-fn authenticate_place(
+fn prepare_place(
     signer: &FixedEoaSigner,
     credentials: &L2Credentials,
-    request: SealedFreshPlaceAuthentication,
-    timestamp: L2Timestamp,
-) -> Result<AuthenticatedPlaceRequest, CredentialAuthorityError> {
+    request: SealedPmT2ProxyPlacePreparation,
+) -> Result<RetainedPreparedPlace, CredentialAuthorityError> {
     if request.unsigned_order.signature_profile() != PmClobV2SignatureType::Proxy
         || request.unsigned_order.maker() == request.unsigned_order.signer()
     {
@@ -1059,13 +1378,56 @@ fn authenticate_place(
     }
     let signed = signer.sign_clob_v2_order(request.domain, request.unsigned_order)?;
     let serialized = credentials.serialize_gtc_post_only(signed)?;
-    let authenticated = credentials.authenticate_place(timestamp, serialized)?;
-    if authenticated.expected_order_id() != derived.expected_order_id()
-        || authenticated.semantic_request_commitment() != derived.semantic_request_commitment()
+    if serialized.expected_order_id() != derived.expected_order_id()
+        || serialized.semantic_request_commitment() != derived.semantic_request_commitment()
     {
         return Err(CredentialAuthorityError::PlacePublicIdentityMismatch);
     }
-    Ok(authenticated)
+    Ok(RetainedPreparedPlace {
+        serialized,
+        public_identity: derived,
+    })
+}
+
+fn respond_place_finalization(
+    mut authorization: PlaceHmacAdmission,
+    response: oneshot::Sender<Result<OpaqueAuthenticatedPlaceRequest, CredentialAuthorityError>>,
+    credentials: &L2Credentials,
+    place_time_finalizer: &mut PmPlaceMutationTimeFinalizer,
+    retained_place: &mut Option<RetainedPreparedPlace>,
+) {
+    authorization.wait_for_test_pause();
+    let Some(prepared) = retained_place.as_ref() else {
+        let _ = response.send(Err(CredentialAuthorityError::PlaceAlreadyConsumed));
+        return;
+    };
+    if authorization.public_identity != prepared.public_identity {
+        let _ = response.send(Err(CredentialAuthorityError::PlaceDispatchBindingMismatch));
+        return;
+    }
+    let Some(prepared) = retained_place.take() else {
+        std::process::abort();
+    };
+    let authenticated = place_time_finalizer
+        .authenticate_exact_place(
+            authorization.proof,
+            authorization.expected_l2_timestamp_seconds,
+            credentials,
+            prepared.serialized,
+        )
+        .map_err(Into::into)
+        .and_then(|authenticated| {
+            if authenticated.expected_order_id() != prepared.public_identity.expected_order_id()
+                || authenticated.semantic_request_commitment()
+                    != prepared.public_identity.semantic_request_commitment()
+            {
+                return Err(CredentialAuthorityError::PlacePublicIdentityMismatch);
+            }
+            Ok(OpaqueAuthenticatedPlaceRequest {
+                request: authenticated,
+            })
+        });
+    let _ = response.send(authenticated);
 }
 
 fn handle_common_request(credentials: &L2Credentials, request: CommonAuthorityRequest) {
@@ -1173,17 +1535,44 @@ fn owner_match(matches: bool) -> Result<(), CredentialAuthorityError> {
     }
 }
 
-async fn request_place(
-    sender: &mpsc::Sender<PlaceAuthenticationRequest>,
-    request: SealedFreshPlaceAuthentication,
-) -> Result<SignerDroppedAuthenticatedPlace, CredentialAuthorityError> {
+async fn request_place<T>(
+    sender: &mpsc::Sender<PlaceAuthorityRequest>,
+    make: impl FnOnce(oneshot::Sender<Result<T, CredentialAuthorityError>>) -> PlaceAuthorityRequest,
+) -> Result<T, CredentialAuthorityError> {
     let (response, receive) = oneshot::channel();
     sender
-        .try_send(PlaceAuthenticationRequest { request, response })
+        .try_send(make(response))
         .map_err(classify_place_send)?;
-    receive
-        .await
-        .map_err(|_| CredentialAuthorityError::AuthorityClosed)?
+    let mut admitted = AdmittedPlaceRequestGuard { armed: true };
+    let result = match receive.await {
+        Ok(result) => result,
+        // An admitted prepare/finalize request may have changed signer/body
+        // custody or consumed the only HMAC opportunity. Losing its terminal
+        // reply is ambiguous and must not unwind into a reusable session.
+        Err(_) => std::process::abort(),
+    };
+    admitted.disarm();
+    result
+}
+
+struct AdmittedPlaceRequestGuard {
+    armed: bool,
+}
+
+impl AdmittedPlaceRequestGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AdmittedPlaceRequestGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // Dropping the caller future after channel admission would lose
+            // whether signing/retention or the final HMAC already occurred.
+            std::process::abort();
+        }
+    }
 }
 
 async fn request_common<T>(
@@ -1200,7 +1589,7 @@ async fn request_common<T>(
 }
 
 fn classify_place_send(
-    error: mpsc::error::TrySendError<PlaceAuthenticationRequest>,
+    error: mpsc::error::TrySendError<PlaceAuthorityRequest>,
 ) -> CredentialAuthorityError {
     match error {
         mpsc::error::TrySendError::Full(request) => {
@@ -1232,27 +1621,42 @@ fn classify_common_send(
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::{
-        convert::Infallible, fs, os::unix::fs::PermissionsExt as _, path::Path, time::Duration,
+        convert::Infallible,
+        fs,
+        os::unix::{fs::PermissionsExt as _, process::ExitStatusExt as _},
+        path::Path,
+        process::Command,
+        time::Duration,
     };
 
     use reap_pm_core::{
-        EvmAddress, PmOrderSalt, PmOrderSide, PmPrice, PmQuantity, PmTick, PmTokenId, U256,
+        ConnectionEpoch, EvmAddress, PmMarketId, PmOrderSalt, PmOrderSide, PmPrice, PmQuantity,
+        PmTick, PmTokenId, U256,
     };
     use reap_polymarket_auth::{
         AuthenticatedUserSubscriptionSink, EoaAddress, FixedOrderId, FixedOwnedCancelRequestSink,
         FixedPlaceRequestSink, L2HeaderSink,
     };
+    use reap_polymarket_live_adapter::{
+        PmPlaceServerTimeHttpRole, PmProductClockOwner, PmPublicConnectivityOwner,
+        PmPublicHttpConfig, PmPublicWsConfig,
+    };
     use reap_polymarket_wire::{
-        PmUnsignedClobV2Order, parse_live_open_order_page, parse_live_order_detail,
-        parse_live_trade_page, parse_live_user_frame,
+        PmBookParserConfig, PmUnsignedClobV2Order, PmWireScope, parse_live_open_order_page,
+        parse_live_order_detail, parse_live_trade_page, parse_live_user_frame,
     };
     use tempfile::TempDir;
+    use tokio::{
+        io::{AsyncReadExt as _, AsyncWriteExt as _},
+        net::TcpListener,
+        task::JoinHandle,
+    };
 
     use super::*;
     use crate::{
         controlled_trial::{
             AuthorizedL2Timestamp, SealedExactOwnedCancelAuthentication,
-            SealedExactOwnedOrderReadAuthentication, SealedFreshPlaceAuthentication,
+            SealedExactOwnedOrderReadAuthentication,
         },
         credentials::{FreshPlaceCredentialFiles, RecoveryOnlyCredentialFiles},
     };
@@ -1266,6 +1670,7 @@ mod tests {
     const PASSPHRASE: &str = "synthetic-passphrase";
     const CONDITION: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
     const AUTH_SECONDS: u64 = 1_780_449_126;
+    const CANCELLATION_CHILD_CASE: &str = "REAP_PM_AUTHORITY_CANCELLATION_CHILD_CASE";
 
     fn write(directory: &Path, name: &str, value: &str) {
         let path = directory.join(name);
@@ -1320,6 +1725,105 @@ mod tests {
         AuthorizedL2Timestamp::new(L2Timestamp::from_unix_seconds(AUTH_SECONDS).unwrap())
     }
 
+    fn test_wire_scope() -> PmWireScope {
+        PmWireScope::new(
+            PmConditionId::parse(CONDITION).unwrap(),
+            PmMarketId::parse(CONDITION).unwrap(),
+            PmTokenId::new(U256::from_u64(1_234)).unwrap(),
+        )
+    }
+
+    fn place_time_roles(origin: &str) -> (PmPlaceServerTimeHttpRole, PmPlaceMutationTimeFinalizer) {
+        let scope = test_wire_scope();
+        let http = PmPublicHttpConfig::loopback_evidence(
+            origin,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let parser = PmBookParserConfig::new_condition_bound(
+            scope,
+            PmTick::parse_decimal("0.01").unwrap(),
+            PmQuantity::parse_decimal("5").unwrap(),
+            false,
+        );
+        let public_ws = PmPublicWsConfig::loopback_evidence(
+            "ws://127.0.0.1:9/ws/market",
+            scope,
+            Duration::from_secs(1),
+            Duration::from_secs(20),
+            Duration::from_secs(10),
+            Duration::from_secs(2),
+            64 * 1_024,
+            1,
+            Duration::from_millis(1),
+            8,
+            ConnectionEpoch::new(1),
+        )
+        .unwrap();
+        let (
+            metadata,
+            book,
+            read_time,
+            private_read,
+            place_time,
+            cancel_time,
+            public_ws,
+            user_clock,
+            actor_clock,
+            okx_clock,
+        ) = PmPublicConnectivityOwner::new(http, parser, public_ws, PmProductClockOwner::system())
+            .unwrap()
+            .into_roles()
+            .into_roles();
+        drop((
+            metadata,
+            book,
+            read_time,
+            private_read,
+            cancel_time,
+            public_ws,
+            user_clock,
+            actor_clock,
+            okx_clock,
+        ));
+        place_time.into_roles()
+    }
+
+    fn unused_place_time_finalizer() -> PmPlaceMutationTimeFinalizer {
+        place_time_roles("http://127.0.0.1:9").1
+    }
+
+    async fn start_time_server(request_count: usize) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            for _ in 0..request_count {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::with_capacity(1_024);
+                loop {
+                    let mut buffer = [0_u8; 512];
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                    assert!(request.len() <= 8 * 1_024);
+                }
+                assert!(request.starts_with(b"GET /time HTTP/1.1\r\n"));
+                let body = AUTH_SECONDS.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        (origin, task)
+    }
+
     fn proxy_order() -> PmUnsignedClobV2Order {
         PmUnsignedClobV2Order::new_pm_t2_proxy(
             PmOrderSalt::from_u64(1_713_398_400_000).unwrap(),
@@ -1353,10 +1857,10 @@ mod tests {
         .unwrap()
     }
 
-    fn sealed_place(order: PmUnsignedClobV2Order) -> SealedFreshPlaceAuthentication {
+    fn sealed_place(order: PmUnsignedClobV2Order) -> SealedPmT2ProxyPlacePreparation {
         let domain = reap_polymarket_auth::PmClobDomain::Standard;
         let identity = derive_place_public_request_identity(domain, order);
-        SealedFreshPlaceAuthentication::new(domain, order, timestamp(), identity)
+        SealedPmT2ProxyPlacePreparation::new(domain, order, identity)
     }
 
     fn all_staged_absent(directory: &Path) -> bool {
@@ -1497,6 +2001,127 @@ mod tests {
             .unwrap()
     }
 
+    async fn cancellation_child(case: &str) {
+        match case {
+            "prepare" => {
+                let directory = stage_four();
+                let roles = fresh_owner(directory.path())
+                    .spawn(unused_place_time_finalizer())
+                    .unwrap();
+                let (place, cancel, http, user_ws, supervisor) = roles.into_roles();
+                let (admitted, admitted_receive) = std::sync::mpsc::sync_channel(0);
+                let (release, release_receive) = std::sync::mpsc::channel();
+                let request = sealed_place(proxy_order()).with_test_pause(PlaceRequestTestPause {
+                    admitted,
+                    release: release_receive,
+                });
+                let task = tokio::spawn(place.prepare_place_once(request));
+                tokio::task::spawn_blocking(move || admitted_receive.recv().unwrap())
+                    .await
+                    .unwrap();
+                task.abort();
+                let _ = task.await;
+                drop(release);
+                drop((cancel, http, user_ws));
+                let _ = supervisor.shutdown_bounded(normal_bounds()).await;
+                drop(directory);
+            }
+            "finalize" => {
+                let (origin, time_server) = start_time_server(1).await;
+                let (place_time_http, place_time_finalizer) = place_time_roles(&origin);
+                let directory = stage_four();
+                let roles = fresh_owner(directory.path())
+                    .spawn(place_time_finalizer)
+                    .unwrap();
+                let (place, cancel, http, user_ws, supervisor) = roles.into_roles();
+                let prepared = place
+                    .prepare_place_once(sealed_place(proxy_order()))
+                    .await
+                    .unwrap();
+                let identity = prepared.public_identity();
+                let proof = place_time_http.fresh_place_time().await.unwrap();
+                time_server.await.unwrap();
+                let (admitted, admitted_receive) = std::sync::mpsc::sync_channel(0);
+                let (release, release_receive) = std::sync::mpsc::channel();
+                let task = tokio::spawn(prepared.finalize_place_once_paused_for_test(
+                    identity,
+                    AUTH_SECONDS,
+                    proof,
+                    PlaceRequestTestPause {
+                        admitted,
+                        release: release_receive,
+                    },
+                ));
+                tokio::task::spawn_blocking(move || admitted_receive.recv().unwrap())
+                    .await
+                    .unwrap();
+                task.abort();
+                let _ = task.await;
+                drop(release);
+                drop((cancel, http, user_ws));
+                let _ = supervisor.shutdown_bounded(normal_bounds()).await;
+                drop(directory);
+            }
+            _ => panic!("unknown cancellation child case"),
+        }
+        panic!("dropping an admitted place future returned instead of aborting the process");
+    }
+
+    #[test]
+    fn admitted_prepare_and_finalize_future_cancellation_abort_the_process() {
+        if let Ok(case) = std::env::var(CANCELLATION_CHILD_CASE) {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(3)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(cancellation_child(&case));
+            return;
+        }
+
+        let executable = std::env::current_exe().unwrap();
+        for case in ["prepare", "finalize"] {
+            let status = Command::new(&executable)
+                .arg("--exact")
+                .arg(
+                    "controlled_trial::authority::tests::admitted_prepare_and_finalize_future_cancellation_abort_the_process",
+                )
+                .arg("--nocapture")
+                .env(CANCELLATION_CHILD_CASE, case)
+                .status()
+                .unwrap();
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGABRT),
+                "{case} cancellation must abort rather than unwind or detach",
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_an_unpolled_prepare_future_preserves_the_sole_task_authority() {
+        let directory = stage_four();
+        let roles = fresh_owner(directory.path())
+            .spawn(unused_place_time_finalizer())
+            .unwrap();
+        let (place, cancel, http, user_ws, supervisor) = roles.into_roles();
+        let later = place.duplicate_for_task_gate();
+        let never_polled = place.prepare_place_once(sealed_place(proxy_order()));
+        drop(never_polled);
+        let prepared = later
+            .prepare_place_once(sealed_place(proxy_order()))
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared.public_identity(),
+            derive_place_public_request_identity(PmClobDomain::Standard, proxy_order())
+        );
+        drop((prepared, cancel, http, user_ws));
+        let outcome = supervisor.shutdown_bounded(normal_bounds()).await.unwrap();
+        assert!(outcome.task_completed_cleanly());
+        assert!(all_staged_absent(directory.path()));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fresh_authority_places_once_then_reads_binds_and_cancels_with_the_same_l2() {
         let public_identity = derive_place_public_request_identity(
@@ -1536,17 +2161,19 @@ mod tests {
         let foreign_user_frame =
             parse_live_user_frame(user_frame_json(order_id, FOREIGN_API_KEY).as_bytes()).unwrap();
 
+        let (time_origin, time_server) = start_time_server(2).await;
+        let (place_time_http, place_time_finalizer) = place_time_roles(&time_origin);
         let directory = stage_four();
-        let roles = fresh_owner(directory.path()).spawn().unwrap();
-        let (place, mut cancel, mut http, mut user_ws, supervisor) = roles.into_roles();
+        let roles = fresh_owner(directory.path())
+            .spawn(place_time_finalizer)
+            .unwrap();
+        let (place, mut cancel, mut http, mut user_ws, mut supervisor) = roles.into_roles();
         let duplicate_place = place.duplicate_for_task_gate();
 
-        let place_result = place
-            .authenticate_place_once(sealed_place(proxy_order()))
-            .await;
+        let prepared_result = place.prepare_place_once(sealed_place(proxy_order())).await;
         let signer_dropped_before_reply = supervisor.signer_dropped_for_test();
         let second_place_result = duplicate_place
-            .authenticate_place_once(sealed_place(proxy_order()))
+            .prepare_place_once(sealed_place(proxy_order()))
             .await;
         let staged_files_remain_before_prepared_or_shutdown =
             directory.path().join("private-key").exists()
@@ -1554,11 +2181,48 @@ mod tests {
                 && directory.path().join("l2-secret").exists()
                 && directory.path().join("passphrase").exists();
 
+        let prepared = prepared_result.unwrap();
+        let prepared_public_identity = prepared.public_identity();
+        let wrong_prepared_identity = derive_place_public_request_identity(
+            reap_polymarket_auth::PmClobDomain::NegativeRisk,
+            proxy_order(),
+        );
+        let wrong_key_removal =
+            supervisor.remove_private_key_after_prepared_for_test(wrong_prepared_identity);
+        let private_key_remains_after_wrong_identity =
+            directory.path().join("private-key").exists();
+        let key_removal =
+            supervisor.remove_private_key_after_prepared_for_test(prepared_public_identity);
+        let private_key_absent_after_explicit_removal =
+            !directory.path().join("private-key").exists();
+        let l2_files_remain_after_explicit_key_removal = directory.path().join("api-key").exists()
+            && directory.path().join("l2-secret").exists()
+            && directory.path().join("passphrase").exists();
+        let mismatched_test_continuation = SignerDroppedPlacePreparation {
+            public_identity: prepared_public_identity,
+            sender: prepared.sender.clone(),
+        };
+        let wrong_time = place_time_http.fresh_place_time().await.unwrap();
+        let dispatch_mismatch = mismatched_test_continuation
+            .finalize_place_once_for_test(wrong_prepared_identity, AUTH_SECONDS, wrong_time)
+            .await;
+        let exact_time = place_time_http
+            .fresh_place_time_observation()
+            .await
+            .unwrap();
+        assert_eq!(exact_time.observed_l2_timestamp_seconds(), AUTH_SECONDS);
+        let place_result = prepared
+            .finalize_place_once_for_test(
+                prepared_public_identity,
+                AUTH_SECONDS,
+                exact_time.into_proof(),
+            )
+            .await;
+        time_server.await.unwrap();
         let place_capture = place_result.map(|place| {
-            let (request, authorized_timestamp) = place.into_parts();
             let mut capture = MutationCapture::default();
-            request.dispatch(&mut capture).unwrap();
-            (capture, authorized_timestamp)
+            place.request.dispatch(&mut capture).unwrap();
+            capture
         });
 
         let open_headers = capture_headers(http.authenticate_open_orders(timestamp()).await);
@@ -1650,9 +2314,21 @@ mod tests {
             CredentialAuthorityError::PlaceAlreadyConsumed
         );
         assert!(staged_files_remain_before_prepared_or_shutdown);
+        assert_eq!(
+            wrong_key_removal.unwrap_err(),
+            CredentialAuthorityError::PlacePreparedIdentityMismatch
+        );
+        assert!(private_key_remains_after_wrong_identity);
+        assert_eq!(key_removal, Ok(()));
+        assert!(private_key_absent_after_explicit_removal);
+        assert!(l2_files_remain_after_explicit_key_removal);
+        assert_eq!(
+            dispatch_mismatch.unwrap_err(),
+            CredentialAuthorityError::PlaceDispatchBindingMismatch
+        );
 
-        let (place_capture, place_timestamp) = place_capture.unwrap();
-        assert_eq!(place_timestamp.unix_seconds(), AUTH_SECONDS);
+        assert_eq!(prepared_public_identity, public_identity);
+        let place_capture = place_capture.unwrap();
         assert_eq!(place_capture.address, SIGNER);
         assert_eq!(place_capture.timestamp, AUTH_SECONDS.to_string());
         assert_eq!(place_capture.api_key, API_KEY);
@@ -1731,14 +2407,31 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fresh_no_place_shutdown_joins_then_removes_all_four_files() {
         let directory = stage_four();
-        let roles = fresh_owner(directory.path()).spawn().unwrap();
-        let (place, cancel, http, user_ws, supervisor) = roles.into_roles();
+        let roles = fresh_owner(directory.path())
+            .spawn(unused_place_time_finalizer())
+            .unwrap();
+        let (place, cancel, http, user_ws, mut supervisor) = roles.into_roles();
         let signer_was_owned = !supervisor.signer_dropped_for_test();
+        let premature_key_removal = supervisor.remove_private_key_after_prepared_for_test(
+            derive_place_public_request_identity(
+                reap_polymarket_auth::PmClobDomain::Standard,
+                proxy_order(),
+            ),
+        );
+        let all_staged_remain_after_premature_removal =
+            ["private-key", "api-key", "l2-secret", "passphrase"]
+                .iter()
+                .all(|name| directory.path().join(name).exists());
         drop((place, cancel, http, user_ws));
         let shutdown = supervisor.shutdown_bounded(normal_bounds()).await;
         let staged_absent = all_staged_absent(directory.path());
 
         assert!(signer_was_owned);
+        assert_eq!(
+            premature_key_removal.unwrap_err(),
+            CredentialAuthorityError::SignerStillOwned
+        );
+        assert!(all_staged_remain_after_premature_removal);
         let shutdown = shutdown.unwrap();
         assert!(shutdown.task_completed_cleanly());
         assert!(shutdown.credentials_dropped());
@@ -1750,10 +2443,18 @@ mod tests {
     async fn failed_place_consumes_and_drops_signer_then_shutdown_removes_all_files() {
         let invalid_place = sealed_place(eoa_order());
         let directory = stage_four();
-        let roles = fresh_owner(directory.path()).spawn().unwrap();
-        let (place, cancel, http, user_ws, supervisor) = roles.into_roles();
-        let place_result = place.authenticate_place_once(invalid_place).await;
+        let roles = fresh_owner(directory.path())
+            .spawn(unused_place_time_finalizer())
+            .unwrap();
+        let (place, cancel, http, user_ws, mut supervisor) = roles.into_roles();
+        let place_result = place.prepare_place_once(invalid_place).await;
         let signer_dropped_before_reply = supervisor.signer_dropped_for_test();
+        let key_removal = supervisor.remove_private_key_after_prepared_for_test(
+            derive_place_public_request_identity(
+                reap_polymarket_auth::PmClobDomain::Standard,
+                proxy_order(),
+            ),
+        );
         drop((cancel, http, user_ws));
         let shutdown = supervisor.shutdown_bounded(normal_bounds()).await;
         let staged_absent = all_staged_absent(directory.path());
@@ -1763,6 +2464,10 @@ mod tests {
             CredentialAuthorityError::PlaceProfileMismatch
         );
         assert!(signer_dropped_before_reply);
+        assert_eq!(
+            key_removal.unwrap_err(),
+            CredentialAuthorityError::PlacePreparedIdentityUnavailable
+        );
         assert!(shutdown.unwrap().task_completed_cleanly());
         assert!(staged_absent);
     }

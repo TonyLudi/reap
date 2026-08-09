@@ -5,7 +5,7 @@ use reap_pm_core::{
 };
 use reap_polymarket_auth::{
     EoaPrivateKeyInput, FixedEoaSigner, FixedOrderId, L2CredentialInput, L2Credentials,
-    L2Timestamp, PmClobDomain,
+    L2Timestamp, PmClobDomain, SerializedOwnedCancelRequest, SerializedPlaceRequest,
 };
 use reap_polymarket_wire::PmUnsignedClobV2Order;
 use tokio::{
@@ -19,6 +19,10 @@ use tokio::{
 use super::*;
 use crate::mutation::{
     retained::MAX_RETAINED_PLACE_BODY_BYTES, transport::MAX_MUTATION_RESPONSE_BYTES,
+};
+use crate::{
+    PM_MUTATION_SERVER_TIME_MAX_AGE, PmCancelMutationAuthenticationError,
+    PmPlaceMutationAuthenticationError, PmProductClockError, PmProductClockOwner,
 };
 
 const TEST_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -108,6 +112,19 @@ fn unsigned_order() -> PmUnsignedClobV2Order {
     .unwrap()
 }
 
+fn serialized_place(credentials: &L2Credentials) -> SerializedPlaceRequest {
+    let signed = signer()
+        .sign_clob_v2_order(PmClobDomain::Standard, unsigned_order())
+        .unwrap();
+    credentials.serialize_gtc_post_only(signed).unwrap()
+}
+
+fn serialized_cancel(credentials: &L2Credentials) -> SerializedOwnedCancelRequest {
+    credentials
+        .serialize_owned_cancel(FixedOrderId::parse(EXPECTED_ID).unwrap())
+        .unwrap()
+}
+
 fn retained_place() -> PmRetainedPlaceRequest {
     retained_place_with_passphrase(PASSPHRASE)
 }
@@ -121,22 +138,203 @@ fn retained_place_with_credentials(
     api_secret: &str,
     passphrase: &str,
 ) -> PmRetainedPlaceRequest {
-    let signer = signer();
     let credentials = credentials_with_values(api_key, api_secret, passphrase);
-    let signed = signer
-        .sign_clob_v2_order(PmClobDomain::Standard, unsigned_order())
-        .unwrap();
-    let body = credentials.serialize_gtc_post_only(signed).unwrap();
+    let body = serialized_place(&credentials);
     let authenticated = credentials
         .authenticate_place(L2Timestamp::from_unix_seconds(AUTH_SECONDS).unwrap(), body)
         .unwrap();
     PmRetainedPlaceRequest::retain(authenticated).unwrap()
 }
 
+#[test]
+fn place_time_bridge_authenticates_exact_hidden_time_at_the_inclusive_boundary() {
+    let owner = PmProductClockOwner::test_support_scripted(&[
+        (1_000, 10),
+        (
+            1_001,
+            10 + PM_MUTATION_SERVER_TIME_MAX_AGE.as_nanos() as u64,
+        ),
+        (
+            1_002,
+            10 + PM_MUTATION_SERVER_TIME_MAX_AGE.as_nanos() as u64,
+        ),
+    ])
+    .unwrap();
+    let (_, _, _, _, _, place_time, mut finalizer, _, _, _, _) = owner.split().into_views();
+    let timestamp = L2Timestamp::from_unix_seconds(AUTH_SECONDS).unwrap();
+    let proof = place_time.place_time_proof(timestamp, place_time.observe_rest_edge().unwrap());
+    let credentials = credentials();
+    let authenticated = finalizer
+        .authenticate_exact_place(
+            proof,
+            AUTH_SECONDS,
+            &credentials,
+            serialized_place(&credentials),
+        )
+        .unwrap();
+    let retained = PmRetainedPlaceRequest::retain(authenticated).unwrap();
+    assert_eq!(retained.l2_timestamp_seconds(), AUTH_SECONDS);
+}
+
+#[test]
+fn place_time_bridge_rejects_evidence_mismatch_foreign_domain_and_staleness() {
+    let mismatch = PmProductClockOwner::test_support_scripted(&[(1_000, 10), (1_001, 11)]).unwrap();
+    let (_, _, _, _, _, place_time, mut finalizer, _, _, _, _) = mismatch.split().into_views();
+    let timestamp = L2Timestamp::from_unix_seconds(AUTH_SECONDS).unwrap();
+    let proof = place_time.place_time_proof(timestamp, place_time.observe_rest_edge().unwrap());
+    let credentials = credentials();
+    assert!(matches!(
+        finalizer.authenticate_exact_place(
+            proof,
+            AUTH_SECONDS + 1,
+            &credentials,
+            serialized_place(&credentials),
+        ),
+        Err(PmPlaceMutationAuthenticationError::ObservedTimestampMismatch)
+    ));
+
+    let local = PmProductClockOwner::test_support_scripted(&[(2_000, 20)]).unwrap();
+    let foreign = PmProductClockOwner::test_support_scripted(&[(3_000, 30)]).unwrap();
+    let (_, _, _, _, _, _, mut local_finalizer, _, _, _, _) = local.split().into_views();
+    let (_, _, _, _, _, foreign_place_time, _, _, _, _, _) = foreign.split().into_views();
+    let foreign_proof = foreign_place_time
+        .place_time_proof(timestamp, foreign_place_time.observe_rest_edge().unwrap());
+    assert!(matches!(
+        local_finalizer.authenticate_exact_place(
+            foreign_proof,
+            AUTH_SECONDS,
+            &credentials,
+            serialized_place(&credentials),
+        ),
+        Err(PmPlaceMutationAuthenticationError::Clock(
+            PmProductClockError::WrongDomain
+        ))
+    ));
+
+    let stale = PmProductClockOwner::test_support_scripted(&[
+        (4_000, 40),
+        (4_001, 41),
+        (
+            4_002,
+            40 + PM_MUTATION_SERVER_TIME_MAX_AGE.as_nanos() as u64 + 1,
+        ),
+    ])
+    .unwrap();
+    let (_, _, _, _, _, stale_place_time, mut stale_finalizer, _, _, _, _) =
+        stale.split().into_views();
+    let stale_proof =
+        stale_place_time.place_time_proof(timestamp, stale_place_time.observe_rest_edge().unwrap());
+    assert!(matches!(
+        stale_finalizer.authenticate_exact_place(
+            stale_proof,
+            AUTH_SECONDS,
+            &credentials,
+            serialized_place(&credentials),
+        ),
+        Err(PmPlaceMutationAuthenticationError::Clock(
+            PmProductClockError::ServerTimeStale
+        ))
+    ));
+}
+
+#[test]
+fn cancel_time_bridge_authenticates_exact_hidden_time_at_the_inclusive_boundary() {
+    let owner = PmProductClockOwner::test_support_scripted(&[
+        (5_000, 50),
+        (
+            5_001,
+            50 + PM_MUTATION_SERVER_TIME_MAX_AGE.as_nanos() as u64,
+        ),
+        (
+            5_002,
+            50 + PM_MUTATION_SERVER_TIME_MAX_AGE.as_nanos() as u64,
+        ),
+    ])
+    .unwrap();
+    let (_, _, _, _, _, _, _, cancel_time, mut finalizer, _, _) = owner.split().into_views();
+    let timestamp = L2Timestamp::from_unix_seconds(AUTH_SECONDS).unwrap();
+    let proof = cancel_time.cancel_time_proof(timestamp, cancel_time.observe_rest_edge().unwrap());
+    let credentials = credentials();
+    let authenticated = finalizer
+        .authenticate_exact_owned_cancel(
+            proof,
+            AUTH_SECONDS,
+            &credentials,
+            serialized_cancel(&credentials),
+        )
+        .unwrap();
+    let retained = PmRetainedOwnedCancelRequest::retain(authenticated).unwrap();
+    assert_eq!(retained.l2_timestamp_seconds(), AUTH_SECONDS);
+    assert_eq!(
+        retained.order_id(),
+        FixedOrderId::parse(EXPECTED_ID).unwrap()
+    );
+}
+
+#[test]
+fn cancel_time_bridge_rejects_evidence_mismatch_foreign_domain_and_final_staleness() {
+    let mismatch = PmProductClockOwner::test_support_scripted(&[(6_000, 60), (6_001, 61)]).unwrap();
+    let (_, _, _, _, _, _, _, cancel_time, mut finalizer, _, _) = mismatch.split().into_views();
+    let timestamp = L2Timestamp::from_unix_seconds(AUTH_SECONDS).unwrap();
+    let proof = cancel_time.cancel_time_proof(timestamp, cancel_time.observe_rest_edge().unwrap());
+    let credentials = credentials();
+    assert!(matches!(
+        finalizer.authenticate_exact_owned_cancel(
+            proof,
+            AUTH_SECONDS + 1,
+            &credentials,
+            serialized_cancel(&credentials),
+        ),
+        Err(PmCancelMutationAuthenticationError::ObservedTimestampMismatch)
+    ));
+
+    let local = PmProductClockOwner::test_support_scripted(&[(7_000, 70)]).unwrap();
+    let foreign = PmProductClockOwner::test_support_scripted(&[(8_000, 80)]).unwrap();
+    let (_, _, _, _, _, _, _, _, mut local_finalizer, _, _) = local.split().into_views();
+    let (_, _, _, _, _, _, _, foreign_cancel_time, _, _, _) = foreign.split().into_views();
+    let foreign_proof = foreign_cancel_time
+        .cancel_time_proof(timestamp, foreign_cancel_time.observe_rest_edge().unwrap());
+    assert!(matches!(
+        local_finalizer.authenticate_exact_owned_cancel(
+            foreign_proof,
+            AUTH_SECONDS,
+            &credentials,
+            serialized_cancel(&credentials),
+        ),
+        Err(PmCancelMutationAuthenticationError::Clock(
+            PmProductClockError::WrongDomain
+        ))
+    ));
+
+    let stale = PmProductClockOwner::test_support_scripted(&[
+        (9_000, 90),
+        (9_001, 91),
+        (
+            9_002,
+            90 + PM_MUTATION_SERVER_TIME_MAX_AGE.as_nanos() as u64 + 1,
+        ),
+    ])
+    .unwrap();
+    let (_, _, _, _, _, _, _, stale_cancel_time, mut stale_finalizer, _, _) =
+        stale.split().into_views();
+    let stale_proof = stale_cancel_time
+        .cancel_time_proof(timestamp, stale_cancel_time.observe_rest_edge().unwrap());
+    assert!(matches!(
+        stale_finalizer.authenticate_exact_owned_cancel(
+            stale_proof,
+            AUTH_SECONDS,
+            &credentials,
+            serialized_cancel(&credentials),
+        ),
+        Err(PmCancelMutationAuthenticationError::Clock(
+            PmProductClockError::ServerTimeStale
+        ))
+    ));
+}
+
 fn retained_cancel() -> PmRetainedOwnedCancelRequest {
     let credentials = credentials();
-    let order_id = FixedOrderId::parse(EXPECTED_ID).unwrap();
-    let body = credentials.serialize_owned_cancel(order_id).unwrap();
+    let body = serialized_cancel(&credentials);
     let authenticated = credentials
         .authenticate_owned_cancel(L2Timestamp::from_unix_seconds(AUTH_SECONDS).unwrap(), body)
         .unwrap();

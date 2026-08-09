@@ -590,6 +590,7 @@ pub enum PmPlaceResultKindV1 {
     Rejected,
     OutOfProfile,
     AcknowledgementUnknown,
+    DefinitelyNotDispatched,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

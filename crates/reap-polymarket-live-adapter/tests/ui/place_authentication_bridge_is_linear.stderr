@@ -1,0 +1,10 @@
+error[E0382]: use of moved value: `proof`
+  --> tests/ui/place_authentication_bridge_is_linear.rs:12:48
+   |
+ 6 |     proof: PmPlaceMutationTimeProof,
+   |     ----- move occurs because `proof` has type `PmPlaceMutationTimeProof`, which does not implement the `Copy` trait
+...
+11 |     let _ = finalizer.authenticate_exact_place(proof, 1_700_000_000, credentials, first);
+   |                                                ----- value moved here
+12 |     let _ = finalizer.authenticate_exact_place(proof, 1_700_000_000, credentials, second);
+   |                                                ^^^^^ value used here after move

@@ -2016,7 +2016,6 @@ mod tests {
             user_ws,
             _actor,
             _okx,
-            _validator,
         ) = PmPublicConnectivityOwner::new(http, parser, public_ws, PmProductClockOwner::system())
             .unwrap()
             .into_roles()
