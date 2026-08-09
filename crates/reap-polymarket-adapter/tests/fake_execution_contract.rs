@@ -9,7 +9,8 @@ use reap_pm_core::{
 use reap_polymarket_adapter::{
     MAX_PM_FAKE_ACK_FILL_LEGS, PmFakeCancelOutcome, PmFakeCancelRejectReason, PmFakeCancelScript,
     PmFakeExecutionError, PmFakeImmediateFill, PmFakeOrderType, PmFakePlaceOutcome,
-    PmFakePlaceRejectReason, PmFakePlaceScript, PmFixtureInstrumentScope, PmFixtureOwnedExecution,
+    PmFakePlaceRejectReason, PmFakePlaceScript, PmFixedMutationPreparation,
+    PmFixtureInstrumentScope, PmFixtureOwnedExecution,
 };
 
 fn client_order(account: PmAccountHandle) -> PmClientOrderKey {
@@ -93,6 +94,39 @@ fn place_command_binds_exact_identity_and_the_only_outer_profile() {
             r#""signer":"0xabababababababababababababababababababab","#,
             r#""takerAmount":"10000000","timestamp":"1760000000000","tokenId":"123"}"#
         )
+    );
+}
+
+#[test]
+fn pm_t2_proxy_preparation_binds_distinct_funder_signer_and_signature_type_one() {
+    let base = support::account_scope();
+    let signer = EvmAddress::parse("0xdededededededededededededededededededede").unwrap();
+    let proxy_scope = PmAccountScope::new(
+        base.environment(),
+        base.chain(),
+        PmSignerId::new(signer),
+        base.funder(),
+        base.handle(),
+    );
+    let request = PmFixedMutationPreparation::new_pm_t2_proxy(proxy_scope, support::instrument())
+        .prepare_place(
+            support::instrument_scope(),
+            client_order(proxy_scope.handle()),
+            PmOrderSalt::from_u64(123_456_789).unwrap(),
+            PmOrderSide::Buy,
+            PmPrice::parse_decimal("0.40").unwrap(),
+            PmQuantity::parse_decimal("10").unwrap(),
+            1_760_000_000_000,
+        )
+        .unwrap();
+
+    assert_eq!(request.account_scope(), proxy_scope);
+    assert_eq!(request.unsigned_order().maker(), base.funder().address());
+    assert_eq!(request.unsigned_order().signer(), signer);
+    assert_eq!(request.unsigned_order().signature_type(), 1);
+    assert_eq!(
+        request.unsigned_order().signature_profile(),
+        reap_polymarket_wire::PmClobV2SignatureType::Proxy
     );
 }
 

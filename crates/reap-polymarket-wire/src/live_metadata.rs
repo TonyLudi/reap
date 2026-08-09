@@ -63,6 +63,48 @@ pub struct PmClobV2Metadata {
     tick: PmTick,
     minimum_order_size: PmQuantity,
     negative_risk: bool,
+    maker_base_fee_bps: u64,
+    taker_base_fee_bps: u64,
+    fee_details: PmClobFeeDetails,
+    take_only_delay_enabled: bool,
+    minimum_order_age_seconds: u64,
+}
+
+/// One exact, nonnegative JSON-decimal fee parameter from the CLOB response.
+/// The lexeme is retained because binary floating-point is not authoritative.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PmClobFeeDecimal(Box<str>);
+
+impl PmClobFeeDecimal {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Optional fee-curve values inside the required `fd` object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PmClobFeeDetails {
+    rate: Option<PmClobFeeDecimal>,
+    exponent: Option<PmClobFeeDecimal>,
+    taker_only: Option<bool>,
+}
+
+impl PmClobFeeDetails {
+    #[must_use]
+    pub const fn rate(&self) -> Option<&PmClobFeeDecimal> {
+        self.rate.as_ref()
+    }
+
+    #[must_use]
+    pub const fn exponent(&self) -> Option<&PmClobFeeDecimal> {
+        self.exponent.as_ref()
+    }
+
+    #[must_use]
+    pub const fn taker_only(&self) -> Option<bool> {
+        self.taker_only
+    }
 }
 
 impl PmClobV2Metadata {
@@ -99,6 +141,31 @@ impl PmClobV2Metadata {
     #[must_use]
     pub const fn negative_risk(&self) -> bool {
         self.negative_risk
+    }
+
+    #[must_use]
+    pub const fn maker_base_fee_bps(&self) -> u64 {
+        self.maker_base_fee_bps
+    }
+
+    #[must_use]
+    pub const fn taker_base_fee_bps(&self) -> u64 {
+        self.taker_base_fee_bps
+    }
+
+    #[must_use]
+    pub const fn fee_details(&self) -> &PmClobFeeDetails {
+        &self.fee_details
+    }
+
+    #[must_use]
+    pub const fn take_only_delay_enabled(&self) -> bool {
+        self.take_only_delay_enabled
+    }
+
+    #[must_use]
+    pub const fn minimum_order_age_seconds(&self) -> u64 {
+        self.minimum_order_age_seconds
     }
 }
 
@@ -154,6 +221,9 @@ pub fn parse_live_clob_v2_metadata(
     if raw_tokens.len() > MAX_MARKET_TOKENS {
         return Err(PmWireError::TooManyMarketTokens);
     }
+    if raw_tokens.len() != 2 {
+        return Err(PmWireError::UnexpectedMarketTokenCount);
+    }
     let mut seen = BTreeSet::new();
     let mut tokens = Vec::with_capacity(raw_tokens.len());
     let mut configured_outcome = None;
@@ -186,6 +256,37 @@ pub fn parse_live_clob_v2_metadata(
         PresentField::Missing => false,
         PresentField::Present(value) => value,
     };
+    let maker_base_fee_bps = wire
+        .maker_base_fee
+        .ok_or(PmWireError::MissingField("maker_base_fee"))?;
+    let taker_base_fee_bps = wire
+        .taker_base_fee
+        .ok_or(PmWireError::MissingField("taker_base_fee"))?;
+    let raw_fee_details = match wire.fee_details {
+        PresentField::Missing => return Err(PmWireError::MissingField("fee_details")),
+        PresentField::Present(None) => return Err(PmWireError::NullField("fee_details")),
+        PresentField::Present(Some(details)) => details,
+    };
+    let fee_details = PmClobFeeDetails {
+        rate: raw_fee_details
+            .rate
+            .as_deref()
+            .map(|value| parse_fee_decimal(value, "fee_details.rate"))
+            .transpose()?,
+        exponent: raw_fee_details
+            .exponent
+            .as_deref()
+            .map(|value| parse_fee_decimal(value, "fee_details.exponent"))
+            .transpose()?,
+        taker_only: raw_fee_details.taker_only,
+    };
+    let take_only_delay_enabled = match wire.is_take_only_delay_enabled {
+        PresentField::Missing => false,
+        PresentField::Present(value) => value,
+    };
+    let minimum_order_age_seconds = wire
+        .order_acceptance_status
+        .ok_or(PmWireError::MissingField("minimum_order_age_seconds"))?;
 
     Ok(PmClobV2Metadata {
         requested_condition: request.condition(),
@@ -195,7 +296,30 @@ pub fn parse_live_clob_v2_metadata(
         tick,
         minimum_order_size,
         negative_risk,
+        maker_base_fee_bps,
+        taker_base_fee_bps,
+        fee_details,
+        take_only_delay_enabled,
+        minimum_order_age_seconds,
     })
+}
+
+fn parse_fee_decimal(
+    value: &RawValue,
+    field: &'static str,
+) -> Result<PmClobFeeDecimal, PmWireError> {
+    const MAX_FEE_DECIMAL_BYTES: usize = 64;
+
+    let text = value.get();
+    // `RawValue` retains the original JSON-number spelling. The containing
+    // typed deserialization has already proved legal JSON, so preserve every
+    // bounded nonnegative spelling instead of converting through f64 or
+    // inventing a venue-side canonical-decimal grammar.
+    if text.is_empty() || text.len() > MAX_FEE_DECIMAL_BYTES || !text.as_bytes()[0].is_ascii_digit()
+    {
+        return Err(PmWireError::InvalidNumeric(field));
+    }
+    Ok(PmClobFeeDecimal(text.into()))
 }
 
 fn check_rest_bound(raw: &[u8]) -> Result<(), PmWireError> {
@@ -318,7 +442,7 @@ struct RawLongClobMarket {
 }
 
 // This spelling mirrors `MarketDetails` in the pinned official TypeScript
-// client. Only `c`, `t`, `mts`, `mos`, and `nr` are authority-bearing here.
+// client plus `oas` from the frozen v3 OpenAPI response contract.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawShortClobMarket {
@@ -335,11 +459,11 @@ struct RawShortClobMarket {
     #[serde(default, rename = "r")]
     _rewards: Option<Box<RawValue>>,
     #[serde(default, rename = "fd")]
-    _fee_details: Option<Box<RawValue>>,
+    fee_details: PresentField<Option<RawFeeDetails>>,
     #[serde(default, rename = "mbf")]
-    _maker_base_fee: Option<Box<RawValue>>,
+    maker_base_fee: Option<u64>,
     #[serde(default, rename = "tbf")]
-    _taker_base_fee: Option<Box<RawValue>>,
+    taker_base_fee: Option<u64>,
     #[serde(default, rename = "ao")]
     _accepting_orders: Option<Box<RawValue>>,
     #[serde(default, rename = "sd")]
@@ -353,11 +477,22 @@ struct RawShortClobMarket {
     #[serde(default, rename = "rfqe")]
     _rfq_enabled: Option<Box<RawValue>>,
     #[serde(default, rename = "itode")]
-    _is_take_only_delay_enabled: Option<Box<RawValue>>,
+    is_take_only_delay_enabled: PresentField<bool>,
     #[serde(default, rename = "ibce")]
     _is_bonding_curve_enabled: Option<Box<RawValue>>,
     #[serde(default, rename = "oas")]
-    _order_acceptance_status: Option<Box<RawValue>>,
+    order_acceptance_status: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFeeDetails {
+    #[serde(default, rename = "r")]
+    rate: Option<Box<RawValue>>,
+    #[serde(default, rename = "e")]
+    exponent: Option<Box<RawValue>>,
+    #[serde(default, rename = "to")]
+    taker_only: Option<bool>,
 }
 
 #[derive(Deserialize)]

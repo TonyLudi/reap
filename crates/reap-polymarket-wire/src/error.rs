@@ -23,6 +23,8 @@ pub enum PmWireError {
     TooManyMarketTokens,
     #[error("required public Polymarket field `{0}` is missing")]
     MissingField(&'static str),
+    #[error("required public Polymarket field `{0}` is explicitly null")]
+    NullField(&'static str),
     #[error("public Polymarket field `{0}` exceeds its byte bound")]
     FieldTooLong(&'static str),
     #[error("public Polymarket field `{0}` is not ASCII")]
@@ -41,6 +43,8 @@ pub enum PmWireError {
     ConfiguredTokenMissing,
     #[error("CLOB metadata contains a duplicate outcome token")]
     DuplicateToken,
+    #[error("CLOB market details must contain exactly two distinct outcome tokens")]
+    UnexpectedMarketTokenCount,
     #[error("book or price-change batch contains a duplicate side/price")]
     DuplicateLevel,
     #[error("book snapshot has an empty bid or ask side")]

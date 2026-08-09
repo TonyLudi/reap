@@ -3,8 +3,8 @@ use reap_pm_core::{
     U256,
 };
 use reap_polymarket_wire::{
-    PM_CLOB_V2_EMPTY_BYTES32, PM_CLOB_V2_EOA_SIGNATURE_TYPE, PmUnsignedClobV2Order,
-    PmUnsignedOrderError,
+    PM_CLOB_V2_EMPTY_BYTES32, PM_CLOB_V2_EOA_SIGNATURE_TYPE, PM_CLOB_V2_PROXY_SIGNATURE_TYPE,
+    PmClobV2SignatureType, PmUnsignedClobV2Order, PmUnsignedOrderError,
 };
 
 const MAKER: &str = "0x1111111111111111111111111111111111111111";
@@ -71,7 +71,35 @@ fn structural_accessors_preserve_the_exact_unsigned_values() {
     assert_eq!(order.maker_amount(), U256::from_u64(4_000_000));
     assert_eq!(order.taker_amount(), U256::from_u64(10_000_000));
     assert_eq!(order.side(), PmOrderSide::Buy);
+    assert_eq!(order.signature_profile(), PmClobV2SignatureType::Eoa);
+    assert_eq!(order.signature_type(), PM_CLOB_V2_EOA_SIGNATURE_TYPE);
     assert_eq!(order.timestamp_ms(), 1_760_000_000_000);
+}
+
+#[test]
+fn proxy_unsigned_order_preserves_distinct_funder_signer_and_type_one() {
+    let order = PmUnsignedClobV2Order::new_pm_t2_proxy(
+        PmOrderSalt::from_u64(123_456_789).unwrap(),
+        address(MAKER),
+        address(OTHER),
+        PmTokenId::new(U256::from_u64(123)).unwrap(),
+        PmOrderSide::Buy,
+        PmPrice::parse_decimal("0.40").unwrap(),
+        PmQuantity::parse_decimal("10").unwrap(),
+        PmTick::parse_decimal("0.01").unwrap(),
+        PmQuantity::parse_decimal("5").unwrap(),
+        1_760_000_000_000,
+    )
+    .unwrap();
+
+    assert_eq!(order.maker(), address(MAKER));
+    assert_eq!(order.signer(), address(OTHER));
+    assert_eq!(order.signature_profile(), PmClobV2SignatureType::Proxy);
+    assert_eq!(order.signature_type(), PM_CLOB_V2_PROXY_SIGNATURE_TYPE);
+    let value = serde_json::to_value(order).unwrap();
+    assert_eq!(value["maker"], MAKER);
+    assert_eq!(value["signer"], OTHER);
+    assert_eq!(value["signatureType"], PM_CLOB_V2_PROXY_SIGNATURE_TYPE);
 }
 
 #[test]
@@ -114,5 +142,21 @@ fn lowering_revalidates_eoa_grid_lot_minimum_and_timestamp() {
         Err(PmUnsignedOrderError::Numeric(
             PmNumericError::QuantityBelowMinimum
         ))
+    );
+
+    assert_eq!(
+        PmUnsignedClobV2Order::new_pm_t2_proxy(
+            PmOrderSalt::from_u64(1).unwrap(),
+            address(MAKER),
+            address(MAKER),
+            PmTokenId::new(U256::from_u64(123)).unwrap(),
+            PmOrderSide::Buy,
+            PmPrice::parse_decimal("0.40").unwrap(),
+            PmQuantity::parse_decimal("10").unwrap(),
+            PmTick::parse_decimal("0.01").unwrap(),
+            PmQuantity::parse_decimal("5").unwrap(),
+            1,
+        ),
+        Err(PmUnsignedOrderError::ProxyIdentityMismatch)
     );
 }

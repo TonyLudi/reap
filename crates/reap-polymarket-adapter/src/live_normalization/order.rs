@@ -26,7 +26,7 @@ pub(crate) fn normalize_rest_order(
     order: &PmLiveOrder,
     require_open: bool,
 ) -> Result<NormalizedOrderRow, PmLiveNormalizationError> {
-    let eoa = scope.validate_account_profile()?;
+    let expected_maker = scope.expected_order_maker();
     let key_digest = order_key_digest(order.id());
     let facts_digest = rest_order_facts_digest(order);
     if !scope.is_configured(order.condition(), order.token()) {
@@ -37,7 +37,7 @@ pub(crate) fn normalize_rest_order(
             configured: None,
         });
     }
-    if order.maker() != eoa {
+    if order.maker() != expected_maker {
         return Err(PmLiveNormalizationError::AccountProfileMismatch);
     }
     if order
@@ -81,7 +81,6 @@ pub(crate) fn normalize_user_order(
     scope: LiveNormalizationScope,
     order: &PmLiveUserOrder,
 ) -> Result<NormalizedOrderRow, PmLiveNormalizationError> {
-    scope.validate_account_profile()?;
     let key_digest = order_key_digest(order.id());
     let facts_digest = user_order_facts_digest(order);
     if !scope.is_configured(order.condition(), order.token()) {
@@ -120,7 +119,7 @@ pub(crate) fn normalize_user_order(
             .ok_or(PmLiveNormalizationError::MissingUserOrderProfileFact(
                 "status",
             ))?;
-    if maker != scope.validate_account_profile()? {
+    if maker != scope.expected_order_maker() {
         return Err(PmLiveNormalizationError::AccountProfileMismatch);
     }
     if order_type != "GTC" {

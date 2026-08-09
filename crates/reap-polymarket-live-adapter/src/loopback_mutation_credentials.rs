@@ -19,7 +19,7 @@ use reap_polymarket_auth::{
     AuthenticatedJournalCredentialSlotFingerprint, CredentialSlotId, FixedEoaSigner, FixedOrderId,
     L2Credentials, L2Timestamp, PmAuthError, PmClobDomain,
 };
-use reap_polymarket_wire::PmWireScope;
+use reap_polymarket_wire::{PmClobV2SignatureType, PmWireScope};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
@@ -154,6 +154,7 @@ struct MutationBinding {
     clob_domain: PmClobDomain,
     place_profile: PmGtcPostOnlyProfile,
     cancel_purpose: PmCancelOwnedPurpose,
+    signature_profile: PmClobV2SignatureType,
 }
 
 /// Test/loopback-only owner of the sole EOA signer and L2 bundle for one
@@ -183,6 +184,70 @@ impl PmLoopbackMutationConnectivityOwner {
         signer: FixedEoaSigner,
         credentials: L2Credentials,
     ) -> Result<Self, PmLoopbackMutationAuthError> {
+        Self::new_with_signature_profile(
+            http_config,
+            user_ws_config,
+            account,
+            instrument,
+            trading_domain,
+            place_profile,
+            cancel_purpose,
+            observation_grant,
+            credential_slot,
+            signer,
+            credentials,
+            PmClobV2SignatureType::Eoa,
+        )
+    }
+
+    /// Construct the feature-gated PM-T2 proxy profile. The private key, L2
+    /// credentials, and account signer remain one EOA; the account funder is
+    /// the distinct proxy maker. This grants no production transport.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_pm_t2_proxy(
+        http_config: PmPrivateHttpConfig,
+        user_ws_config: PmUserWsConfig,
+        account: PmAccountScope,
+        instrument: PmInstrumentHandle,
+        trading_domain: PmGoalFTradingDomain,
+        place_profile: PmGtcPostOnlyProfile,
+        cancel_purpose: PmCancelOwnedPurpose,
+        observation_grant: PmPublicObservationGrant,
+        credential_slot: CredentialSlotId,
+        signer: FixedEoaSigner,
+        credentials: L2Credentials,
+    ) -> Result<Self, PmLoopbackMutationAuthError> {
+        Self::new_with_signature_profile(
+            http_config,
+            user_ws_config,
+            account,
+            instrument,
+            trading_domain,
+            place_profile,
+            cancel_purpose,
+            observation_grant,
+            credential_slot,
+            signer,
+            credentials,
+            PmClobV2SignatureType::Proxy,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_signature_profile(
+        http_config: PmPrivateHttpConfig,
+        user_ws_config: PmUserWsConfig,
+        account: PmAccountScope,
+        instrument: PmInstrumentHandle,
+        trading_domain: PmGoalFTradingDomain,
+        place_profile: PmGtcPostOnlyProfile,
+        cancel_purpose: PmCancelOwnedPurpose,
+        observation_grant: PmPublicObservationGrant,
+        credential_slot: CredentialSlotId,
+        signer: FixedEoaSigner,
+        credentials: L2Credentials,
+        signature_profile: PmClobV2SignatureType,
+    ) -> Result<Self, PmLoopbackMutationAuthError> {
         let wire_scope = http_config.exact_order_scope();
         if wire_scope.condition() != user_ws_config.condition() {
             return Err(PmLoopbackMutationAuthError::InvalidConfiguration(
@@ -209,13 +274,35 @@ impl PmLoopbackMutationConnectivityOwner {
             ));
         }
         let configured_eoa = signer.address().as_core();
-        if credentials.address() != signer.address()
-            || account.signer().address() != configured_eoa
-            || account.funder().address() != configured_eoa
-        {
-            return Err(PmLoopbackMutationAuthError::InvalidConfiguration(
-                "signer, L2 credentials, account signer, and funder must be one EOA",
-            ));
+        let configured_funder = account.funder().address();
+        match signature_profile {
+            PmClobV2SignatureType::Eoa
+                if credentials.address() != signer.address()
+                    || account.signer().address() != configured_eoa
+                    || configured_funder != configured_eoa =>
+            {
+                return Err(PmLoopbackMutationAuthError::InvalidConfiguration(
+                    "signer, L2 credentials, account signer, and funder must be one EOA",
+                ));
+            }
+            PmClobV2SignatureType::Proxy
+                if credentials.address() != signer.address()
+                    || account.signer().address() != configured_eoa =>
+            {
+                return Err(PmLoopbackMutationAuthError::InvalidConfiguration(
+                    "private-key signer, L2 credentials, and account signer must be one EOA",
+                ));
+            }
+            PmClobV2SignatureType::Proxy
+                if configured_funder.bytes() == [0; 20]
+                    || configured_eoa.bytes() == [0; 20]
+                    || configured_funder == configured_eoa =>
+            {
+                return Err(PmLoopbackMutationAuthError::InvalidConfiguration(
+                    "PM-T2 proxy funder must be nonzero and distinct from the signer EOA",
+                ));
+            }
+            PmClobV2SignatureType::Eoa | PmClobV2SignatureType::Proxy => {}
         }
         if place_profile.order_type() != PmFixedOrderType::Gtc
             || !place_profile.post_only()
@@ -242,6 +329,7 @@ impl PmLoopbackMutationConnectivityOwner {
                 clob_domain,
                 place_profile,
                 cancel_purpose,
+                signature_profile,
             },
             configuration_fingerprint: observation_grant.configuration_fingerprint(),
             credential_slot_fingerprint,
@@ -256,11 +344,16 @@ impl PmLoopbackMutationConnectivityOwner {
         let address = self.credentials.address();
         let transport = PmPrivateHttpTransport::new(&self.http_config, address)?;
         let senders = spawn_loopback_authority(self.binding, self.signer, self.credentials)?;
-        let http = PmAuthenticatedHttpOwner::from_authority(
+        let balance_signature_type = match self.binding.signature_profile {
+            PmClobV2SignatureType::Eoa => crate::PmReadOnlySignatureType::Eoa,
+            PmClobV2SignatureType::Proxy => crate::PmReadOnlySignatureType::Proxy,
+        };
+        let http = PmAuthenticatedHttpOwner::from_authority_with_account_profile(
             transport,
             self.http_config.exact_order_scope(),
             address,
-            crate::PmReadOnlySignatureType::Eoa,
+            self.binding.account.funder().address(),
+            balance_signature_type,
             PmHttpCredentialRole::from_sender(senders.read.clone()),
         );
         let user_ws = PmAuthenticatedUserWsRole::from_authority(
@@ -282,6 +375,7 @@ impl PmLoopbackMutationConnectivityOwner {
                 instrument: self.binding.instrument,
                 trading_domain: self.binding.trading_domain,
                 wire_scope: self.http_config.exact_order_scope(),
+                signature_profile: self.binding.signature_profile,
             },
             credential_slot_fingerprint: self.credential_slot_fingerprint,
             supervisor: senders.supervisor,
@@ -318,6 +412,7 @@ pub struct PmLoopbackMutationConnectivityBinding {
     instrument: PmInstrumentHandle,
     trading_domain: PmGoalFTradingDomain,
     wire_scope: PmWireScope,
+    signature_profile: PmClobV2SignatureType,
 }
 
 impl PmLoopbackMutationConnectivityBinding {
@@ -344,6 +439,11 @@ impl PmLoopbackMutationConnectivityBinding {
     #[must_use]
     pub const fn wire_scope(&self) -> PmWireScope {
         self.wire_scope
+    }
+
+    #[must_use]
+    pub const fn signature_profile(&self) -> PmClobV2SignatureType {
+        self.signature_profile
     }
 }
 
@@ -602,10 +702,23 @@ fn authenticate_place(
     let unsigned = request.unsigned_order();
     let expected = exact_order_amounts(request.side(), request.price(), request.quantity())
         .map_err(|_| PmLoopbackMutationAuthError::PlaceOrderMismatch)?;
-    let eoa = binding.account.signer().address();
-    if binding.account.funder().address() != eoa
-        || unsigned.maker() != eoa
-        || unsigned.signer() != eoa
+    let eoa_signer = binding.account.signer().address();
+    let expected_maker = binding.account.funder().address();
+    let identity_matches = match binding.signature_profile {
+        PmClobV2SignatureType::Eoa => {
+            expected_maker == eoa_signer
+                && unsigned.maker() == eoa_signer
+                && unsigned.signer() == eoa_signer
+                && unsigned.signature_profile() == PmClobV2SignatureType::Eoa
+        }
+        PmClobV2SignatureType::Proxy => {
+            expected_maker != eoa_signer
+                && unsigned.maker() == expected_maker
+                && unsigned.signer() == eoa_signer
+                && unsigned.signature_profile() == PmClobV2SignatureType::Proxy
+        }
+    };
+    if !identity_matches
         || unsigned.token_id() != binding.trading_domain.instrument().token()
         || unsigned.side() != request.side()
         || unsigned.maker_amount() != expected.maker()

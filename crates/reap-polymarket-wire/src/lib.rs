@@ -13,6 +13,7 @@ mod hash;
 mod limits;
 mod live_metadata;
 mod live_private;
+mod preflight;
 mod private_fixture;
 mod raw;
 mod rest;
@@ -29,8 +30,8 @@ pub use limits::{
     MAX_PUBLIC_REST_BODY_BYTES, MAX_PUBLIC_WS_FRAME_BYTES, MAX_WS_EVENTS_PER_FRAME,
 };
 pub use live_metadata::{
-    PmClobV2Metadata, PmClobV2RequestScope, parse_live_clob_market_lifecycle,
-    parse_live_clob_v2_metadata,
+    PmClobFeeDecimal, PmClobFeeDetails, PmClobV2Metadata, PmClobV2RequestScope,
+    parse_live_clob_market_lifecycle, parse_live_clob_v2_metadata,
 };
 pub use live_private::{
     MAX_PM_LIVE_BODY_BYTES, MAX_PM_LIVE_CURSOR_BYTES, MAX_PM_LIVE_PAGE_ITEMS, PmCredentialOwner,
@@ -39,6 +40,10 @@ pub use live_private::{
     PmLiveTradePage, PmLiveUserEvent, PmLiveUserFrame, PmLiveUserOrder, PmLiveWireError,
     parse_live_balance_allowance, parse_live_cancel_result, parse_live_open_order_page,
     parse_live_order_detail, parse_live_place_result, parse_live_trade_page, parse_live_user_frame,
+};
+pub use preflight::{
+    MAX_PM_CLOSED_ONLY_BODY_BYTES, MAX_PM_GEOBLOCK_BODY_BYTES, PmClosedOnlyStatus,
+    PmGeoblockStatus, parse_pm_closed_only, parse_pm_geoblock,
 };
 pub use private_fixture::{
     PmFixtureAllowanceScope, PmFixtureMakerOrder, PmFixtureOpenOrder, PmFixtureTradeLinkage,
@@ -53,8 +58,8 @@ pub use rest::{
 pub use scope::{PmBookMarketBinding, PmBookParserConfig, PmWireScope};
 pub use subscription::PmMarketSubscription;
 pub use unsigned_order::{
-    PM_CLOB_V2_EMPTY_BYTES32, PM_CLOB_V2_EOA_SIGNATURE_TYPE, PmUnsignedClobV2Order,
-    PmUnsignedOrderError,
+    PM_CLOB_V2_EMPTY_BYTES32, PM_CLOB_V2_EOA_SIGNATURE_TYPE, PM_CLOB_V2_PROXY_SIGNATURE_TYPE,
+    PmClobV2SignatureType, PmUnsignedClobV2Order, PmUnsignedOrderError,
 };
 pub use ws::{
     PmBestBidAsk, PmBestPrices, PmBookSnapshot, PmExactBookLevel, PmExactPriceChange,

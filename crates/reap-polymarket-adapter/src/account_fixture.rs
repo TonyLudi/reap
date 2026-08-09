@@ -105,9 +105,6 @@ impl PmFixtureAccountPositionSnapshot {
         if trading_domain.chain() != account_scope.chain() {
             return Err(PmAccountPositionRoleError::DomainChainMismatch);
         }
-        if account_scope.signer().address() != account_scope.funder().address() {
-            return Err(PmAccountPositionRoleError::SignerFunderMismatch);
-        }
         let required_spenders = trading_domain
             .required_spenders()
             .map(|requirement| PmSpenderId::new(account_scope.handle(), requirement));

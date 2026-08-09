@@ -37,14 +37,14 @@ pub(crate) fn normalize_trade(
     scope: LiveNormalizationScope,
     trade: &PmLiveTrade,
 ) -> Result<NormalizedTrade, PmLiveNormalizationError> {
-    let eoa = scope.validate_account_profile()?;
+    let expected_maker = scope.expected_order_maker();
     let settlement = parse_trade_status(trade.status())?;
     if scope.is_configured(trade.condition(), trade.token()) {
         validate_configured_fill(scope, trade.side(), trade.price(), trade.size())?;
     }
     match trade.trader_side() {
         Some("TAKER") => normalize_taker_trade(scope, trade, settlement),
-        Some("MAKER") => normalize_maker_trade(scope, trade, settlement, eoa),
+        Some("MAKER") => normalize_maker_trade(scope, trade, settlement, expected_maker),
         _ => Ok(NormalizedTrade {
             candidates: Vec::new(),
             unresolved: Some(PmUnresolvedTradeReason::MissingDirectOrderRole),
@@ -115,7 +115,7 @@ fn normalize_maker_trade(
     scope: LiveNormalizationScope,
     trade: &PmLiveTrade,
     settlement: PmFillSettlementStatus,
-    eoa: EvmAddress,
+    expected_maker: EvmAddress,
 ) -> Result<NormalizedTrade, PmLiveNormalizationError> {
     if trade.maker_orders().is_empty() {
         return Ok(NormalizedTrade {
@@ -132,7 +132,7 @@ fn normalize_maker_trade(
     for maker in trade.maker_orders() {
         let configured = scope.is_configured(trade.condition(), maker.token());
         relevant_to_configured |= configured;
-        if maker.maker() == eoa {
+        if maker.maker() == expected_maker {
             let leg = make_maker_leg(scope, trade, maker, settlement)?;
             candidates.push(candidate_for_leg(leg, Some(maker.maker())));
             local_count += 1;

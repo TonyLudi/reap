@@ -257,6 +257,41 @@ fn configured_order_contradictions_fail_the_whole_cut() {
 }
 
 #[test]
+fn proxy_open_order_uses_funder_as_maker_and_rejects_a_foreign_maker() {
+    let (_, reconciliation, _) = PmReadOwnerGrant::allocate().split();
+    let mut role =
+        support::reconciliation_with_account(reconciliation, support::proxy_account_scope());
+    let configured = [open_page(
+        &[order(ORDER_A, CONDITION, "123", FUNDER, "0.42")],
+        "LTE=",
+    )];
+    let normalized = role
+        .request_open_orders(ConnectionEpoch::new(1), IngressSequence::new(10))
+        .unwrap()
+        .complete_live_pages(completion(1, 11, Some(1)), snapshot(1), &configured)
+        .unwrap();
+    assert!(normalized.foreign_diagnostics().is_empty());
+    let serviced = normalized.into_delivery().service_at(30_000).unwrap();
+    role.reduce_open_orders_delivery(serviced, |_, envelope| {
+        assert_eq!(envelope.payload().orders().len(), 1);
+    })
+    .unwrap();
+
+    let foreign = [open_page(
+        &[order(ORDER_B, CONDITION, "123", FOREIGN_MAKER, "0.42")],
+        "LTE=",
+    )];
+    assert!(matches!(
+        role.request_open_orders(ConnectionEpoch::new(1), IngressSequence::new(20))
+            .unwrap()
+            .complete_live_pages(completion(1, 21, Some(2)), snapshot(2), &foreign),
+        Err(PmReconciliationContractError::Live(
+            PmLiveNormalizationError::AccountProfileMismatch
+        ))
+    ));
+}
+
+#[test]
 fn empty_live_cuts_are_explicit_and_exact_detail_uses_rest_status() {
     let (_, reconciliation, _) = PmReadOwnerGrant::allocate().split();
     let mut role = reconciliation_with(reconciliation);

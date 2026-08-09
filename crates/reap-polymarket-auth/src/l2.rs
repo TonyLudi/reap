@@ -278,6 +278,15 @@ impl L2Credentials {
         self.read_headers(timestamp, b"/balance-allowance")
     }
 
+    /// Headers for the fixed signer-bound account preflight
+    /// `GET /auth/ban-status/closed-only` operation.
+    pub fn authenticate_closed_only(
+        &self,
+        timestamp: L2Timestamp,
+    ) -> Result<AuthenticatedL2Headers, PmAuthError> {
+        self.read_headers(timestamp, b"/auth/ban-status/closed-only")
+    }
+
     /// Headers for one exact `GET /data/order/{orderID}` operation.
     pub fn authenticate_order_detail(
         &self,

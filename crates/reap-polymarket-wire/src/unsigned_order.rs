@@ -6,8 +6,27 @@ use serde::ser::{Serialize, SerializeStruct, Serializer};
 use thiserror::Error;
 
 pub const PM_CLOB_V2_EOA_SIGNATURE_TYPE: u8 = 0;
+pub const PM_CLOB_V2_PROXY_SIGNATURE_TYPE: u8 = 1;
 pub const PM_CLOB_V2_EMPTY_BYTES32: &str =
     "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Closed CLOB V2 order-signature profiles supported by the fixed PM wire
+/// contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PmClobV2SignatureType {
+    /// One EOA is both maker/funder and signer.
+    Eoa = PM_CLOB_V2_EOA_SIGNATURE_TYPE,
+    /// A distinct proxy is maker/funder while its owner EOA signs.
+    Proxy = PM_CLOB_V2_PROXY_SIGNATURE_TYPE,
+}
+
+impl PmClobV2SignatureType {
+    #[must_use]
+    pub const fn value(self) -> u8 {
+        self as u8
+    }
+}
 
 /// Canonical unsigned CLOB V2 fields for the fixed Goal F EOA profile.
 ///
@@ -22,6 +41,7 @@ pub struct PmUnsignedClobV2Order {
     maker_amount: U256,
     taker_amount: U256,
     side: PmOrderSide,
+    signature_profile: PmClobV2SignatureType,
     timestamp_ms: u64,
 }
 
@@ -42,6 +62,66 @@ impl PmUnsignedClobV2Order {
         if maker != signer {
             return Err(PmUnsignedOrderError::MakerIdentityMismatch);
         }
+        Self::new_checked(
+            salt,
+            maker,
+            signer,
+            token_id,
+            side,
+            price,
+            quantity,
+            tick,
+            minimum_order_size,
+            PmClobV2SignatureType::Eoa,
+            timestamp_ms,
+        )
+    }
+
+    /// Construct the fixed PM-T2 proxy profile: the nonzero proxy funder is
+    /// the order maker and a distinct nonzero owner EOA is the order signer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_pm_t2_proxy(
+        salt: PmOrderSalt,
+        proxy_funder: EvmAddress,
+        eoa_signer: EvmAddress,
+        token_id: PmTokenId,
+        side: PmOrderSide,
+        price: PmPrice,
+        quantity: PmQuantity,
+        tick: PmTick,
+        minimum_order_size: PmQuantity,
+        timestamp_ms: u64,
+    ) -> Result<Self, PmUnsignedOrderError> {
+        validate_proxy_identities(proxy_funder.bytes(), eoa_signer.bytes())?;
+        Self::new_checked(
+            salt,
+            proxy_funder,
+            eoa_signer,
+            token_id,
+            side,
+            price,
+            quantity,
+            tick,
+            minimum_order_size,
+            PmClobV2SignatureType::Proxy,
+            timestamp_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_checked(
+        salt: PmOrderSalt,
+        maker: EvmAddress,
+        signer: EvmAddress,
+        token_id: PmTokenId,
+        side: PmOrderSide,
+        price: PmPrice,
+        quantity: PmQuantity,
+        tick: PmTick,
+        minimum_order_size: PmQuantity,
+        signature_profile: PmClobV2SignatureType,
+        timestamp_ms: u64,
+    ) -> Result<Self, PmUnsignedOrderError> {
         if timestamp_ms == 0 {
             return Err(PmUnsignedOrderError::ZeroTimestamp);
         }
@@ -57,6 +137,7 @@ impl PmUnsignedClobV2Order {
             maker_amount: amounts.maker(),
             taker_amount: amounts.taker(),
             side,
+            signature_profile,
             timestamp_ms,
         })
     }
@@ -98,7 +179,12 @@ impl PmUnsignedClobV2Order {
 
     #[must_use]
     pub const fn signature_type(self) -> u8 {
-        PM_CLOB_V2_EOA_SIGNATURE_TYPE
+        self.signature_profile.value()
+    }
+
+    #[must_use]
+    pub const fn signature_profile(self) -> PmClobV2SignatureType {
+        self.signature_profile
     }
 
     #[must_use]
@@ -137,7 +223,7 @@ impl Serialize for PmUnsignedClobV2Order {
                 PmOrderSide::Sell => "SELL",
             },
         )?;
-        object.serialize_field("signatureType", &PM_CLOB_V2_EOA_SIGNATURE_TYPE)?;
+        object.serialize_field("signatureType", &self.signature_type())?;
         object.serialize_field("signer", &self.signer)?;
         object.serialize_field("takerAmount", &self.taker_amount)?;
         object.serialize_field("timestamp", &QuotedU64(self.timestamp_ms))?;
@@ -161,8 +247,52 @@ impl Serialize for QuotedU64 {
 pub enum PmUnsignedOrderError {
     #[error("fixed EOA unsigned order requires maker and signer to match")]
     MakerIdentityMismatch,
+    #[error("fixed proxy unsigned order requires a nonzero proxy maker/funder")]
+    ZeroProxyFunder,
+    #[error("fixed proxy unsigned order requires a nonzero EOA signer")]
+    ZeroProxySigner,
+    #[error("fixed proxy unsigned order requires distinct maker/funder and EOA signer")]
+    ProxyIdentityMismatch,
     #[error("unsigned order timestamp must be a positive Unix millisecond value")]
     ZeroTimestamp,
     #[error(transparent)]
     Numeric(#[from] PmNumericError),
+}
+
+fn validate_proxy_identities(
+    proxy_funder: [u8; 20],
+    eoa_signer: [u8; 20],
+) -> Result<(), PmUnsignedOrderError> {
+    if proxy_funder == [0; 20] {
+        return Err(PmUnsignedOrderError::ZeroProxyFunder);
+    }
+    if eoa_signer == [0; 20] {
+        return Err(PmUnsignedOrderError::ZeroProxySigner);
+    }
+    if proxy_funder == eoa_signer {
+        return Err(PmUnsignedOrderError::ProxyIdentityMismatch);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PmUnsignedOrderError, validate_proxy_identities};
+
+    #[test]
+    fn proxy_identity_gate_explicitly_rejects_each_zero_role_and_equal_identities() {
+        assert_eq!(
+            validate_proxy_identities([0; 20], [0x11; 20]),
+            Err(PmUnsignedOrderError::ZeroProxyFunder)
+        );
+        assert_eq!(
+            validate_proxy_identities([0x11; 20], [0; 20]),
+            Err(PmUnsignedOrderError::ZeroProxySigner)
+        );
+        assert_eq!(
+            validate_proxy_identities([0x11; 20], [0x11; 20]),
+            Err(PmUnsignedOrderError::ProxyIdentityMismatch)
+        );
+        assert_eq!(validate_proxy_identities([0x11; 20], [0x22; 20]), Ok(()));
+    }
 }

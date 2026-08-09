@@ -18,6 +18,7 @@ use reap_polymarket_adapter::{
 pub const CONDITION: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 pub const MARKET: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 pub const FUNDER: &str = "0xabababababababababababababababababababab";
+pub const PROXY_SIGNER: &str = "0xdededededededededededededededededededede";
 pub const MIXED_CASE_FUNDER: &str = "0xABABABABABABABABABABABABABABABABABABABAB";
 pub const PUSD: &str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
 pub const CONDITIONAL_TOKENS: &str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
@@ -54,6 +55,17 @@ pub fn account_scope() -> PmAccountScope {
         PmSignerId::new(eoa),
         PmFunderId::new(eoa),
         PmAccountHandle::from_ordinal(7),
+    )
+}
+
+pub fn proxy_account_scope() -> PmAccountScope {
+    let base = account_scope();
+    PmAccountScope::new(
+        base.environment(),
+        base.chain(),
+        PmSignerId::new(address(PROXY_SIGNER)),
+        PmFunderId::new(address(FUNDER)),
+        base.handle(),
     )
 }
 
@@ -138,33 +150,54 @@ pub fn grants() -> (
 }
 
 pub fn private_with(grant: PmFixturePrivateRoleGrant) -> PmFixturePrivateLifecycle {
+    private_with_account(grant, account_scope())
+}
+
+pub fn private_with_account(
+    grant: PmFixturePrivateRoleGrant,
+    account: PmAccountScope,
+) -> PmFixturePrivateLifecycle {
     PmFixturePrivateLifecycle::new(
         grant,
-        account_scope(),
+        account,
         instrument_scope(),
-        account_source(),
+        PmProductSource::polymarket_account(PmSourceHandle::from_ordinal(4), account.handle()),
         connection(),
     )
     .unwrap()
 }
 
 pub fn reconciliation_with(grant: PmFixtureReconciliationRoleGrant) -> PmFixtureReconciliation {
+    reconciliation_with_account(grant, account_scope())
+}
+
+pub fn reconciliation_with_account(
+    grant: PmFixtureReconciliationRoleGrant,
+    account: PmAccountScope,
+) -> PmFixtureReconciliation {
     PmFixtureReconciliation::new(
         grant,
-        account_scope(),
+        account,
         instrument_scope(),
-        account_source(),
+        PmProductSource::polymarket_account(PmSourceHandle::from_ordinal(4), account.handle()),
         connection(),
     )
     .unwrap()
 }
 
 pub fn account_with(grant: PmFixtureAccountRoleGrant) -> PmFixtureAccountPositionSnapshot {
+    account_with_account(grant, account_scope())
+}
+
+pub fn account_with_account(
+    grant: PmFixtureAccountRoleGrant,
+    account: PmAccountScope,
+) -> PmFixtureAccountPositionSnapshot {
     PmFixtureAccountPositionSnapshot::new(
         grant,
-        account_scope(),
+        account,
         instrument_scope(),
-        account_source(),
+        PmProductSource::polymarket_account(PmSourceHandle::from_ordinal(4), account.handle()),
         connection(),
     )
     .unwrap()

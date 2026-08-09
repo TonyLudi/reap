@@ -12,6 +12,7 @@
 mod account;
 mod config;
 mod error;
+mod geoblock_http;
 mod http_transport;
 #[cfg(any(test, feature = "loopback-evidence"))]
 mod loopback_mutation_credentials;
@@ -34,8 +35,12 @@ pub use account::{
     PmAccountAsset, PmAccountBalanceAllowance, PmAccountHttpRole, PmReadOnlyAccountHttpOwner,
     PmReadOnlySignatureType,
 };
-pub use config::{PM_CLOB_PRODUCTION_ORIGIN, PmPrivateHttpConfig, PmPublicHttpConfig};
+pub use config::{
+    PM_CLOB_PRODUCTION_ORIGIN, PM_GEOBLOCK_PRODUCTION_ORIGIN, PmGeoblockHttpConfig,
+    PmPrivateHttpConfig, PmPublicHttpConfig,
+};
 pub use error::{PmLiveAdapterError, PmPublicMetadataDeliveryError, PmRestBookDeliveryError};
+pub use geoblock_http::PmGeoblockHttpRole;
 #[cfg(any(test, feature = "loopback-evidence"))]
 pub use loopback_mutation_credentials::{
     PmLoopbackCancelAuthenticationFailure, PmLoopbackCancelAuthenticationRole,
@@ -43,7 +48,9 @@ pub use loopback_mutation_credentials::{
     PmLoopbackMutationConnectivityOwner, PmLoopbackMutationConnectivityRoles,
     PmLoopbackPlaceAuthenticationFailure, PmLoopbackPlaceAuthenticationRole,
 };
-pub use metadata_http::{PmLiveMetadataPair, PmLiveMetadataPairSink, PmPublicMetadataHttpRole};
+pub use metadata_http::{
+    PmLiveMetadataPair, PmLiveMetadataPairSink, PmPublicMetadataHttpRole, PmTypedLiveMarketDetails,
+};
 pub use mutation::{
     PmCancelMutationOutcome, PmExactOwnedCancelLoopbackRole, PmFixedPlaceLoopbackRole,
     PmLoopbackMutationConfig, PmMutationClassification, PmMutationDiagnostic,
@@ -56,7 +63,7 @@ pub use private_credentials::{
     PmCredentialAuthorityShutdownOutcome, PmCredentialAuthoritySupervisor,
     PmPrivateConnectivityOwner, PmPrivateConnectivityRoles,
 };
-pub use private_http::PmAuthenticatedHttpOwner;
+pub use private_http::{PmAuthenticatedHttpOwner, PmPrivatePreflightHttpRole};
 #[cfg(any(test, feature = "loopback-evidence"))]
 pub use product_clock::PmLoopbackServerTimeScript;
 pub use product_clock::{

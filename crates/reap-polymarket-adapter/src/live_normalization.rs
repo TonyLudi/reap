@@ -11,7 +11,7 @@ pub(crate) use trade::{fill_event_from_leg, normalize_trade};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum PmLiveNormalizationError {
-    #[error("live PM account profile requires signer, funder, and observed maker to be one EOA")]
+    #[error("live PM configured order maker does not match the account funder")]
     AccountProfileMismatch,
     #[error("live PM configured order explicitly names an unsupported order type")]
     UnsupportedOrderType,
@@ -71,13 +71,11 @@ pub(crate) struct LiveNormalizationScope {
 }
 
 impl LiveNormalizationScope {
-    pub(crate) fn validate_account_profile(self) -> Result<EvmAddress, PmLiveNormalizationError> {
-        let signer = self.account.signer().address();
-        let funder = self.account.funder().address();
-        if signer != funder {
-            return Err(PmLiveNormalizationError::AccountProfileMismatch);
-        }
-        Ok(funder)
+    /// The CLOB order maker is always the account funder. For signature type
+    /// zero this is the signer EOA; for signature type one it is the distinct
+    /// proxy address. L2 authentication remains bound to the signer upstream.
+    pub(crate) const fn expected_order_maker(self) -> EvmAddress {
+        self.account.funder().address()
     }
 
     pub(crate) fn is_configured(

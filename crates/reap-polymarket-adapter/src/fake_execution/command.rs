@@ -115,8 +115,15 @@ pub struct PmExactOwnedCancelRequest {
 pub struct PmFixedMutationPreparation {
     account_scope: PmAccountScope,
     instrument: PmInstrumentHandle,
+    identity_profile: PmFixedMutationIdentityProfile,
     place_profile: PmGtcPostOnlyProfile,
     cancel_purpose: PmCancelOwnedPurpose,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PmFixedMutationIdentityProfile {
+    GoalFEoa,
+    PmT2Proxy,
 }
 
 impl PmFixedMutationPreparation {
@@ -125,6 +132,25 @@ impl PmFixedMutationPreparation {
         Self {
             account_scope,
             instrument,
+            identity_profile: PmFixedMutationIdentityProfile::GoalFEoa,
+            place_profile: PmGtcPostOnlyProfile::goal_f(),
+            cancel_purpose: PmCancelOwnedPurpose::goal_f(),
+        }
+    }
+
+    /// Construct the fixed PM-T2 preparation path for a proxy-funded account.
+    /// The request remains structural and carries no signer or transport
+    /// authority. Exact distinct proxy/signer identities are rechecked when
+    /// the place request is prepared.
+    #[must_use]
+    pub const fn new_pm_t2_proxy(
+        account_scope: PmAccountScope,
+        instrument: PmInstrumentHandle,
+    ) -> Self {
+        Self {
+            account_scope,
+            instrument,
+            identity_profile: PmFixedMutationIdentityProfile::PmT2Proxy,
             place_profile: PmGtcPostOnlyProfile::goal_f(),
             cancel_purpose: PmCancelOwnedPurpose::goal_f(),
         }
@@ -168,22 +194,38 @@ impl PmFixedMutationPreparation {
         }
         let signer = self.account_scope.signer().address();
         let funder = self.account_scope.funder().address();
-        if signer != funder {
-            return Err(PmFakeExecutionError::EoaIdentityMismatch);
-        }
         let metadata = instrument_scope.metadata();
-        let unsigned_order = PmUnsignedClobV2Order::new_goal_f(
-            salt,
-            funder,
-            signer,
-            instrument_scope.id().token(),
-            side,
-            price,
-            quantity,
-            metadata.tick(),
-            metadata.minimum_order_size(),
-            timestamp_ms,
-        )?;
+        let unsigned_order = match self.identity_profile {
+            PmFixedMutationIdentityProfile::GoalFEoa => {
+                if signer != funder {
+                    return Err(PmFakeExecutionError::EoaIdentityMismatch);
+                }
+                PmUnsignedClobV2Order::new_goal_f(
+                    salt,
+                    funder,
+                    signer,
+                    instrument_scope.id().token(),
+                    side,
+                    price,
+                    quantity,
+                    metadata.tick(),
+                    metadata.minimum_order_size(),
+                    timestamp_ms,
+                )?
+            }
+            PmFixedMutationIdentityProfile::PmT2Proxy => PmUnsignedClobV2Order::new_pm_t2_proxy(
+                salt,
+                funder,
+                signer,
+                instrument_scope.id().token(),
+                side,
+                price,
+                quantity,
+                metadata.tick(),
+                metadata.minimum_order_size(),
+                timestamp_ms,
+            )?,
+        };
         Ok(PmGtcPostOnlyPlaceRequest {
             account_scope: self.account_scope,
             instrument_scope,

@@ -1,6 +1,7 @@
 const MANIFEST: &str = include_str!("../Cargo.toml");
 const LIB: &str = include_str!("../src/lib.rs");
 const CONFIG: &str = include_str!("../src/config.rs");
+const GEOBLOCK_HTTP: &str = include_str!("../src/geoblock_http.rs");
 const HTTP_TRANSPORT: &str = include_str!("../src/http_transport.rs");
 const LOOPBACK_MUTATION_CREDENTIALS: &str = include_str!("../src/loopback_mutation_credentials.rs");
 const METADATA_HTTP: &str = include_str!("../src/metadata_http.rs");
@@ -51,6 +52,7 @@ fn modules_are_separate_and_raw_transport_remains_private() {
     for module in [
         "mod config;",
         "mod error;",
+        "mod geoblock_http;",
         "mod http_transport;",
         "mod metadata_http;",
         "mod private_http;",
@@ -99,6 +101,9 @@ fn production_read_only_facade_is_opaque_exact_bound_and_mutation_free() {
         "validate_one_eoa(expected_signer, expected_funder)?",
         "credentials.address().as_core() != expected_eoa",
         "pub struct PmReadOnlyPrivateConnectivityRoles",
+        "pub server_time: PmReadServerTimeHttpRole",
+        "pub geoblock: PmGeoblockHttpRole",
+        "pub market_details: PmPublicMetadataHttpRole",
         "pub authenticated_http: PmAuthenticatedHttpOwner",
         "pub authenticated_user_ws: PmAuthenticatedUserWsRole",
         "pub credential_supervisor: PmCredentialAuthoritySupervisor",
@@ -538,12 +543,15 @@ fn authenticated_user_websocket_is_fixed_bound_and_has_no_raw_or_mutation_escape
 }
 
 #[test]
-fn public_routes_are_exactly_time_book_and_the_atomic_metadata_pair() {
+fn public_routes_are_exactly_the_reviewed_get_only_surface() {
     assert!(HTTP_TRANSPORT.contains("url.set_path(\"/time\")"));
     assert!(HTTP_TRANSPORT.contains("url.set_path(\"/book\")"));
     assert!(HTTP_TRANSPORT.contains(".append_pair(\"token_id\""));
     assert!(HTTP_TRANSPORT.contains("format!(\"/markets/{condition}\")"));
     assert!(HTTP_TRANSPORT.contains("format!(\"/clob-markets/{condition}\")"));
+    assert!(HTTP_TRANSPORT.contains("url.set_path(\"/api/geoblock\")"));
+    assert!(GEOBLOCK_HTTP.contains("PmPublicRoute::Geoblock"));
+    assert!(GEOBLOCK_HTTP.contains("MAX_PM_GEOBLOCK_BODY_BYTES"));
     assert!(METADATA_HTTP.contains("PmLiveMetadataPair"));
     assert!(METADATA_HTTP.contains("deliver_native_metadata_pair"));
     assert!(METADATA_HTTP.contains("self.scope.condition()"));
@@ -563,7 +571,14 @@ fn public_routes_are_exactly_time_book_and_the_atomic_metadata_pair() {
 
 #[test]
 fn public_role_has_no_auth_private_ws_or_mutation_capability() {
-    let production = [CONFIG, HTTP_TRANSPORT, PUBLIC_HTTP, METADATA_HTTP].join("\n");
+    let production = [
+        CONFIG,
+        GEOBLOCK_HTTP,
+        HTTP_TRANSPORT,
+        PUBLIC_HTTP,
+        METADATA_HTTP,
+    ]
+    .join("\n");
     for forbidden in [
         "L2Credentials",
         "PrivateKey",

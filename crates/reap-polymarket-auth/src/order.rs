@@ -2,7 +2,8 @@ use std::fmt;
 
 use reap_pm_core::{PmOrderSalt, PmOrderSide, PmTokenId, U256};
 use reap_polymarket_wire::{
-    PM_CLOB_V2_EMPTY_BYTES32, PM_CLOB_V2_EOA_SIGNATURE_TYPE, PmUnsignedClobV2Order,
+    PM_CLOB_V2_EMPTY_BYTES32, PM_CLOB_V2_EOA_SIGNATURE_TYPE, PM_CLOB_V2_PROXY_SIGNATURE_TYPE,
+    PmClobV2SignatureType, PmUnsignedClobV2Order,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -65,6 +66,12 @@ const FIXED_PLACE_SEMANTIC_PROFILE: FixedPlaceSemanticProfile = FixedPlaceSemant
     maker_equals_signer: true,
 };
 
+const FIXED_PROXY_PLACE_SEMANTIC_PROFILE: FixedPlaceSemanticProfile = FixedPlaceSemanticProfile {
+    signature_type: PM_CLOB_V2_PROXY_SIGNATURE_TYPE,
+    maker_equals_signer: false,
+    ..FIXED_PLACE_SEMANTIC_PROFILE
+};
+
 #[derive(Clone, Copy)]
 struct PlaceSemanticCommitmentBasis {
     profile: FixedPlaceSemanticProfile,
@@ -72,6 +79,7 @@ struct PlaceSemanticCommitmentBasis {
     domain: PmClobDomain,
     salt: PmOrderSalt,
     maker: EoaAddress,
+    signer: EoaAddress,
     token_id: PmTokenId,
     maker_amount: U256,
     taker_amount: U256,
@@ -104,10 +112,12 @@ pub struct SignedClobV2Order {
     domain: PmClobDomain,
     salt: PmOrderSalt,
     maker: EoaAddress,
+    signer: EoaAddress,
     token_id: PmTokenId,
     maker_amount: U256,
     taker_amount: U256,
     side: PmOrderSide,
+    signature_profile: PmClobV2SignatureType,
     timestamp_ms: u64,
     signature: Zeroizing<[u8; 65]>,
     expected_order_id: ExpectedOrderId,
@@ -215,7 +225,11 @@ impl FixedEoaSigner {
         order: PmUnsignedClobV2Order,
     ) -> Result<SignedClobV2Order, PmAuthError> {
         let account = self.address().as_core();
-        if order.maker() != account || order.signer() != account {
+        let identity_matches = match order.signature_profile() {
+            PmClobV2SignatureType::Eoa => order.maker() == account && order.signer() == account,
+            PmClobV2SignatureType::Proxy => order.maker() != account && order.signer() == account,
+        };
+        if !identity_matches {
             return Err(PmAuthError::OrderIdentityMismatch);
         }
 
@@ -237,11 +251,13 @@ impl FixedEoaSigner {
         Ok(SignedClobV2Order {
             domain,
             salt: order.salt(),
-            maker: self.address(),
+            maker: EoaAddress::from_bytes(order.maker().bytes()),
+            signer: self.address(),
             token_id: order.token_id(),
             maker_amount: order.maker_amount(),
             taker_amount: order.taker_amount(),
             side: order.side(),
+            signature_profile: order.signature_profile(),
             timestamp_ms: order.timestamp_ms(),
             signature: encoded_signature,
             expected_order_id: ExpectedOrderId::from_bytes(digest),
@@ -250,18 +266,20 @@ impl FixedEoaSigner {
 }
 
 impl L2Credentials {
-    /// Consume one signed EOA order into the only supported place body: GTC,
-    /// post-only, non-deferred, with owner equal to this bundle's API key.
+    /// Consume one signed EOA or proxy order into the only supported place
+    /// body: GTC, post-only, non-deferred, with owner equal to this bundle's
+    /// API key. L2 credentials remain bound to the EOA signer for both modes.
     pub fn serialize_gtc_post_only(
         &self,
         order: SignedClobV2Order,
     ) -> Result<SerializedPlaceRequest, PmAuthError> {
-        if order.maker != self.address() {
+        if order.signer != self.address() {
             return Err(PmAuthError::CredentialIdentityMismatch);
         }
 
         let semantic_request_commitment = place_semantic_request_commitment(&order);
         let maker = order.maker.to_string();
+        let signer = order.signer.to_string();
         let mut signature_text = Zeroizing::new(String::with_capacity(132));
         signature_text.push_str("0x");
         signature_text.push_str(&lower_hex(order.signature.as_slice()));
@@ -279,8 +297,8 @@ impl L2Credentials {
                     PmOrderSide::Sell => "SELL",
                 },
                 signature: signature_text.as_str(),
-                signature_type: PM_CLOB_V2_EOA_SIGNATURE_TYPE,
-                signer: &maker,
+                signature_type: order.signature_profile.value(),
+                signer: &signer,
                 taker_amount: order.taker_amount,
                 timestamp: QuotedU64(order.timestamp_ms),
                 token_id: order.token_id,
@@ -404,7 +422,7 @@ fn order_struct_hash(order: PmUnsignedClobV2Order) -> [u8; 32] {
         PmOrderSide::Buy => 0,
         PmOrderSide::Sell => 1,
     }));
-    hasher.update(u8_word(PM_CLOB_V2_EOA_SIGNATURE_TYPE));
+    hasher.update(u8_word(order.signature_type()));
     hasher.update(u64_word(order.timestamp_ms()));
     hasher.update([0_u8; 32]);
     hasher.update([0_u8; 32]);
@@ -443,11 +461,15 @@ fn runtime_exact_body_commitment(body: &[u8]) -> RuntimeExactBodyCommitment {
 
 fn place_semantic_request_commitment(order: &SignedClobV2Order) -> PlaceSemanticRequestCommitment {
     hash_place_semantic_basis(PlaceSemanticCommitmentBasis {
-        profile: FIXED_PLACE_SEMANTIC_PROFILE,
+        profile: match order.signature_profile {
+            PmClobV2SignatureType::Eoa => FIXED_PLACE_SEMANTIC_PROFILE,
+            PmClobV2SignatureType::Proxy => FIXED_PROXY_PLACE_SEMANTIC_PROFILE,
+        },
         expected_order_id: order.expected_order_id,
         domain: order.domain,
         salt: order.salt,
         maker: order.maker,
+        signer: order.signer,
         token_id: order.token_id,
         maker_amount: order.maker_amount,
         taker_amount: order.taker_amount,
@@ -483,10 +505,7 @@ fn hash_place_semantic_basis(
     hasher.update(basis.expected_order_id.bytes());
     hasher.update(basis.salt.value().to_be_bytes());
     hasher.update(basis.maker.bytes());
-    // The fixed profile requires signer == maker. Commit the signer field
-    // independently so that the durable semantic identity mirrors the exact
-    // public EIP-712 shape rather than relying on that invariant implicitly.
-    hasher.update(basis.maker.bytes());
+    hasher.update(basis.signer.bytes());
     hasher.update(basis.token_id.units().to_be_bytes());
     hasher.update(basis.maker_amount.to_be_bytes());
     hasher.update(basis.taker_amount.to_be_bytes());
@@ -529,14 +548,15 @@ fn update_semantic_bytes(hasher: &mut Sha256, value: &[u8]) {
 mod tests {
     use super::{
         CancelSemanticCommitmentBasis, FIXED_CANCEL_SEMANTIC_PROFILE, FIXED_PLACE_SEMANTIC_PROFILE,
-        FixedCancelSemanticProfile, FixedPlaceSemanticProfile, ORDER_TYPE,
-        PlaceSemanticCommitmentBasis, domain_separator, hash_cancel_semantic_basis,
+        FIXED_PROXY_PLACE_SEMANTIC_PROFILE, FixedCancelSemanticProfile, FixedPlaceSemanticProfile,
+        ORDER_TYPE, PlaceSemanticCommitmentBasis, domain_separator, hash_cancel_semantic_basis,
         hash_place_semantic_basis, order_struct_hash,
     };
     use crate::{EoaAddress, ExpectedOrderId, FixedOrderId, PmClobDomain};
     use reap_pm_core::{
         EvmAddress, PmOrderSalt, PmOrderSide, PmPrice, PmQuantity, PmTick, PmTokenId, U256,
     };
+    use reap_polymarket_wire::PM_CLOB_V2_PROXY_SIGNATURE_TYPE;
     use reap_polymarket_wire::PmUnsignedClobV2Order;
     use sha3::{Digest as _, Keccak256};
 
@@ -596,6 +616,7 @@ mod tests {
             domain: PmClobDomain::Standard,
             salt: PmOrderSalt::from_u64(7).unwrap(),
             maker: EoaAddress::from_bytes([0x22; 20]),
+            signer: EoaAddress::from_bytes([0x22; 20]),
             token_id: PmTokenId::new(U256::from_u64(1_234)).unwrap(),
             maker_amount: U256::from_u64(5_200_000),
             taker_amount: U256::from_u64(10_000_000),
@@ -631,6 +652,10 @@ mod tests {
             }),
             hash_place_semantic_basis(PlaceSemanticCommitmentBasis {
                 maker: EoaAddress::from_bytes([0x23; 20]),
+                ..basis
+            }),
+            hash_place_semantic_basis(PlaceSemanticCommitmentBasis {
+                signer: EoaAddress::from_bytes([0x23; 20]),
                 ..basis
             }),
             hash_place_semantic_basis(PlaceSemanticCommitmentBasis {
@@ -675,6 +700,32 @@ mod tests {
         }
 
         assert!(changed.into_iter().all(|candidate| candidate != exact));
+    }
+
+    #[test]
+    fn proxy_semantic_profile_binds_distinct_signer_and_type_one() {
+        let eoa = place_semantic_basis();
+        let proxy = PlaceSemanticCommitmentBasis {
+            profile: FIXED_PROXY_PLACE_SEMANTIC_PROFILE,
+            maker: EoaAddress::from_bytes([0x23; 20]),
+            ..eoa
+        };
+        assert_eq!(
+            proxy.profile.signature_type,
+            PM_CLOB_V2_PROXY_SIGNATURE_TYPE
+        );
+        assert!(!proxy.profile.maker_equals_signer);
+        assert_ne!(
+            hash_place_semantic_basis(proxy),
+            hash_place_semantic_basis(eoa)
+        );
+        assert_ne!(
+            hash_place_semantic_basis(PlaceSemanticCommitmentBasis {
+                signer: EoaAddress::from_bytes([0x24; 20]),
+                ..proxy
+            }),
+            hash_place_semantic_basis(proxy)
+        );
     }
 
     #[test]

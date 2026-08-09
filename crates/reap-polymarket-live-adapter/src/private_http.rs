@@ -1,8 +1,11 @@
 use std::fmt;
 
-use reap_pm_core::PmTokenId;
+use reap_pm_core::{EvmAddress, PmTokenId};
 use reap_polymarket_auth::{AuthenticatedL2Headers, EoaAddress, FixedOrderId, L2HeaderSink};
-use reap_polymarket_wire::{MAX_PM_LIVE_BODY_BYTES, PmWireScope};
+use reap_polymarket_wire::{
+    MAX_PM_CLOSED_ONLY_BODY_BYTES, MAX_PM_LIVE_BODY_BYTES, PmClosedOnlyStatus, PmWireScope,
+    parse_pm_closed_only,
+};
 use reqwest::{
     Client, RequestBuilder, StatusCode, Url,
     header::{ACCEPT, HeaderName, HeaderValue},
@@ -35,11 +38,23 @@ pub(crate) enum PmPrivateRoute<'a> {
         token: PmTokenId,
         signature_type: PmReadOnlySignatureType,
     },
+    ClosedOnly,
 }
 
 impl PmPrivateRoute<'_> {
     const fn accepts_not_found(&self) -> bool {
         matches!(self, Self::ExactOrder(_))
+    }
+
+    const fn maximum_body_bytes(&self) -> usize {
+        match self {
+            Self::ClosedOnly => MAX_PM_CLOSED_ONLY_BODY_BYTES,
+            Self::OpenOrders { .. }
+            | Self::Trades { .. }
+            | Self::ExactOrder(_)
+            | Self::CollateralBalanceAllowance(_)
+            | Self::ConditionalBalanceAllowance { .. } => MAX_PM_LIVE_BODY_BYTES,
+        }
     }
 }
 
@@ -92,6 +107,7 @@ impl PmPrivateHttpTransport {
             .connect_timeout(connect_timeout)
             .timeout(request_timeout)
             .redirect(Policy::none())
+            .retry(reqwest::retry::never())
             .no_proxy();
         if mode == OriginMode::Production {
             builder = builder.https_only(true);
@@ -112,6 +128,7 @@ impl PmPrivateHttpTransport {
         authenticated: AuthenticatedL2Headers,
     ) -> Result<PmPrivateHttpObservation, PmLiveAdapterError> {
         let accepts_not_found = route.accepts_not_found();
+        let maximum_body_bytes = route.maximum_body_bytes();
         let url = self.route_url(route);
         let request = self.client.get(url).header(ACCEPT, "application/json");
         let mut sink = FixedReadHeaderSink::new(request, self.configured_address);
@@ -133,10 +150,10 @@ impl PmPrivateHttpTransport {
         }
         if response
             .content_length()
-            .is_some_and(|length| length > MAX_PM_LIVE_BODY_BYTES as u64)
+            .is_some_and(|length| length > maximum_body_bytes as u64)
         {
             return Err(PmLiveAdapterError::ResponseBodyTooLarge {
-                limit: MAX_PM_LIVE_BODY_BYTES,
+                limit: maximum_body_bytes,
             });
         }
 
@@ -144,17 +161,17 @@ impl PmPrivateHttpTransport {
             .content_length()
             .and_then(|length| usize::try_from(length).ok())
             .unwrap_or(0)
-            .min(MAX_PM_LIVE_BODY_BYTES);
+            .min(maximum_body_bytes);
         let mut body = Zeroizing::new(Vec::with_capacity(capacity));
         while let Some(chunk) = response.chunk().await.map_err(map_body_error)? {
             let next_length = body.len().checked_add(chunk.len()).ok_or(
                 PmLiveAdapterError::ResponseBodyTooLarge {
-                    limit: MAX_PM_LIVE_BODY_BYTES,
+                    limit: maximum_body_bytes,
                 },
             )?;
-            if next_length > MAX_PM_LIVE_BODY_BYTES {
+            if next_length > maximum_body_bytes {
                 return Err(PmLiveAdapterError::ResponseBodyTooLarge {
-                    limit: MAX_PM_LIVE_BODY_BYTES,
+                    limit: maximum_body_bytes,
                 });
             }
             body.extend_from_slice(&chunk);
@@ -196,6 +213,7 @@ impl PmPrivateHttpTransport {
                     .append_pair("token_id", &token.units().to_string())
                     .append_pair("signature_type", signature_type.query_value());
             }
+            PmPrivateRoute::ClosedOnly => url.set_path("/auth/ban-status/closed-only"),
         }
         url
     }
@@ -209,15 +227,17 @@ pub struct PmAuthenticatedHttpOwner {
     authority: PmHttpCredentialRole,
     transport: PmPrivateHttpTransport,
     exact_order_scope: PmWireScope,
-    configured_address: EoaAddress,
+    l2_signer_address: EoaAddress,
+    expected_order_maker: EvmAddress,
     balance_signature_type: PmReadOnlySignatureType,
 }
 
 impl PmAuthenticatedHttpOwner {
-    pub(crate) const fn from_authority(
+    pub(crate) const fn from_authority_with_account_profile(
         transport: PmPrivateHttpTransport,
         exact_order_scope: PmWireScope,
-        configured_address: EoaAddress,
+        l2_signer_address: EoaAddress,
+        expected_order_maker: EvmAddress,
         balance_signature_type: PmReadOnlySignatureType,
         authority: PmHttpCredentialRole,
     ) -> Self {
@@ -225,7 +245,8 @@ impl PmAuthenticatedHttpOwner {
             authority,
             transport,
             exact_order_scope,
-            configured_address,
+            l2_signer_address,
+            expected_order_maker,
             balance_signature_type,
         }
     }
@@ -237,26 +258,47 @@ impl PmAuthenticatedHttpOwner {
         config: PmPrivateHttpConfig,
         credentials: reap_polymarket_auth::L2Credentials,
     ) -> Result<(Self, crate::PmCredentialAuthoritySupervisor), PmLiveAdapterError> {
-        Self::new_with_signature_type(config, PmReadOnlySignatureType::Eoa, credentials)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_with_signature_type(
-        config: PmPrivateHttpConfig,
-        balance_signature_type: PmReadOnlySignatureType,
-        credentials: reap_polymarket_auth::L2Credentials,
-    ) -> Result<(Self, crate::PmCredentialAuthoritySupervisor), PmLiveAdapterError> {
         let exact_order_scope = config.exact_order_scope();
-        let configured_address = credentials.address();
-        let transport = PmPrivateHttpTransport::new(&config, configured_address)?;
+        let l2_signer_address = credentials.address();
+        let transport = PmPrivateHttpTransport::new(&config, l2_signer_address)?;
         let (authority, supervisor) =
             crate::private_credentials::test_http_credential_role(credentials)?;
         Ok((
-            Self::from_authority(
+            Self::from_authority_with_account_profile(
                 transport,
                 exact_order_scope,
-                configured_address,
-                balance_signature_type,
+                l2_signer_address,
+                l2_signer_address.as_core(),
+                PmReadOnlySignatureType::Eoa,
+                authority,
+            ),
+            supervisor,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_proxy_read_only(
+        config: PmPrivateHttpConfig,
+        expected_order_maker: EvmAddress,
+        credentials: reap_polymarket_auth::L2Credentials,
+    ) -> Result<(Self, crate::PmCredentialAuthoritySupervisor), PmLiveAdapterError> {
+        let exact_order_scope = config.exact_order_scope();
+        let l2_signer_address = credentials.address();
+        if l2_signer_address.as_core() == expected_order_maker {
+            return Err(PmLiveAdapterError::InvalidConfiguration(
+                "proxy read profile requires distinct signer and funder",
+            ));
+        }
+        let transport = PmPrivateHttpTransport::new(&config, l2_signer_address)?;
+        let (authority, supervisor) =
+            crate::private_credentials::test_http_credential_role(credentials)?;
+        Ok((
+            Self::from_authority_with_account_profile(
+                transport,
+                exact_order_scope,
+                l2_signer_address,
+                expected_order_maker,
+                PmReadOnlySignatureType::Proxy,
                 authority,
             ),
             supervisor,
@@ -264,11 +306,12 @@ impl PmAuthenticatedHttpOwner {
     }
 
     pub fn reconciliation(&mut self) -> PmReconciliationHttpRole<'_> {
+        debug_assert_eq!(self.transport.configured_address, self.l2_signer_address);
         PmReconciliationHttpRole::new(
             &mut self.authority,
             &self.transport,
             self.exact_order_scope,
-            self.configured_address,
+            self.expected_order_maker,
         )
     }
 
@@ -281,9 +324,51 @@ impl PmAuthenticatedHttpOwner {
         )
     }
 
+    /// Borrow the sole fixed authenticated account-safety read capability.
+    pub fn preflight(&mut self) -> PmPrivatePreflightHttpRole<'_> {
+        PmPrivatePreflightHttpRole {
+            authority: &mut self.authority,
+            transport: &self.transport,
+        }
+    }
+
     #[must_use]
     pub const fn production_order_entry_authorized(&self) -> bool {
         false
+    }
+}
+
+/// Borrowed authenticated capability for only
+/// `GET /auth/ban-status/closed-only`.
+pub struct PmPrivatePreflightHttpRole<'a> {
+    authority: &'a mut PmHttpCredentialRole,
+    transport: &'a PmPrivateHttpTransport,
+}
+
+impl PmPrivatePreflightHttpRole<'_> {
+    pub async fn closed_only(
+        &mut self,
+        server_time: crate::PmReadServerTime,
+    ) -> Result<PmClosedOnlyStatus, PmLiveAdapterError> {
+        let headers = self
+            .authority
+            .authenticate_closed_only(
+                server_time
+                    .into_l2_timestamp()
+                    .map_err(|_| PmLiveAdapterError::ProductClock)?,
+            )
+            .await?;
+        let body = match self
+            .transport
+            .get(PmPrivateRoute::ClosedOnly, headers)
+            .await?
+        {
+            PmPrivateHttpObservation::Found(body) => body,
+            PmPrivateHttpObservation::NotFound => {
+                return Err(PmLiveAdapterError::UnexpectedStatus { status: 404 });
+            }
+        };
+        parse_pm_closed_only(&body).map_err(Into::into)
     }
 }
 
@@ -520,10 +605,10 @@ mod tests {
         crate::PmAuthenticatedHttpOwner::new(config, credentials()).unwrap()
     }
 
-    fn local_owner_for_signature_type(
+    fn local_proxy_owner(
         origin: &str,
         request_timeout: Duration,
-        signature_type: PmReadOnlySignatureType,
+        expected_order_maker: reap_pm_core::EvmAddress,
     ) -> (
         crate::PmAuthenticatedHttpOwner,
         crate::PmCredentialAuthoritySupervisor,
@@ -535,9 +620,9 @@ mod tests {
             scope(),
         )
         .unwrap();
-        crate::PmAuthenticatedHttpOwner::new_with_signature_type(
+        crate::PmAuthenticatedHttpOwner::new_proxy_read_only(
             config,
-            signature_type,
+            expected_order_maker,
             credentials(),
         )
         .unwrap()
@@ -687,10 +772,10 @@ mod tests {
             MockResponse::ok(balance()),
         ])
         .await;
-        let (mut owner, supervisor) = local_owner_for_signature_type(
+        let (mut owner, supervisor) = local_proxy_owner(
             &origin,
             Duration::from_secs(1),
-            PmReadOnlySignatureType::Proxy,
+            reap_pm_core::EvmAddress::parse(FOREIGN_MAKER).unwrap(),
         );
 
         let mut account = owner.account();
@@ -718,6 +803,122 @@ mod tests {
             assert!(headers.contains(&format!("poly_address: {}", ADDRESS.to_ascii_lowercase())));
         }
 
+        task.await.unwrap();
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_only_is_one_fixed_signer_authenticated_get_for_proxy_accounts() {
+        let (origin, mut requests, task) =
+            mock_server(vec![MockResponse::ok(br#"{"closed_only":false}"#)]).await;
+        let (mut owner, supervisor) = local_proxy_owner(
+            &origin,
+            Duration::from_secs(1),
+            reap_pm_core::EvmAddress::parse(FOREIGN_MAKER).unwrap(),
+        );
+
+        let status = owner.preflight().closed_only(timestamp()).await.unwrap();
+        assert!(!status.closed_only());
+
+        let request = requests.recv().await.unwrap();
+        assert_eq!(
+            request.lines().next(),
+            Some("GET /auth/ban-status/closed-only HTTP/1.1")
+        );
+        let headers = request.to_ascii_lowercase();
+        assert!(headers.contains(&format!("poly_address: {}", ADDRESS.to_ascii_lowercase())));
+        assert!(!headers.contains(&format!(
+            "poly_address: {}",
+            FOREIGN_MAKER.to_ascii_lowercase()
+        )));
+        assert!(headers.contains("poly_signature: n1obdnq7auhb1m63pmycfo6tkgegkwjgrzkv86-ztfe="));
+        assert!(headers.contains(&format!("poly_timestamp: {AUTH_SECONDS}")));
+        assert!(headers.contains(&format!("poly_api_key: {API_KEY}")));
+        assert!(headers.contains(&format!("poly_passphrase: {PASSPHRASE}")));
+
+        task.await.unwrap();
+        assert!(requests.try_recv().is_err());
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_only_redirect_and_both_body_oversize_modes_fail_without_retry() {
+        let advertised = MockResponse {
+            status: 200,
+            body: Vec::new(),
+            delay: Duration::ZERO,
+            location: None,
+            content_length: Some(MAX_PM_CLOSED_ONLY_BODY_BYTES + 1),
+        };
+        let streamed = MockResponse {
+            status: 200,
+            body: vec![b'x'; MAX_PM_CLOSED_ONLY_BODY_BYTES + 1],
+            delay: Duration::ZERO,
+            location: None,
+            content_length: None,
+        };
+        let mut redirect = MockResponse::status(302);
+        redirect.location = Some("/auth/ban-status/closed-only");
+        let (origin, mut requests, task) = mock_server(vec![advertised, streamed, redirect]).await;
+        let (mut owner, supervisor) = local_owner(&origin, Duration::from_secs(1));
+
+        for _ in 0..2 {
+            assert!(matches!(
+                owner.preflight().closed_only(timestamp()).await,
+                Err(PmLiveAdapterError::ResponseBodyTooLarge {
+                    limit: MAX_PM_CLOSED_ONLY_BODY_BYTES
+                })
+            ));
+        }
+        assert!(matches!(
+            owner.preflight().closed_only(timestamp()).await,
+            Err(PmLiveAdapterError::Redirect { status: 302 })
+        ));
+
+        for _ in 0..3 {
+            assert_eq!(
+                requests.recv().await.unwrap().lines().next(),
+                Some("GET /auth/ban-status/closed-only HTTP/1.1")
+            );
+        }
+        task.await.unwrap();
+        assert!(requests.try_recv().is_err());
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_exact_order_matches_funder_while_l2_headers_keep_signer() {
+        let proxy = reap_pm_core::EvmAddress::parse(FOREIGN_MAKER).unwrap();
+        let correct = order(ORDER_ID, CONDITION, "123", FOREIGN_MAKER, API_KEY);
+        let foreign = order(ORDER_ID, CONDITION, "123", ADDRESS, API_KEY);
+        let (origin, mut requests, task) =
+            mock_server(vec![MockResponse::ok(correct), MockResponse::ok(foreign)]).await;
+        let (mut owner, supervisor) = local_proxy_owner(&origin, Duration::from_secs(1), proxy);
+        let mut reconciliation = owner.reconciliation();
+        let id = FixedOrderId::parse(ORDER_ID).unwrap();
+
+        assert!(matches!(
+            reconciliation
+                .exact_local_order_detail(timestamp(), id)
+                .await
+                .unwrap(),
+            PmExactOrderObservation::Present(_)
+        ));
+        assert_eq!(
+            reconciliation
+                .exact_local_order_detail(timestamp(), id)
+                .await,
+            Err(PmLiveAdapterError::ExactOrderMakerMismatch)
+        );
+
+        for _ in 0..2 {
+            let request = requests.recv().await.unwrap().to_ascii_lowercase();
+            assert!(request.contains(&format!("poly_address: {}", ADDRESS.to_ascii_lowercase())));
+            assert!(!request.contains(&format!(
+                "poly_address: {}",
+                FOREIGN_MAKER.to_ascii_lowercase()
+            )));
+        }
         task.await.unwrap();
         supervisor.shutdown().await.unwrap();
     }

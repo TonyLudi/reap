@@ -3,7 +3,7 @@ use reqwest::{Client, StatusCode, Url, redirect::Policy};
 
 use crate::{
     PmLiveAdapterError,
-    config::{OriginMode, PmPublicHttpConfig},
+    config::{OriginMode, PmGeoblockHttpConfig, PmPublicHttpConfig},
 };
 
 pub(crate) enum PmPublicRoute {
@@ -11,6 +11,7 @@ pub(crate) enum PmPublicRoute {
     Book(PmTokenId),
     MarketMetadata(PmConditionId),
     ClobV2Metadata(PmConditionId),
+    Geoblock,
 }
 
 #[derive(Clone)]
@@ -21,21 +22,42 @@ pub(crate) struct PmHttpTransport {
 
 impl PmHttpTransport {
     pub(crate) fn new(config: &PmPublicHttpConfig) -> Result<Self, PmLiveAdapterError> {
+        Self::build(
+            config.origin().clone(),
+            config.connect_timeout(),
+            config.request_timeout(),
+            config.mode(),
+        )
+    }
+
+    pub(crate) fn geoblock(config: &PmGeoblockHttpConfig) -> Result<Self, PmLiveAdapterError> {
+        Self::build(
+            config.origin().clone(),
+            config.connect_timeout(),
+            config.request_timeout(),
+            config.mode(),
+        )
+    }
+
+    fn build(
+        origin: Url,
+        connect_timeout: std::time::Duration,
+        request_timeout: std::time::Duration,
+        mode: OriginMode,
+    ) -> Result<Self, PmLiveAdapterError> {
         let mut builder = Client::builder()
-            .connect_timeout(config.connect_timeout())
-            .timeout(config.request_timeout())
+            .connect_timeout(connect_timeout)
+            .timeout(request_timeout)
             .redirect(Policy::none())
+            .retry(reqwest::retry::never())
             .no_proxy();
-        if config.mode() == OriginMode::Production {
+        if mode == OriginMode::Production {
             builder = builder.https_only(true);
         }
         let client = builder
             .build()
             .map_err(|_| PmLiveAdapterError::TransportBuild)?;
-        Ok(Self {
-            client,
-            origin: config.origin().clone(),
-        })
+        Ok(Self { client, origin })
     }
 
     pub(crate) async fn get(
@@ -108,6 +130,7 @@ impl PmHttpTransport {
             PmPublicRoute::ClobV2Metadata(condition) => {
                 url.set_path(&format!("/clob-markets/{condition}"));
             }
+            PmPublicRoute::Geoblock => url.set_path("/api/geoblock"),
         }
         url
     }

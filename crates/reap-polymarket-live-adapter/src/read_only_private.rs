@@ -8,10 +8,11 @@ use zeroize::Zeroizing;
 
 use crate::{
     PM_CLOB_PRODUCTION_ORIGIN, PmAuthenticatedHttpOwner, PmAuthenticatedUserWsRole,
-    PmCredentialAuthoritySupervisor, PmLiveAdapterError, PmPrivateConnectivityOwner,
-    PmPrivateHttpConfig, PmPublicHttpConfig, PmReadOnlyAccountHttpOwner, PmReadOnlySignatureType,
-    PmReadServerTimeHttpRole, PmUserWsBounds, PmUserWsConfig,
-    private_credentials::account_http_credential_role, private_http::PmPrivateHttpTransport,
+    PmCredentialAuthoritySupervisor, PmGeoblockHttpConfig, PmGeoblockHttpRole, PmLiveAdapterError,
+    PmPrivateConnectivityOwner, PmPrivateHttpConfig, PmPublicHttpConfig, PmPublicMetadataHttpRole,
+    PmReadOnlyAccountHttpOwner, PmReadOnlySignatureType, PmReadServerTimeHttpRole, PmUserWsBounds,
+    PmUserWsConfig, config::OriginMode, private_credentials::account_http_credential_role,
+    private_http::PmPrivateHttpTransport,
 };
 
 /// Move-only, zeroizing injection value for production read-only credentials.
@@ -207,10 +208,14 @@ impl fmt::Debug for PmReadOnlyAccountConnectivityRoles {
 ///
 /// The owner binds credentials to the exact configured signer/funder before
 /// any authority task is started. It exposes no general credential, signing,
-/// mutation, server-time, or validator capability.
+/// mutation-time or validator capability. The only public time capability is
+/// the read-only `/time` role needed to authenticate the fixed private GETs.
 pub struct PmReadOnlyPrivateConnectivityOwner {
     inner: PmPrivateConnectivityOwner,
     exact_scope: PmWireScope,
+    server_time: PmReadServerTimeHttpRole,
+    geoblock: PmGeoblockHttpRole,
+    market_details: PmPublicMetadataHttpRole,
 }
 
 impl PmReadOnlyPrivateConnectivityOwner {
@@ -233,6 +238,43 @@ impl PmReadOnlyPrivateConnectivityOwner {
         let user_ws_config = PmUserWsConfig::production(exact_scope.condition(), user_ws_bounds)?;
         Self::bind(
             expected_signer,
+            expected_funder,
+            PmReadOnlySignatureType::Eoa,
+            exact_scope,
+            http_config,
+            user_ws_config,
+            credentials,
+        )
+    }
+
+    /// Construct the full authenticated read-only facade for a signature
+    /// type-1 account. L2 headers are signed by `expected_signer`, while exact
+    /// order identity is checked against the distinct proxy funder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn production_proxy(
+        expected_signer: EvmAddress,
+        expected_funder: EvmAddress,
+        exact_scope: PmWireScope,
+        http_connect_timeout: Duration,
+        http_request_timeout: Duration,
+        user_ws_bounds: PmUserWsBounds,
+        credentials: PmReadOnlyCredentialInput,
+    ) -> Result<Self, PmLiveAdapterError> {
+        validate_account_profile(
+            expected_signer,
+            expected_funder,
+            PmReadOnlySignatureType::Proxy,
+        )?;
+        let http_config = PmPrivateHttpConfig::production(
+            http_connect_timeout,
+            http_request_timeout,
+            exact_scope,
+        )?;
+        let user_ws_config = PmUserWsConfig::production(exact_scope.condition(), user_ws_bounds)?;
+        Self::bind(
+            expected_signer,
+            expected_funder,
+            PmReadOnlySignatureType::Proxy,
             exact_scope,
             http_config,
             user_ws_config,
@@ -254,8 +296,6 @@ impl PmReadOnlyPrivateConnectivityOwner {
         user_ws_config: PmUserWsConfig,
         credentials: PmReadOnlyCredentialInput,
     ) -> Result<Self, PmLiveAdapterError> {
-        use crate::config::OriginMode;
-
         validate_one_eoa(expected_signer, expected_funder)?;
         if http_config.mode() != OriginMode::LocalEvidence || user_ws_config.is_production() {
             return Err(PmLiveAdapterError::InvalidConfiguration(
@@ -264,6 +304,41 @@ impl PmReadOnlyPrivateConnectivityOwner {
         }
         Self::bind(
             expected_signer,
+            expected_funder,
+            PmReadOnlySignatureType::Eoa,
+            exact_scope,
+            http_config,
+            user_ws_config,
+            credentials,
+        )
+    }
+
+    /// Construct the signature type-1 full read facade over literal-loopback
+    /// transports for end-to-end contract evidence.
+    #[cfg(any(test, feature = "read-only-evidence"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn proxy_read_only_evidence(
+        expected_signer: EvmAddress,
+        expected_funder: EvmAddress,
+        exact_scope: PmWireScope,
+        http_config: PmPrivateHttpConfig,
+        user_ws_config: PmUserWsConfig,
+        credentials: PmReadOnlyCredentialInput,
+    ) -> Result<Self, PmLiveAdapterError> {
+        validate_account_profile(
+            expected_signer,
+            expected_funder,
+            PmReadOnlySignatureType::Proxy,
+        )?;
+        if http_config.mode() != OriginMode::LocalEvidence || user_ws_config.is_production() {
+            return Err(PmLiveAdapterError::InvalidConfiguration(
+                "read-only evidence facade requires literal-loopback transports",
+            ));
+        }
+        Self::bind(
+            expected_signer,
+            expected_funder,
+            PmReadOnlySignatureType::Proxy,
             exact_scope,
             http_config,
             user_ws_config,
@@ -272,7 +347,9 @@ impl PmReadOnlyPrivateConnectivityOwner {
     }
 
     fn bind(
-        expected_eoa: EvmAddress,
+        expected_signer: EvmAddress,
+        expected_funder: EvmAddress,
+        signature_type: PmReadOnlySignatureType,
         exact_scope: PmWireScope,
         http_config: PmPrivateHttpConfig,
         user_ws_config: PmUserWsConfig,
@@ -286,13 +363,63 @@ impl PmReadOnlyPrivateConnectivityOwner {
             ));
         }
 
+        let public_config = match http_config.mode() {
+            OriginMode::Production => PmPublicHttpConfig::production(
+                PM_CLOB_PRODUCTION_ORIGIN,
+                http_config.connect_timeout(),
+                http_config.request_timeout(),
+            )?,
+            #[cfg(any(test, feature = "loopback-evidence", feature = "read-only-evidence"))]
+            OriginMode::LocalEvidence => PmPublicHttpConfig::local_evidence(
+                http_config.origin().as_str(),
+                http_config.connect_timeout(),
+                http_config.request_timeout(),
+            )?,
+        };
+        let geoblock_config = match http_config.mode() {
+            OriginMode::Production => PmGeoblockHttpConfig::production(
+                http_config.connect_timeout(),
+                http_config.request_timeout(),
+            )?,
+            #[cfg(any(test, feature = "loopback-evidence", feature = "read-only-evidence"))]
+            OriginMode::LocalEvidence => PmGeoblockHttpConfig::local_evidence(
+                http_config.origin().as_str(),
+                http_config.connect_timeout(),
+                http_config.request_timeout(),
+            )?,
+        };
+        let server_time = PmReadServerTimeHttpRole::new(public_config.clone())?;
+        let market_details = PmPublicMetadataHttpRole::new(public_config, exact_scope)?;
+        let geoblock = PmGeoblockHttpRole::new(geoblock_config)?;
+
+        // Retain the original one-EOA binding name and check for the existing
+        // type-0 path; the proxy path uses the same signer-bound credential
+        // proof while carrying a distinct expected funder separately.
+        let expected_eoa = expected_signer;
         let expected_eip55 = eip55(expected_eoa);
         let credentials = L2Credentials::bind(&expected_eip55, credentials.into_auth_input())?;
         if credentials.address().as_core() != expected_eoa {
             return Err(PmLiveAdapterError::CredentialOwnerMismatch);
         }
-        let inner = PmPrivateConnectivityOwner::new(http_config, user_ws_config, credentials)?;
-        Ok(Self { inner, exact_scope })
+        let inner = match signature_type {
+            PmReadOnlySignatureType::Eoa => {
+                debug_assert_eq!(expected_signer, expected_funder);
+                PmPrivateConnectivityOwner::new(http_config, user_ws_config, credentials)?
+            }
+            PmReadOnlySignatureType::Proxy => PmPrivateConnectivityOwner::new_proxy_read_only(
+                http_config,
+                user_ws_config,
+                expected_funder,
+                credentials,
+            )?,
+        };
+        Ok(Self {
+            inner,
+            exact_scope,
+            server_time,
+            geoblock,
+            market_details,
+        })
     }
 
     #[must_use]
@@ -305,12 +432,15 @@ impl PmReadOnlyPrivateConnectivityOwner {
         false
     }
 
-    /// Consume the sole owner into exactly the three authenticated read
-    /// capabilities required by an operator.
+    /// Consume the sole owner into its fixed public-safety and authenticated
+    /// read capabilities. None carries mutation authentication or transport.
     pub fn split(self) -> Result<PmReadOnlyPrivateConnectivityRoles, PmLiveAdapterError> {
         let (authenticated_http, authenticated_user_ws, credential_supervisor) =
             self.inner.split()?.into_read_roles();
         Ok(PmReadOnlyPrivateConnectivityRoles {
+            server_time: self.server_time,
+            geoblock: self.geoblock,
+            market_details: self.market_details,
             authenticated_http,
             authenticated_user_ws,
             credential_supervisor,
@@ -342,10 +472,12 @@ fn validate_one_eoa(
 
 /// Named, move-only result of splitting the read-only credential owner.
 ///
-/// These are the only three capabilities released by the facade. In
-/// particular, this bundle contains no mutation authentication role, signer,
-/// general L2 credential, mutation-time proof, or mutation validator.
+/// In particular, this bundle contains no mutation authentication role,
+/// signer, general L2 credential, mutation-time proof, or mutation validator.
 pub struct PmReadOnlyPrivateConnectivityRoles {
+    pub server_time: PmReadServerTimeHttpRole,
+    pub geoblock: PmGeoblockHttpRole,
+    pub market_details: PmPublicMetadataHttpRole,
     pub authenticated_http: PmAuthenticatedHttpOwner,
     pub authenticated_user_ws: PmAuthenticatedUserWsRole,
     pub credential_supervisor: PmCredentialAuthoritySupervisor,
@@ -416,6 +548,12 @@ fn eip55(address: EvmAddress) -> String {
 #[cfg(test)]
 mod tests {
     use reap_pm_core::{ConnectionEpoch, PmConditionId, PmMarketId, PmTokenId, U256};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::mpsc,
+        task::JoinHandle,
+    };
 
     use super::*;
 
@@ -456,6 +594,39 @@ mod tests {
         PmReadOnlyCredentialInput::new(API_KEY.into(), API_SECRET.into(), PASSPHRASE.into())
     }
 
+    async fn read_preflight_server(
+        bodies: Vec<Vec<u8>>,
+    ) -> (String, mpsc::UnboundedReceiver<String>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            for body in bodies {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                loop {
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&chunk[..read]);
+                    if raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let _ = request_tx.send(String::from_utf8(raw).unwrap());
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(headers.as_bytes()).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+            }
+        });
+        (format!("http://{address}"), request_rx, task)
+    }
+
     #[test]
     fn typed_evm_address_is_bound_as_the_exact_eip55_eoa() {
         assert_eq!(eip55(address(ADDRESS)), CHECKSUM_ADDRESS);
@@ -490,6 +661,36 @@ mod tests {
                 "read-only credentials require signer and funder to be the same EOA"
             ))
         ));
+    }
+
+    #[test]
+    fn proxy_full_read_facade_requires_and_retains_split_identity() {
+        let owner = PmReadOnlyPrivateConnectivityOwner::production_proxy(
+            address(ADDRESS),
+            address(OTHER_ADDRESS),
+            scope(),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            user_bounds(),
+            credential_input(),
+        )
+        .unwrap();
+        assert_eq!(owner.configured_scope(), scope());
+        assert!(!owner.production_order_entry_authorized());
+        assert!(!format!("{owner:?}").contains(API_KEY));
+
+        assert!(
+            PmReadOnlyPrivateConnectivityOwner::production_proxy(
+                address(ADDRESS),
+                address(ADDRESS),
+                scope(),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                user_bounds(),
+                credential_input(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -600,5 +801,165 @@ mod tests {
         .unwrap();
         assert_eq!(owner.configured_scope(), exact_scope);
         assert!(!owner.production_order_entry_authorized());
+    }
+
+    #[tokio::test]
+    async fn proxy_evidence_facade_splits_only_full_read_roles() {
+        let exact_scope = scope();
+        let http = PmPrivateHttpConfig::read_only_evidence(
+            "http://127.0.0.1:18080",
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            exact_scope,
+        )
+        .unwrap();
+        let user_ws = PmUserWsConfig::read_only_evidence(
+            "ws://127.0.0.1:18081/ws/user",
+            exact_scope.condition(),
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            Duration::from_millis(500),
+            64 * 1_024,
+            3,
+            Duration::from_millis(100),
+            32,
+            ConnectionEpoch::new(1),
+        )
+        .unwrap();
+        let owner = PmReadOnlyPrivateConnectivityOwner::proxy_read_only_evidence(
+            address(ADDRESS),
+            address(OTHER_ADDRESS),
+            exact_scope,
+            http,
+            user_ws,
+            credential_input(),
+        )
+        .unwrap();
+        let roles = owner.split().unwrap();
+        assert!(!roles.production_order_entry_authorized());
+        assert!(!roles.authenticated_http.production_order_entry_authorized());
+        roles.credential_supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_facade_runs_the_complete_literal_loopback_read_preflight() {
+        let exact_scope = scope();
+        let condition = exact_scope.condition().to_string();
+        let market = exact_scope.market().to_string();
+        let long_market = format!(
+            r#"{{"condition_id":"{condition}","question_id":"{market}","active":true,"closed":false,"archived":false,"accepting_orders":true,"enable_order_book":true}}"#
+        );
+        let short_market = format!(
+            r#"{{"c":"{condition}","t":[{{"t":"7","o":"Yes"}},{{"t":"8","o":"No"}}],"mts":0.01,"mos":5,"nr":false,"fd":{{"r":0.020,"e":2.0,"to":true}},"mbf":0,"tbf":0,"itode":false,"oas":0}}"#
+        );
+        let responses = vec![
+            br#"{"blocked":false,"ip":"203.0.113.9","country":"US","region":"NY"}"#.to_vec(),
+            long_market.into_bytes(),
+            short_market.into_bytes(),
+            b"1780449126".to_vec(),
+            br#"{"closed_only":false}"#.to_vec(),
+        ];
+        let (origin, mut requests, server) = read_preflight_server(responses).await;
+        let http = PmPrivateHttpConfig::read_only_evidence(
+            &origin,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            exact_scope,
+        )
+        .unwrap();
+        let ws_origin = format!("ws://{}/ws/user", origin.trim_start_matches("http://"));
+        let user_ws = PmUserWsConfig::read_only_evidence(
+            &ws_origin,
+            exact_scope.condition(),
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            Duration::from_millis(500),
+            64 * 1_024,
+            3,
+            Duration::from_millis(100),
+            32,
+            ConnectionEpoch::new(1),
+        )
+        .unwrap();
+        let owner = PmReadOnlyPrivateConnectivityOwner::proxy_read_only_evidence(
+            address(ADDRESS),
+            address(OTHER_ADDRESS),
+            exact_scope,
+            http,
+            user_ws,
+            credential_input(),
+        )
+        .unwrap();
+        let mut roles = owner.split().unwrap();
+
+        let geoblock = roles.geoblock.status().await.unwrap();
+        assert!(!geoblock.blocked());
+        assert_eq!(geoblock.country(), "US");
+        let details = roles.market_details.refresh_typed().await.unwrap();
+        assert_eq!(details.lifecycle().condition(), exact_scope.condition());
+        assert_eq!(details.lifecycle().market(), exact_scope.market());
+        assert_eq!(
+            details.clob().configured_outcome().token(),
+            exact_scope.token()
+        );
+        assert_eq!(details.clob().tokens().len(), 2);
+        assert_eq!(details.clob().maker_base_fee_bps(), 0);
+        assert_eq!(details.clob().taker_base_fee_bps(), 0);
+        assert_eq!(
+            details.clob().fee_details().rate().unwrap().as_str(),
+            "0.020"
+        );
+        assert_eq!(
+            details.clob().fee_details().exponent().unwrap().as_str(),
+            "2.0"
+        );
+        assert!(!details.clob().take_only_delay_enabled());
+        assert_eq!(details.clob().minimum_order_age_seconds(), 0);
+        let server_time = roles.server_time.fresh_read_server_time().await.unwrap();
+        let closed_only = roles
+            .authenticated_http
+            .preflight()
+            .closed_only(server_time)
+            .await
+            .unwrap();
+        assert!(!closed_only.closed_only());
+
+        let mut captured = Vec::new();
+        for _ in 0..5 {
+            captured.push(requests.recv().await.unwrap());
+        }
+        assert_eq!(
+            captured
+                .iter()
+                .map(|request| request.lines().next().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "GET /api/geoblock HTTP/1.1".to_owned(),
+                format!("GET /markets/{condition} HTTP/1.1"),
+                format!("GET /clob-markets/{condition} HTTP/1.1"),
+                "GET /time HTTP/1.1".to_owned(),
+                "GET /auth/ban-status/closed-only HTTP/1.1".to_owned(),
+            ]
+        );
+        let closed_request = captured.last().unwrap().to_ascii_lowercase();
+        assert!(
+            closed_request.contains(&format!("poly_address: {}", ADDRESS.to_ascii_lowercase()))
+        );
+        assert!(!closed_request.contains(&format!(
+            "poly_address: {}",
+            OTHER_ADDRESS.to_ascii_lowercase()
+        )));
+        assert!(
+            closed_request.contains("poly_signature: n1obdnq7auhb1m63pmycfo6tkgegkwjgrzkv86-ztfe=")
+        );
+
+        server.await.unwrap();
+        assert!(requests.try_recv().is_err());
+        assert!(!roles.production_order_entry_authorized());
+        assert!(!roles.geoblock.production_order_entry_authorized());
+        assert!(!roles.authenticated_http.production_order_entry_authorized());
+        roles.credential_supervisor.shutdown().await.unwrap();
     }
 }

@@ -8,12 +8,16 @@ use reap_polymarket_auth::{
     AuthenticatedUserSubscriptionSink, EoaPrivateKeyInput, FixedEoaSigner, FixedOrderId,
     FixedOwnedCancelRequestSink, FixedPlaceRequestSink, L2CredentialInput, L2Credentials,
     L2HeaderSink, L2Timestamp, OwnedCancelSemanticRequestCommitment,
-    PlaceSemanticRequestCommitment, PmClobDomain, RuntimeExactBodyCommitment,
+    PlaceSemanticRequestCommitment, PmAuthError, PmClobDomain, RuntimeExactBodyCommitment,
 };
-use reap_polymarket_wire::{PmLiveUserEvent, PmUnsignedClobV2Order, parse_live_user_frame};
+use reap_polymarket_wire::{
+    PM_CLOB_V2_PROXY_SIGNATURE_TYPE, PmLiveUserEvent, PmUnsignedClobV2Order, PmUnsignedOrderError,
+    parse_live_user_frame,
+};
 
 const TEST_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 const ADDRESS: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+const PROXY_ADDRESS: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
 const API_KEY: &str = "00000000-0000-4000-8000-000000000001";
 const API_SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 const PASSPHRASE: &str = "synthetic-passphrase";
@@ -28,12 +32,21 @@ fn signer() -> FixedEoaSigner {
 }
 
 fn credentials() -> L2Credentials {
-    credentials_with(API_KEY, API_SECRET, PASSPHRASE)
+    credentials_for(ADDRESS, API_KEY, API_SECRET, PASSPHRASE)
 }
 
 fn credentials_with(api_key: &str, api_secret: &str, passphrase: &str) -> L2Credentials {
+    credentials_for(ADDRESS, api_key, api_secret, passphrase)
+}
+
+fn credentials_for(
+    address: &str,
+    api_key: &str,
+    api_secret: &str,
+    passphrase: &str,
+) -> L2Credentials {
     L2Credentials::bind(
-        ADDRESS,
+        address,
         L2CredentialInput::new(api_key.into(), api_secret.into(), passphrase.into()),
     )
     .unwrap()
@@ -59,6 +72,22 @@ fn vector_order(side: PmOrderSide) -> PmUnsignedClobV2Order {
         PmTick::parse_decimal("0.01").unwrap(),
         PmQuantity::parse_decimal("5").unwrap(),
         1_780_449_126_930,
+    )
+    .unwrap()
+}
+
+fn proxy_vector_order(side: PmOrderSide) -> PmUnsignedClobV2Order {
+    PmUnsignedClobV2Order::new_pm_t2_proxy(
+        PmOrderSalt::from_u64(1_713_398_400_000).unwrap(),
+        EvmAddress::parse(PROXY_ADDRESS).unwrap(),
+        EvmAddress::parse(ADDRESS).unwrap(),
+        PmTokenId::new(U256::from_u64(1_234)).unwrap(),
+        side,
+        PmPrice::parse_decimal("0.40").unwrap(),
+        PmQuantity::parse_decimal("10").unwrap(),
+        PmTick::parse_decimal("0.01").unwrap(),
+        PmQuantity::parse_decimal("5").unwrap(),
+        1_713_398_400_000,
     )
     .unwrap()
 }
@@ -286,6 +315,173 @@ fn standard_buy_body_signature_identity_and_l2_hmac_match_exactly() {
     assert_eq!(
         body["order"]["signature"],
         "0xbb81b245ea7ebb9aa480ccbf15364a2cb2cd77d7adebcb56fd5f49b653683110055a3d5ad05adf1aa65b1701bf25c622275f098fd5724c7f782671829e6d4d0b1b"
+    );
+}
+
+/// Frozen from a synthetic, offline run of the official production V2 client:
+/// `Polymarket/py-clob-client-v2` v1.1.0 at
+/// `215fc63a8fd6ec3a10c7edb73997c9772d8686d3`. The oracle used its bundled
+/// `ExchangeOrderBuilderV2`, `order_to_json_v2`, and exact production Polygon
+/// V2 addresses. The legacy `py-clob-client@b076b04...` / `py-order-utils`
+/// pins are V1 and are intentionally not used as V2 order oracles. All key,
+/// proxy, credential, token, salt, and timestamp inputs below are synthetic.
+///
+/// The official client preserves insertion order while Reap deliberately
+/// emits a canonical field order, so these are Reap's exact transmitted bytes
+/// over the same oracle-authenticated body fields and values.
+#[test]
+fn official_v2_proxy_domain_side_vectors_match_exactly() {
+    let cases = [
+        (
+            PmClobDomain::Standard,
+            PmOrderSide::Buy,
+            "0xb5c738f05de98533825d2412e68eeda3e8c2a11d4001b062c81d27e38dd5bcac",
+            r#"{"deferExec":false,"order":{"builder":"0x0000000000000000000000000000000000000000000000000000000000000000","expiration":"0","maker":"0x70997970C51812dc3A010C7d01b50e0d17dc79C8","makerAmount":"4000000","metadata":"0x0000000000000000000000000000000000000000000000000000000000000000","salt":1713398400000,"side":"BUY","signature":"0x62dec972666e737c6b51e6f13a209cb57f7f82f7bffc22ac4767e91d14d5da6051855b2d2397ee5f060f68bcbd7d6810639098cc22b85477dedf378e831d47fa1b","signatureType":1,"signer":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","takerAmount":"10000000","timestamp":"1713398400000","tokenId":"1234"},"orderType":"GTC","owner":"00000000-0000-4000-8000-000000000001","postOnly":true}"#,
+        ),
+        (
+            PmClobDomain::Standard,
+            PmOrderSide::Sell,
+            "0xbaa1a4fe5cc54c9445a3e440d9f36ddf761bd2ad86e3d20148b832d3dc0820a1",
+            r#"{"deferExec":false,"order":{"builder":"0x0000000000000000000000000000000000000000000000000000000000000000","expiration":"0","maker":"0x70997970C51812dc3A010C7d01b50e0d17dc79C8","makerAmount":"10000000","metadata":"0x0000000000000000000000000000000000000000000000000000000000000000","salt":1713398400000,"side":"SELL","signature":"0x57cf1b7ed0f2656dfec190885289ae83906ac22831448940e0a0c1c14d3a74402961e55dcc89a8adc6e16927a95e284a84a20475587912c7af56997db3a34c831c","signatureType":1,"signer":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","takerAmount":"4000000","timestamp":"1713398400000","tokenId":"1234"},"orderType":"GTC","owner":"00000000-0000-4000-8000-000000000001","postOnly":true}"#,
+        ),
+        (
+            PmClobDomain::NegativeRisk,
+            PmOrderSide::Buy,
+            "0xd3e4edc371b2be2e8e229b27f0f00003279cfca2cc30540cceb1126e97fb16a2",
+            r#"{"deferExec":false,"order":{"builder":"0x0000000000000000000000000000000000000000000000000000000000000000","expiration":"0","maker":"0x70997970C51812dc3A010C7d01b50e0d17dc79C8","makerAmount":"4000000","metadata":"0x0000000000000000000000000000000000000000000000000000000000000000","salt":1713398400000,"side":"BUY","signature":"0xbd1f2a89f07e5c6174985e95a2bb7f7eac36fce9f5ed3b1a4b8b54040dcf21e816c686634a862a31e6524e84ee35e3d5d84b49071fe22a4003296a5956d95c461b","signatureType":1,"signer":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","takerAmount":"10000000","timestamp":"1713398400000","tokenId":"1234"},"orderType":"GTC","owner":"00000000-0000-4000-8000-000000000001","postOnly":true}"#,
+        ),
+        (
+            PmClobDomain::NegativeRisk,
+            PmOrderSide::Sell,
+            "0x5c3ddfb7ca2ad7880e2be93f804ee061ed415f31e479076f27b767c751c03def",
+            r#"{"deferExec":false,"order":{"builder":"0x0000000000000000000000000000000000000000000000000000000000000000","expiration":"0","maker":"0x70997970C51812dc3A010C7d01b50e0d17dc79C8","makerAmount":"10000000","metadata":"0x0000000000000000000000000000000000000000000000000000000000000000","salt":1713398400000,"side":"SELL","signature":"0x2408198e5245c70a016932bac6b29cacbd22a048ad4ebcd830f46fe4cb3685641c0f1c625dcd892516ad9258183e251e2060ce42941d8be3acbdd217c8fd8be31b","signatureType":1,"signer":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","takerAmount":"4000000","timestamp":"1713398400000","tokenId":"1234"},"orderType":"GTC","owner":"00000000-0000-4000-8000-000000000001","postOnly":true}"#,
+        ),
+    ];
+
+    for (domain, side, expected_id, expected_body) in cases {
+        let signer = signer();
+        let signed = signer
+            .sign_clob_v2_order(domain, proxy_vector_order(side))
+            .unwrap();
+        assert_eq!(signed.expected_order_id().to_string(), expected_id);
+
+        let credentials = credentials();
+        let body = credentials.serialize_gtc_post_only(signed).unwrap();
+        let request = credentials
+            .authenticate_place(L2Timestamp::from_unix_seconds(AUTH_SECONDS).unwrap(), body)
+            .unwrap();
+        let mut capture = MutationCapture::default();
+        request.dispatch(&mut capture).unwrap();
+        assert_eq!(capture.address, ADDRESS);
+        assert_eq!(capture.body, expected_body.as_bytes());
+
+        let value: serde_json::Value = serde_json::from_slice(&capture.body).unwrap();
+        assert_eq!(value["order"]["maker"], PROXY_ADDRESS);
+        assert_eq!(value["order"]["signer"], ADDRESS);
+        assert_eq!(
+            value["order"]["signatureType"],
+            PM_CLOB_V2_PROXY_SIGNATURE_TYPE
+        );
+        assert_eq!(
+            capture.expected_making_amount,
+            Some(U256::from_u64(if side == PmOrderSide::Buy {
+                4_000_000
+            } else {
+                10_000_000
+            }))
+        );
+        assert_eq!(
+            capture.expected_taking_amount,
+            Some(U256::from_u64(if side == PmOrderSide::Buy {
+                10_000_000
+            } else {
+                4_000_000
+            }))
+        );
+    }
+}
+
+#[test]
+fn proxy_profile_rejects_wrong_domain_expectation_swapped_roles_and_wrong_l2_owner() {
+    let standard = signer()
+        .sign_clob_v2_order(PmClobDomain::Standard, proxy_vector_order(PmOrderSide::Buy))
+        .unwrap();
+    let negative_risk = signer()
+        .sign_clob_v2_order(
+            PmClobDomain::NegativeRisk,
+            proxy_vector_order(PmOrderSide::Buy),
+        )
+        .unwrap();
+    assert_ne!(
+        standard.expected_order_id(),
+        negative_risk.expected_order_id()
+    );
+
+    let wrong_l2_owner = credentials_for(PROXY_ADDRESS, API_KEY, API_SECRET, PASSPHRASE);
+    assert_eq!(
+        wrong_l2_owner
+            .serialize_gtc_post_only(standard)
+            .unwrap_err(),
+        PmAuthError::CredentialIdentityMismatch
+    );
+
+    let order = PmUnsignedClobV2Order::new_pm_t2_proxy(
+        PmOrderSalt::from_u64(1).unwrap(),
+        EvmAddress::parse(ADDRESS).unwrap(),
+        EvmAddress::parse(PROXY_ADDRESS).unwrap(),
+        PmTokenId::new(U256::from_u64(1_234)).unwrap(),
+        PmOrderSide::Buy,
+        PmPrice::parse_decimal("0.40").unwrap(),
+        PmQuantity::parse_decimal("10").unwrap(),
+        PmTick::parse_decimal("0.01").unwrap(),
+        PmQuantity::parse_decimal("5").unwrap(),
+        1_713_398_400_000,
+    )
+    .unwrap();
+    assert_eq!(
+        signer()
+            .sign_clob_v2_order(PmClobDomain::Standard, order)
+            .unwrap_err(),
+        PmAuthError::OrderIdentityMismatch
+    );
+}
+
+#[test]
+fn eoa_and_proxy_profiles_cannot_be_cross_used() {
+    let signer_address = EvmAddress::parse(ADDRESS).unwrap();
+    let proxy_address = EvmAddress::parse(PROXY_ADDRESS).unwrap();
+    let make = |maker, signer| {
+        PmUnsignedClobV2Order::new_goal_f(
+            PmOrderSalt::from_u64(1).unwrap(),
+            maker,
+            signer,
+            PmTokenId::new(U256::from_u64(1_234)).unwrap(),
+            PmOrderSide::Buy,
+            PmPrice::parse_decimal("0.40").unwrap(),
+            PmQuantity::parse_decimal("10").unwrap(),
+            PmTick::parse_decimal("0.01").unwrap(),
+            PmQuantity::parse_decimal("5").unwrap(),
+            1_713_398_400_000,
+        )
+    };
+    assert_eq!(
+        make(proxy_address, signer_address),
+        Err(PmUnsignedOrderError::MakerIdentityMismatch)
+    );
+    assert_eq!(
+        PmUnsignedClobV2Order::new_pm_t2_proxy(
+            PmOrderSalt::from_u64(1).unwrap(),
+            signer_address,
+            signer_address,
+            PmTokenId::new(U256::from_u64(1_234)).unwrap(),
+            PmOrderSide::Buy,
+            PmPrice::parse_decimal("0.40").unwrap(),
+            PmQuantity::parse_decimal("10").unwrap(),
+            PmTick::parse_decimal("0.01").unwrap(),
+            PmQuantity::parse_decimal("5").unwrap(),
+            1_713_398_400_000,
+        ),
+        Err(PmUnsignedOrderError::ProxyIdentityMismatch)
     );
 }
 
@@ -533,6 +729,22 @@ fn predarb_parity_get_route_excludes_transport_query() {
 }
 
 #[test]
+fn closed_only_get_uses_the_frozen_signer_bound_l2_preimage() {
+    let credentials = credentials();
+    let headers = credentials
+        .authenticate_closed_only(L2Timestamp::from_unix_seconds(AUTH_SECONDS).unwrap())
+        .unwrap();
+    let mut capture = HeaderCapture::default();
+    headers.apply_to(&mut capture).unwrap();
+    assert_eq!(
+        capture.0.signature,
+        "n1obdNq7AuHb1M63PMyCfo6tkGeGkwjGRzkV86-ZtfE="
+    );
+    assert_eq!(capture.0.address, ADDRESS);
+    assert_eq!(capture.0.timestamp, AUTH_SECONDS.to_string());
+}
+
+#[test]
 fn exact_owned_cancel_body_and_l2_hmac_match() {
     let credentials = credentials();
     let order_id = FixedOrderId::parse(EXPECTED_BUY_ID).unwrap();
@@ -564,6 +776,7 @@ fn fixed_read_routes_have_distinct_auth_and_no_route_escape() {
         credentials
             .authenticate_balance_allowance(timestamp)
             .unwrap(),
+        credentials.authenticate_closed_only(timestamp).unwrap(),
         credentials
             .authenticate_order_detail(timestamp, order_id)
             .unwrap(),
@@ -576,7 +789,7 @@ fn fixed_read_routes_have_distinct_auth_and_no_route_escape() {
     }
     signatures.sort();
     signatures.dedup();
-    assert_eq!(signatures.len(), 4);
+    assert_eq!(signatures.len(), 5);
 }
 
 #[test]

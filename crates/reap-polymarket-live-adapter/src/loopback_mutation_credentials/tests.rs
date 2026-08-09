@@ -10,15 +10,14 @@ use reap_pm_core::{
     PmVenueOrderId, PmVenueOrderKey, U256, exact_order_amounts,
 };
 use reap_polymarket_adapter::{
-    PmExactOwnedCancelRequest, PmFixtureInstrumentScope, PmFixtureOwnedExecution,
-    PmGtcPostOnlyPlaceRequest,
+    PmExactOwnedCancelRequest, PmFixedMutationPreparation, PmFixtureInstrumentScope,
+    PmFixtureOwnedExecution, PmGtcPostOnlyPlaceRequest,
 };
 use reap_polymarket_auth::{
     CredentialSlotId, EoaPrivateKeyInput, FixedEoaSigner, L2CredentialInput, L2Credentials,
     L2Timestamp,
 };
-use reap_polymarket_wire::PmBookParserConfig;
-use reap_polymarket_wire::PmWireScope;
+use reap_polymarket_wire::{PmBookParserConfig, PmClobV2SignatureType, PmWireScope};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -73,6 +72,17 @@ fn account() -> PmAccountScope {
         PmSignerId::new(eoa),
         PmFunderId::new(eoa),
         PmAccountHandle::from_ordinal(7),
+    )
+}
+
+fn proxy_account() -> PmAccountScope {
+    let base = account();
+    PmAccountScope::new(
+        base.environment(),
+        base.chain(),
+        base.signer(),
+        PmFunderId::new(address(FOREIGN_ADDRESS)),
+        base.handle(),
     )
 }
 
@@ -140,12 +150,39 @@ fn place(scope: PmFixtureInstrumentScope) -> PmGtcPostOnlyPlaceRequest {
         .unwrap()
 }
 
+fn proxy_place(scope: PmFixtureInstrumentScope) -> PmGtcPostOnlyPlaceRequest {
+    PmFixedMutationPreparation::new_pm_t2_proxy(proxy_account(), instrument())
+        .prepare_place(
+            scope,
+            client_order(),
+            PmOrderSalt::from_u64(479_249_096_354).unwrap(),
+            PmOrderSide::Buy,
+            PmPrice::parse_decimal("0.52").unwrap(),
+            PmQuantity::parse_decimal("10").unwrap(),
+            1_780_449_126_930,
+        )
+        .unwrap()
+}
+
 fn cancel(order_id: &str) -> PmExactOwnedCancelRequest {
     execution()
         .cancel_command(
             instrument_scope(MARKET, 1_234),
             client_order(),
             PmVenueOrderKey::new(account().handle(), PmVenueOrderId::new(order_id).unwrap()),
+        )
+        .unwrap()
+}
+
+fn proxy_cancel(order_id: &str) -> PmExactOwnedCancelRequest {
+    PmFixedMutationPreparation::new_pm_t2_proxy(proxy_account(), instrument())
+        .prepare_cancel(
+            instrument_scope(MARKET, 1_234),
+            client_order(),
+            PmVenueOrderKey::new(
+                proxy_account().handle(),
+                PmVenueOrderId::new(order_id).unwrap(),
+            ),
         )
         .unwrap()
 }
@@ -163,6 +200,10 @@ fn credentials(address: &str) -> L2Credentials {
 }
 
 fn configs() -> (PmPrivateHttpConfig, PmUserWsConfig) {
+    configs_with_http_origin("http://127.0.0.1:18080")
+}
+
+fn configs_with_http_origin(origin: &str) -> (PmPrivateHttpConfig, PmUserWsConfig) {
     let scope = PmWireScope::new(
         PmConditionId::parse(CONDITION).unwrap(),
         PmMarketId::parse(MARKET).unwrap(),
@@ -170,7 +211,7 @@ fn configs() -> (PmPrivateHttpConfig, PmUserWsConfig) {
     );
     (
         PmPrivateHttpConfig::loopback_evidence(
-            "http://127.0.0.1:18080",
+            origin,
             Duration::from_millis(100),
             Duration::from_secs(1),
             scope,
@@ -239,6 +280,133 @@ fn owner() -> PmLoopbackMutationConnectivityOwner {
     owner_with_slot(CREDENTIAL_SLOT)
 }
 
+fn proxy_owner_with_configs(
+    http: PmPrivateHttpConfig,
+    user_ws: PmUserWsConfig,
+) -> PmLoopbackMutationConnectivityOwner {
+    let execution = execution();
+    let scope = instrument_scope(MARKET, 1_234);
+    PmLoopbackMutationConnectivityOwner::new_pm_t2_proxy(
+        http,
+        user_ws,
+        proxy_account(),
+        instrument(),
+        PmGoalFTradingDomain::from_metadata(scope.metadata()).unwrap(),
+        execution.place_profile(),
+        execution.cancel_purpose(),
+        observation_grant("BTC-USDT"),
+        CredentialSlotId::new(CREDENTIAL_SLOT.into()).unwrap(),
+        signer(),
+        credentials(ADDRESS),
+    )
+    .unwrap()
+}
+
+fn try_proxy_owner(
+    account: PmAccountScope,
+    credentials: L2Credentials,
+) -> Result<PmLoopbackMutationConnectivityOwner, PmLoopbackMutationAuthError> {
+    let execution = execution();
+    let scope = instrument_scope(MARKET, 1_234);
+    let (http, user_ws) = configs();
+    PmLoopbackMutationConnectivityOwner::new_pm_t2_proxy(
+        http,
+        user_ws,
+        account,
+        instrument(),
+        PmGoalFTradingDomain::from_metadata(scope.metadata()).unwrap(),
+        execution.place_profile(),
+        execution.cancel_purpose(),
+        observation_grant("BTC-USDT"),
+        CredentialSlotId::new(CREDENTIAL_SLOT.into()).unwrap(),
+        signer(),
+        credentials,
+    )
+}
+
+async fn mock_http_server(
+    responses: Vec<(u16, String)>,
+) -> (String, mpsc::Receiver<Vec<u8>>, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (requests, receiver) = mpsc::channel(responses.len());
+    let task = tokio::spawn(async move {
+        for (status, body) in responses {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            requests.send(request).await.unwrap();
+            let reason = if status == 200 { "OK" } else { "Unauthorized" };
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+    });
+    (format!("http://{address}"), receiver, task)
+}
+
+async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+    let mut request = Vec::new();
+    let mut chunk = [0_u8; 1_024];
+    loop {
+        let read = stream.read(&mut chunk).await.unwrap();
+        request.extend_from_slice(&chunk[..read]);
+        let Some(header_end) = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+        else {
+            assert_ne!(read, 0, "request closed before headers completed");
+            continue;
+        };
+        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length: ")
+                    .map(str::to_owned)
+            })
+            .map_or(0, |value| value.parse().unwrap());
+        if request.len() >= header_end + content_length {
+            return request;
+        }
+        assert_ne!(read, 0, "request closed before body completed");
+    }
+}
+
+fn request_header<'a>(request: &'a [u8], name: &str) -> &'a str {
+    let request = std::str::from_utf8(request).unwrap();
+    request
+        .lines()
+        .find_map(|line| {
+            let (candidate, value) = line.split_once(": ")?;
+            candidate.eq_ignore_ascii_case(name).then_some(value)
+        })
+        .unwrap()
+}
+
+fn request_body(request: &[u8]) -> &[u8] {
+    let header_end = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    &request[header_end..]
+}
+
+fn exact_order_body(maker: &str) -> String {
+    format!(
+        r#"{{"id":"{VENUE_ORDER}","market":"{CONDITION}","asset_id":"1234","side":"BUY","original_size":"10","size_matched":"0","price":"0.52","status":"LIVE","maker_address":"{maker}","owner":"{API_KEY}","expiration":"0","created_at":1700000000,"outcome":"Yes","order_type":"GTC"}}"#
+    )
+}
+
 #[tokio::test]
 async fn exact_neutral_place_and_cancel_are_signed_authenticated_and_retained() {
     let debug = format!("{:?}", owner());
@@ -262,6 +430,7 @@ async fn exact_neutral_place_and_cancel_are_signed_authenticated_and_retained() 
         PmGoalFTradingDomain::from_metadata(metadata(MARKET, 1_234)).unwrap()
     );
     assert_eq!(binding.wire_scope(), configs().0.exact_order_scope());
+    assert_eq!(binding.signature_profile(), PmClobV2SignatureType::Eoa);
     assert_ne!(
         fingerprint.into_authenticated_journal_scope_bytes(),
         [0; 32]
@@ -297,6 +466,151 @@ async fn exact_neutral_place_and_cancel_are_signed_authenticated_and_retained() 
         failure.into_request().venue_order().id().as_str(),
         VENUE_ORDER
     );
+}
+
+#[tokio::test]
+async fn pm_t2_proxy_custody_binds_reads_place_semantics_and_exact_cancel() {
+    let balance_body = r#"{"balance":"1000","allowances":{}}"#.to_owned();
+    let (private_origin, mut private_requests, private_server) = mock_http_server(vec![
+        (200, balance_body),
+        (200, exact_order_body(FOREIGN_ADDRESS)),
+    ])
+    .await;
+    let (http_config, user_ws_config) = configs_with_http_origin(&private_origin);
+    let roles = proxy_owner_with_configs(http_config, user_ws_config)
+        .split()
+        .unwrap();
+    let (mut http, _user_ws, mut place_role, mut cancel_role, binding, _, supervisor) =
+        roles.into_roles();
+
+    assert_eq!(binding.account(), proxy_account());
+    assert_eq!(binding.signature_profile(), PmClobV2SignatureType::Proxy);
+    let read_time = crate::product_clock::test_support_read_server_time(AUTH_SECONDS);
+    http.account()
+        .collateral_balance_allowance(read_time)
+        .await
+        .unwrap();
+    let observation = http
+        .reconciliation()
+        .exact_local_order_detail(
+            crate::product_clock::test_support_read_server_time(AUTH_SECONDS),
+            FixedOrderId::parse(VENUE_ORDER).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        observation,
+        crate::PmExactOrderObservation::Present(_)
+    ));
+
+    let balance_request = private_requests.recv().await.unwrap();
+    assert_eq!(
+        std::str::from_utf8(&balance_request)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+        "GET /balance-allowance?asset_type=COLLATERAL&signature_type=1 HTTP/1.1"
+    );
+    assert_eq!(request_header(&balance_request, "poly_address"), ADDRESS);
+    let detail_request = private_requests.recv().await.unwrap();
+    assert_eq!(
+        std::str::from_utf8(&detail_request)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+        format!("GET /data/order/{VENUE_ORDER} HTTP/1.1")
+    );
+    assert_eq!(request_header(&detail_request, "poly_address"), ADDRESS);
+    private_server.await.unwrap();
+
+    let retained_place = place_role
+        .authenticate_place(
+            proxy_place(instrument_scope(MARKET, 1_234)),
+            mutation_server_time(AUTH_SECONDS),
+        )
+        .await
+        .unwrap();
+    let semantic_commitment = retained_place.semantic_request_commitment();
+    assert_ne!(semantic_commitment.bytes(), [0; 32]);
+    let (place_origin, mut place_requests, place_server) =
+        mock_http_server(vec![(401, "{}".to_owned())]).await;
+    let mutation_config = crate::PmLoopbackMutationConfig::loopback_evidence(
+        &place_origin,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let outcome = crate::PmFixedPlaceLoopbackRole::new(mutation_config)
+        .unwrap()
+        .send(retained_place)
+        .await;
+    assert_eq!(outcome.semantic_request_commitment(), semantic_commitment);
+    let place_request = place_requests.recv().await.unwrap();
+    assert_eq!(
+        std::str::from_utf8(&place_request)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+        "POST /order HTTP/1.1"
+    );
+    assert_eq!(request_header(&place_request, "poly_address"), ADDRESS);
+    let body = std::str::from_utf8(request_body(&place_request)).unwrap();
+    for required in [
+        format!(r#""maker":"{FOREIGN_ADDRESS}""#),
+        format!(r#""signer":"{ADDRESS}""#),
+        r#""signatureType":1"#.to_owned(),
+        r#""orderType":"GTC""#.to_owned(),
+        r#""postOnly":true"#.to_owned(),
+        r#""deferExec":false"#.to_owned(),
+    ] {
+        assert!(
+            body.contains(&required),
+            "missing proxy place fact {required}"
+        );
+    }
+    place_server.await.unwrap();
+
+    let retained_cancel = cancel_role
+        .authenticate_cancel(
+            proxy_cancel(VENUE_ORDER),
+            mutation_server_time(AUTH_SECONDS + 1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retained_cancel.order_id().to_string(), VENUE_ORDER);
+    let cancel_semantic = retained_cancel.semantic_request_commitment();
+    let (cancel_origin, mut cancel_requests, cancel_server) =
+        mock_http_server(vec![(401, "{}".to_owned())]).await;
+    let mutation_config = crate::PmLoopbackMutationConfig::loopback_evidence(
+        &cancel_origin,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let outcome = crate::PmExactOwnedCancelLoopbackRole::new(mutation_config)
+        .unwrap()
+        .send(retained_cancel)
+        .await;
+    assert_eq!(outcome.semantic_request_commitment(), cancel_semantic);
+    let cancel_request = cancel_requests.recv().await.unwrap();
+    assert_eq!(
+        std::str::from_utf8(&cancel_request)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+        "DELETE /order HTTP/1.1"
+    );
+    assert_eq!(request_header(&cancel_request, "poly_address"), ADDRESS);
+    assert_eq!(
+        std::str::from_utf8(request_body(&cancel_request)).unwrap(),
+        format!(r#"{{"orderID":"{VENUE_ORDER}"}}"#)
+    );
+    cancel_server.await.unwrap();
+    supervisor.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -427,6 +741,38 @@ fn constructor_rejects_a_second_l2_identity_and_surface_is_redacted() {
             credentials(FOREIGN_ADDRESS),
         ),
         Err(PmLoopbackMutationAuthError::InvalidConfiguration(_))
+    ));
+}
+
+#[test]
+fn pm_t2_proxy_constructor_rejects_equal_swapped_and_wrong_l2_identities() {
+    assert!(matches!(
+        try_proxy_owner(account(), credentials(ADDRESS)),
+        Err(PmLoopbackMutationAuthError::InvalidConfiguration(
+            "PM-T2 proxy funder must be nonzero and distinct from the signer EOA"
+        ))
+    ));
+
+    let base = account();
+    let swapped = PmAccountScope::new(
+        base.environment(),
+        base.chain(),
+        PmSignerId::new(address(FOREIGN_ADDRESS)),
+        PmFunderId::new(address(ADDRESS)),
+        base.handle(),
+    );
+    assert!(matches!(
+        try_proxy_owner(swapped, credentials(ADDRESS)),
+        Err(PmLoopbackMutationAuthError::InvalidConfiguration(
+            "private-key signer, L2 credentials, and account signer must be one EOA"
+        ))
+    ));
+
+    assert!(matches!(
+        try_proxy_owner(proxy_account(), credentials(FOREIGN_ADDRESS)),
+        Err(PmLoopbackMutationAuthError::InvalidConfiguration(
+            "private-key signer, L2 credentials, and account signer must be one EOA"
+        ))
     ));
 }
 

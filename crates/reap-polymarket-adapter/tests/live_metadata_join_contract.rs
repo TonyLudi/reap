@@ -54,7 +54,12 @@ fn short_market(
           "t":[{{"t":"123","o":"{label}"}},{{"t":"456","o":"No"}}],
           "mts":{tick},
           "mos":{minimum},
-          "nr":{negative_risk}
+          "nr":{negative_risk},
+          "fd":{{"r":0.02,"e":2,"to":true}},
+          "mbf":0,
+          "tbf":0,
+          "itode":false,
+          "oas":0
           {condition}
         }}"#
     )

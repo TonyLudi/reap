@@ -1,6 +1,9 @@
 use std::fmt;
 
-use reap_polymarket_wire::{MAX_PUBLIC_REST_BODY_BYTES, PmWireScope};
+use reap_polymarket_wire::{
+    MAX_PUBLIC_REST_BODY_BYTES, PmClobV2Metadata, PmClobV2RequestScope, PmLifecycleMetadata,
+    PmWireScope, parse_live_clob_market_lifecycle, parse_live_clob_v2_metadata,
+};
 
 use crate::{
     PmLiveAdapterError, PmPublicHttpConfig, PmPublicMetadataDeliveryError,
@@ -53,6 +56,27 @@ pub trait PmLiveMetadataPairSink {
     ) -> Result<Self::Output, Self::Error>;
 }
 
+/// Fully parsed result of the exact long-market plus abbreviated CLOB-details
+/// pair. Construction succeeds only after both bounded responses validate
+/// against the same configured condition/question/token scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PmTypedLiveMarketDetails {
+    lifecycle: PmLifecycleMetadata,
+    clob: PmClobV2Metadata,
+}
+
+impl PmTypedLiveMarketDetails {
+    #[must_use]
+    pub const fn lifecycle(&self) -> &PmLifecycleMetadata {
+        &self.lifecycle
+    }
+
+    #[must_use]
+    pub const fn clob(&self) -> &PmClobV2Metadata {
+        &self.clob
+    }
+}
+
 /// Exact two-route public metadata capability for one configured PM outcome.
 #[derive(Clone)]
 pub struct PmPublicMetadataHttpRole {
@@ -81,20 +105,8 @@ impl PmPublicMetadataHttpRole {
     where
         S: PmLiveMetadataPairSink,
     {
-        let market_bytes = self
-            .transport
-            .get(
-                PmPublicRoute::MarketMetadata(self.scope.condition()),
-                MAX_PUBLIC_REST_BODY_BYTES,
-            )
-            .await
-            .map_err(PmPublicMetadataDeliveryError::Http)?;
-        let clob_v2_bytes = self
-            .transport
-            .get(
-                PmPublicRoute::ClobV2Metadata(self.scope.condition()),
-                MAX_PUBLIC_REST_BODY_BYTES,
-            )
+        let (market_bytes, clob_v2_bytes) = self
+            .fetch_pair()
             .await
             .map_err(PmPublicMetadataDeliveryError::Http)?;
         sink.deliver_native_metadata_pair(PmLiveMetadataPair {
@@ -103,6 +115,35 @@ impl PmPublicMetadataHttpRole {
             clob_v2_bytes: &clob_v2_bytes,
         })
         .map_err(PmPublicMetadataDeliveryError::Sink)
+    }
+
+    /// Fetch and strictly parse the complete configured market preflight pair.
+    pub async fn refresh_typed(&self) -> Result<PmTypedLiveMarketDetails, PmLiveAdapterError> {
+        let (market_bytes, clob_v2_bytes) = self.fetch_pair().await?;
+        let lifecycle = parse_live_clob_market_lifecycle(&market_bytes, self.scope)?;
+        let clob = parse_live_clob_v2_metadata(
+            &clob_v2_bytes,
+            PmClobV2RequestScope::new(self.scope.condition(), self.scope.token()),
+        )?;
+        Ok(PmTypedLiveMarketDetails { lifecycle, clob })
+    }
+
+    async fn fetch_pair(&self) -> Result<(Vec<u8>, Vec<u8>), PmLiveAdapterError> {
+        let market_bytes = self
+            .transport
+            .get(
+                PmPublicRoute::MarketMetadata(self.scope.condition()),
+                MAX_PUBLIC_REST_BODY_BYTES,
+            )
+            .await?;
+        let clob_v2_bytes = self
+            .transport
+            .get(
+                PmPublicRoute::ClobV2Metadata(self.scope.condition()),
+                MAX_PUBLIC_REST_BODY_BYTES,
+            )
+            .await?;
+        Ok((market_bytes, clob_v2_bytes))
     }
 }
 
@@ -219,7 +260,7 @@ mod tests {
 
     fn short_market() -> String {
         format!(
-            r#"{{"c":"{CONDITION}","t":[{{"t":"123","o":"Yes"}},{{"t":"456","o":"No"}}],"mts":0.01,"mos":5,"nr":false}}"#
+            r#"{{"c":"{CONDITION}","t":[{{"t":"123","o":"Yes"}},{{"t":"456","o":"No"}}],"mts":0.01,"mos":5,"nr":false,"fd":{{"r":0.02,"e":2,"to":true}},"mbf":0,"tbf":0,"itode":false,"oas":0}}"#
         )
     }
 

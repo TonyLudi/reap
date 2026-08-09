@@ -73,7 +73,7 @@ fn short_market(condition: Option<&str>, tick: &str, minimum: &str, nr: Option<&
           "mts":{tick},
           "mos":{minimum},
           "r":{{"rates":null}},
-          "fd":{{"maker":0,"taker":0}},
+          "fd":{{"r":0.02,"e":2,"to":true}},
           "mbf":0,
           "tbf":0,
           "ao":true,
@@ -83,8 +83,8 @@ fn short_market(condition: Option<&str>, tick: &str, minimum: &str, nr: Option<&
           "aot":"2026-08-08T00:00:00Z",
           "rfqe":false,
           "itode":false,
-          "ibce":true,
-          "oas":"open"
+          "oas":0,
+          "ibce":true
           {condition}{nr}
         }}"#
     )
@@ -154,6 +154,13 @@ fn abbreviated_route_retains_request_provenance_without_fabricating_market_ident
     assert!(!omitted.negative_risk());
     assert_eq!(omitted.configured_outcome().label().as_str(), "Yes");
     assert_eq!(omitted.tokens().len(), 2);
+    assert_eq!(omitted.maker_base_fee_bps(), 0);
+    assert_eq!(omitted.taker_base_fee_bps(), 0);
+    assert_eq!(omitted.fee_details().rate().unwrap().as_str(), "0.02");
+    assert_eq!(omitted.fee_details().exponent().unwrap().as_str(), "2");
+    assert_eq!(omitted.fee_details().taker_only(), Some(true));
+    assert!(!omitted.take_only_delay_enabled());
+    assert_eq!(omitted.minimum_order_age_seconds(), 0);
 
     let reported = parse_live_clob_v2_metadata(
         short_market(Some(support::CONDITION), "0.01", "5", Some("true")).as_bytes(),
@@ -252,6 +259,15 @@ fn abbreviated_membership_required_fields_and_unknowns_fail_closed() {
         Err(PmWireError::DuplicateToken)
     );
 
+    let extra_token = valid.replace(
+        r#"{"t":"456","o":"No"}"#,
+        r#"{"t":"456","o":"No"},{"t":"789","o":"Other"}"#,
+    );
+    assert_eq!(
+        parse_live_clob_v2_metadata(extra_token.as_bytes(), request_scope()),
+        Err(PmWireError::UnexpectedMarketTokenCount)
+    );
+
     for (needle, field) in [
         (
             r#"          "mts":0.01,
@@ -267,6 +283,26 @@ fn abbreviated_membership_required_fields_and_unknowns_fail_closed() {
             r#"          "t":[{"t":"123","o":"Yes"},{"t":"456","o":"No"}],
 "#,
             "tokens",
+        ),
+        (
+            r#"          "mbf":0,
+"#,
+            "maker_base_fee",
+        ),
+        (
+            r#"          "tbf":0,
+"#,
+            "taker_base_fee",
+        ),
+        (
+            r#"          "fd":{"r":0.02,"e":2,"to":true},
+"#,
+            "fee_details",
+        ),
+        (
+            r#"          "oas":0,
+"#,
+            "minimum_order_age_seconds",
         ),
     ] {
         let missing = valid.replace(needle, "");
@@ -285,6 +321,72 @@ fn abbreviated_membership_required_fields_and_unknowns_fail_closed() {
     let unknown_token = valid.replace(r#"{"t":"123","o":"Yes"}"#, r#"{"t":"123","o":"Yes","x":1}"#);
     assert_eq!(
         parse_live_clob_v2_metadata(unknown_token.as_bytes(), request_scope()),
+        Err(PmWireError::MalformedJson)
+    );
+
+    let null_fee_details = valid.replace(r#""fd":{"r":0.02,"e":2,"to":true}"#, r#""fd":null"#);
+    assert_eq!(
+        parse_live_clob_v2_metadata(null_fee_details.as_bytes(), request_scope()),
+        Err(PmWireError::NullField("fee_details"))
+    );
+}
+
+#[test]
+fn abbreviated_fee_delay_and_order_age_fields_are_exact_and_typed() {
+    let valid = short_market(None, "0.01", "5", None);
+    let delayed = valid.replace(r#""itode":false"#, r#""itode":true"#);
+    assert!(
+        parse_live_clob_v2_metadata(delayed.as_bytes(), request_scope())
+            .unwrap()
+            .take_only_delay_enabled()
+    );
+
+    for (raw, field) in [
+        (valid.replace(r#""mbf":0"#, r#""mbf":-1"#), "maker_base_fee"),
+        (
+            valid.replace(r#""tbf":0"#, r#""tbf":0.5"#),
+            "taker_base_fee",
+        ),
+        (
+            valid.replace(r#""oas":0"#, r#""oas":"0""#),
+            "minimum_order_age_seconds",
+        ),
+    ] {
+        assert_eq!(
+            parse_live_clob_v2_metadata(raw.as_bytes(), request_scope()),
+            Err(PmWireError::MalformedJson),
+            "{field}"
+        );
+    }
+
+    for exact in ["0.0", "0.020", "1e-2"] {
+        let raw = valid.replace("0.02", exact);
+        assert_eq!(
+            parse_live_clob_v2_metadata(raw.as_bytes(), request_scope())
+                .unwrap()
+                .fee_details()
+                .rate()
+                .unwrap()
+                .as_str(),
+            exact
+        );
+    }
+
+    for malformed in ["-0.02", "\"0.02\""] {
+        let raw = valid.replace("0.02", malformed);
+        assert_eq!(
+            parse_live_clob_v2_metadata(raw.as_bytes(), request_scope()),
+            Err(PmWireError::InvalidNumeric("fee_details.rate")),
+            "{malformed}"
+        );
+    }
+
+    let duplicate_fee_member = valid.replace(
+        r#""fd":{"r":0.02,"e":2,"to":true}"#,
+        r#""fd":{"r":0.02,"r":0.03,"e":2,"to":true}"#,
+    );
+    assert_eq!(
+        parse_live_clob_v2_metadata(duplicate_fee_member.as_bytes(), request_scope()),
         Err(PmWireError::MalformedJson)
     );
 }

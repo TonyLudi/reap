@@ -52,7 +52,6 @@ pub(crate) fn normalize_live_account(
     collateral: &PmLiveBalanceAllowance,
     conditional: &PmLiveBalanceAllowance,
 ) -> Result<NormalizedLiveAccountRows, PmLiveNormalizationError> {
-    scope.validate_account_profile()?;
     let domain = scope.instrument.trading_domain();
     let required = domain.required_spenders();
     let collateral_requirement = exact_requirement(required, domain.collateral())?;

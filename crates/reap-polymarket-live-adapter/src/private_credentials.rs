@@ -1,5 +1,6 @@
 use std::{fmt, time::Duration};
 
+use reap_pm_core::EvmAddress;
 use reap_polymarket_auth::{
     AuthenticatedL2Headers, AuthenticatedUserSubscription, AuthenticatedUserSubscriptionSink,
     CredentialOwnedUserFrame, FixedOrderId, L2Credentials, L2Timestamp,
@@ -120,6 +121,8 @@ pub struct PmPrivateConnectivityOwner {
     http_config: PmPrivateHttpConfig,
     user_ws_config: PmUserWsConfig,
     credentials: L2Credentials,
+    expected_order_maker: EvmAddress,
+    balance_signature_type: PmReadOnlySignatureType,
 }
 
 impl PmPrivateConnectivityOwner {
@@ -133,10 +136,41 @@ impl PmPrivateConnectivityOwner {
                 "private HTTP and user WebSocket must bind the same condition",
             ));
         }
+        let expected_order_maker = credentials.address().as_core();
         Ok(Self {
             http_config,
             user_ws_config,
             credentials,
+            expected_order_maker,
+            balance_signature_type: PmReadOnlySignatureType::Eoa,
+        })
+    }
+
+    /// Construct a read-only proxy-account owner. L2 requests remain bound to
+    /// the signer address held by `credentials`; exact order identity and
+    /// downstream normalization instead use the distinct proxy funder.
+    pub(crate) fn new_proxy_read_only(
+        http_config: PmPrivateHttpConfig,
+        user_ws_config: PmUserWsConfig,
+        expected_order_maker: EvmAddress,
+        credentials: L2Credentials,
+    ) -> Result<Self, PmLiveAdapterError> {
+        if http_config.exact_order_scope().condition() != user_ws_config.condition() {
+            return Err(PmLiveAdapterError::InvalidConfiguration(
+                "private HTTP and user WebSocket must bind the same condition",
+            ));
+        }
+        if credentials.address().as_core() == expected_order_maker {
+            return Err(PmLiveAdapterError::InvalidConfiguration(
+                "proxy read profile requires distinct signer and funder",
+            ));
+        }
+        Ok(Self {
+            http_config,
+            user_ws_config,
+            credentials,
+            expected_order_maker,
+            balance_signature_type: PmReadOnlySignatureType::Proxy,
         })
     }
 
@@ -144,15 +178,16 @@ impl PmPrivateConnectivityOwner {
     /// handles. A Tokio runtime must be active because the authority is an
     /// isolated task rather than a lent secret reference.
     pub fn split(self) -> Result<PmPrivateConnectivityRoles, PmLiveAdapterError> {
-        let address = self.credentials.address();
-        let transport = PmPrivateHttpTransport::new(&self.http_config, address)?;
+        let l2_signer_address = self.credentials.address();
+        let transport = PmPrivateHttpTransport::new(&self.http_config, l2_signer_address)?;
         let (sender, supervisor) = spawn_credential_authority(self.credentials)?;
 
-        let http = PmAuthenticatedHttpOwner::from_authority(
+        let http = PmAuthenticatedHttpOwner::from_authority_with_account_profile(
             transport,
             self.http_config.exact_order_scope(),
-            address,
-            PmReadOnlySignatureType::Eoa,
+            l2_signer_address,
+            self.expected_order_maker,
+            self.balance_signature_type,
             PmHttpCredentialRole {
                 sender: sender.clone(),
             },
@@ -389,6 +424,17 @@ impl PmHttpCredentialRole {
         .await
     }
 
+    pub(crate) async fn authenticate_closed_only(
+        &mut self,
+        timestamp: L2Timestamp,
+    ) -> Result<AuthenticatedL2Headers, PmLiveAdapterError> {
+        request(&self.sender, |response| CredentialRequest::ClosedOnly {
+            timestamp,
+            response,
+        })
+        .await
+    }
+
     pub(crate) async fn authenticate_exact_order(
         &mut self,
         timestamp: L2Timestamp,
@@ -508,6 +554,10 @@ pub(crate) enum CredentialRequest {
         timestamp: L2Timestamp,
         response: oneshot::Sender<Result<AuthenticatedL2Headers, PmLiveAdapterError>>,
     },
+    ClosedOnly {
+        timestamp: L2Timestamp,
+        response: oneshot::Sender<Result<AuthenticatedL2Headers, PmLiveAdapterError>>,
+    },
     ExactOrder {
         timestamp: L2Timestamp,
         order_id: FixedOrderId,
@@ -585,6 +635,15 @@ pub(crate) fn handle_credential_request(credentials: &L2Credentials, request: Cr
             response,
             credentials
                 .authenticate_balance_allowance(timestamp)
+                .map_err(Into::into),
+        ),
+        CredentialRequest::ClosedOnly {
+            timestamp,
+            response,
+        } => respond(
+            response,
+            credentials
+                .authenticate_closed_only(timestamp)
                 .map_err(Into::into),
         ),
         CredentialRequest::ExactOrder {

@@ -103,6 +103,36 @@ fn exact_balances_allowances_and_position_are_atomic_and_extras_are_diagnostic()
 }
 
 #[test]
+fn proxy_account_balance_and_position_normalization_accepts_split_identity() {
+    let (_, _, account) = PmReadOwnerGrant::allocate().split();
+    let mut role = support::account_with_account(account, support::proxy_account_scope());
+    let collateral = balance(1_000, Some(100), None, false);
+    let conditional = balance(25, Some(1), None, false);
+    let serviced = role
+        .request_snapshot(ConnectionEpoch::new(1), IngressSequence::new(10))
+        .unwrap()
+        .complete_live(
+            completion(1, 11, Some(1)),
+            snapshot(1),
+            &collateral,
+            &conditional,
+        )
+        .unwrap()
+        .into_delivery()
+        .service_at(30_000)
+        .unwrap();
+    role.reduce_snapshot_delivery(serviced, |_, envelope| {
+        let position = envelope
+            .payload()
+            .expected_position(instrument())
+            .unwrap()
+            .unwrap();
+        assert_eq!(position.quantity(), U256::from_u64(25));
+    })
+    .unwrap();
+}
+
+#[test]
 fn missing_exact_spender_never_falls_back_to_the_first_allowance() {
     let (_, _, account) = PmReadOwnerGrant::allocate().split();
     let mut role = support::account_with(account);

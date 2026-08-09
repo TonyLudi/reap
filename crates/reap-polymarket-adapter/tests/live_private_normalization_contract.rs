@@ -236,6 +236,33 @@ fn user_order_status_is_proven_by_kind_cumulative_and_wire_status() {
 }
 
 #[test]
+fn proxy_user_order_uses_funder_as_maker_and_rejects_a_foreign_maker() {
+    let (private, _, _) = PmReadOwnerGrant::allocate().split();
+    let mut role = support::private_with_account(private, support::proxy_account_scope());
+    role.reconnect(ConnectionEpoch::new(1)).unwrap();
+
+    let (observations, diagnostics) = observe(
+        &mut role,
+        1,
+        user_order(ORDER_A, CONDITION, "0", "PLACEMENT"),
+    );
+    assert!(diagnostics.is_empty());
+    let [PmPrivateLifecycleObservation::Order(order)] = observations.as_slice() else {
+        panic!("one proxy-funded order")
+    };
+    assert_eq!(order.progress().status(), PmOrderStatus::Open);
+
+    let mut foreign = user_order(ORDER_B, CONDITION, "0", "PLACEMENT");
+    foreign["maker_address"] = json!(FOREIGN_MAKER);
+    assert!(matches!(
+        role.receive_live_user_frame(completion(1, 2, None), authenticated(foreign)),
+        Err(PmPrivateNormalizationError::Live(
+            reap_polymarket_adapter::PmLiveNormalizationError::AccountProfileMismatch
+        ))
+    ));
+}
+
+#[test]
 fn configured_user_order_requires_exact_eoa_gtc_outcome_and_status_consistency() {
     let cases = [
         (

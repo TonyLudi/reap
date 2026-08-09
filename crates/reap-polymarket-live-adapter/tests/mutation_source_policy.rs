@@ -14,7 +14,9 @@ fn production_surface_has_no_constructible_mutation_transport() {
     assert!(!LOOPBACK_CREDENTIALS.contains("read-only-evidence"));
     assert!(TRANSPORT.contains("#[cfg(any(test, feature = \"loopback-evidence\"))]"));
     assert!(TRANSPORT.contains("pub fn loopback_evidence("));
+    assert!(LOOPBACK_CREDENTIALS.contains("pub fn new_pm_t2_proxy("));
     assert!(!TRANSPORT.contains("pub fn production("));
+    assert!(!LOOPBACK_CREDENTIALS.contains("pub fn production("));
     assert!(!TRANSPORT.contains("pub fn new_origin("));
     assert!(LIB.contains("PRODUCTION_ORDER_ENTRY_AUTHORIZED: bool = false"));
     assert!(!LIB.contains("PRODUCTION_ORDER_ENTRY_AUTHORIZED: bool = true"));
@@ -164,7 +166,10 @@ fn loopback_role_bundle_carries_one_typed_configuration_pairing_proof() {
         "instrument: self.binding.instrument",
         "trading_domain: self.binding.trading_domain",
         "wire_scope: self.http_config.exact_order_scope()",
+        "signature_profile: self.binding.signature_profile",
         "configuration_fingerprint: PmConfigurationFingerprint",
+        "signature_profile: PmClobV2SignatureType",
+        "pub const fn signature_profile(&self) -> PmClobV2SignatureType",
         "credential_slot_fingerprint: AuthenticatedJournalCredentialSlotFingerprint",
         "self.binding,",
     ] {

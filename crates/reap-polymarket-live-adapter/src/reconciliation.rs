@@ -1,7 +1,7 @@
 use std::fmt;
 
-use reap_pm_core::{MAX_PM_RECONCILIATION_FILLS, MAX_PM_RECONCILIATION_ORDERS};
-use reap_polymarket_auth::{EoaAddress, FixedOrderId, L2Timestamp};
+use reap_pm_core::{EvmAddress, MAX_PM_RECONCILIATION_FILLS, MAX_PM_RECONCILIATION_ORDERS};
+use reap_polymarket_auth::{FixedOrderId, L2Timestamp};
 use reap_polymarket_wire::{
     PmLiveOpenOrderPage, PmLiveOrder, PmLiveTradePage, PmWireScope, parse_live_open_order_page,
     parse_live_order_detail, parse_live_trade_page,
@@ -173,7 +173,7 @@ pub struct PmReconciliationHttpRole<'a> {
     authority: &'a mut PmHttpCredentialRole,
     transport: &'a PmPrivateHttpTransport,
     exact_order_scope: PmWireScope,
-    configured_address: EoaAddress,
+    expected_order_maker: EvmAddress,
 }
 
 impl<'a> PmReconciliationHttpRole<'a> {
@@ -181,13 +181,13 @@ impl<'a> PmReconciliationHttpRole<'a> {
         authority: &'a mut PmHttpCredentialRole,
         transport: &'a PmPrivateHttpTransport,
         exact_order_scope: PmWireScope,
-        configured_address: EoaAddress,
+        expected_order_maker: EvmAddress,
     ) -> Self {
         Self {
             authority,
             transport,
             exact_order_scope,
-            configured_address,
+            expected_order_maker,
         }
     }
 
@@ -305,7 +305,7 @@ impl<'a> PmReconciliationHttpRole<'a> {
                 if order.id().as_str() != order_id.to_string() {
                     return Err(PmLiveAdapterError::ExactOrderIdentityMismatch);
                 }
-                if order.maker() != self.configured_address.as_core() {
+                if order.maker() != self.expected_order_maker {
                     return Err(PmLiveAdapterError::ExactOrderMakerMismatch);
                 }
                 if order.condition() != self.exact_order_scope.condition()
