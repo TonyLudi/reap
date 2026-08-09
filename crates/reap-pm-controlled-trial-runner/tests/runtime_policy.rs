@@ -1,4 +1,5 @@
 const AUTHORITY: &str = include_str!("../src/controlled_trial/authority.rs");
+const CURRENT_RUNTIME: &str = include_str!("../src/controlled_trial/runtime/current_runtime.rs");
 const PRIVATE_READS: &str = include_str!("../src/controlled_trial/runtime/private_reads.rs");
 const PUBLIC_BOOK: &str = include_str!("../src/controlled_trial/runtime/public_book.rs");
 const USER_STREAM: &str = include_str!("../src/controlled_trial/runtime/user_stream.rs");
@@ -11,14 +12,23 @@ fn production_prefix(source: &str) -> &str {
         .map_or(source, |(head, _)| head)
 }
 
+fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    source
+        .split_once(start)
+        .and_then(|(_, tail)| tail.split_once(end).map(|(slice, _)| slice))
+        .expect("runtime source policy markers must remain ordered")
+}
+
 #[test]
 fn runtime_is_binary_private_read_only_evidence_without_a_transport_escape() {
+    assert!(RUNTIME_MOD.contains("mod current_runtime;"));
     assert!(RUNTIME_MOD.contains("mod private_reads;"));
     assert!(RUNTIME_MOD.contains("mod public_book;"));
     assert!(RUNTIME_MOD.contains("mod user_stream;"));
     assert!(!MANIFEST.contains("reqwest"));
 
     for (name, source) in [
+        ("current runtime", production_prefix(CURRENT_RUNTIME)),
         ("private reads", production_prefix(PRIVATE_READS)),
         ("public book", production_prefix(PUBLIC_BOOK)),
         ("user stream", production_prefix(USER_STREAM)),
@@ -43,6 +53,274 @@ fn runtime_is_binary_private_read_only_evidence_without_a_transport_escape() {
                 "{name} runtime gained forbidden `{forbidden}` surface",
             );
         }
+    }
+}
+
+#[test]
+fn current_runtime_is_source_owned_move_only_and_consumingly_rechecked() {
+    let production = production_prefix(CURRENT_RUNTIME);
+    let observe_signature = between(
+        production,
+        "pub(super) fn observe_phase_a_place(",
+        ") -> Result<PmPhaseAPlaceCurrentRuntimeWitness",
+    );
+    for required in [
+        "&mut self",
+        "config: &CanonicalTrialConfig",
+        "authorization: &CanonicalAuthorization",
+        "geoblock: PmProductionGeoblockObservation",
+    ] {
+        assert!(observe_signature.contains(required));
+    }
+    for forbidden in [
+        "path:",
+        "sha256:",
+        "length:",
+        "host_identity:",
+        "runtime_user:",
+        "egress_identity:",
+        "blocked:",
+        "now:",
+        "clock:",
+        "origin:",
+    ] {
+        assert!(
+            !observe_signature.contains(forbidden),
+            "current-runtime observer gained caller fact `{forbidden}`",
+        );
+    }
+    for required in [
+        "pub(super) struct PmCurrentRuntimeObserver",
+        "pub(super) fn system() -> Self",
+        "pub(super) fn observe_phase_a_place(",
+        "geoblock: PmProductionGeoblockObservation",
+        "pub(super) fn recheck_phase_a_place(",
+        "witness: PmPhaseAPlaceCurrentRuntimeWitness",
+        "pub(super) struct PmPhaseAPlaceCurrentRuntimeWitness",
+        "pub(super) struct PmRevalidatedPhaseAPlaceCurrentRuntimeWitness",
+        "pub(super) struct PmCurrentRuntimeFactsView<'a>",
+        "evidence: &'a PmCurrentRuntimeEvidence",
+        "PmCurrentRuntimeFactsView<'_>",
+        "impl fmt::Debug for PmCurrentRuntimeObserver",
+        "impl fmt::Debug for PmPhaseAPlaceCurrentRuntimeWitness",
+        "impl fmt::Debug for PmRevalidatedPhaseAPlaceCurrentRuntimeWitness",
+        "impl fmt::Debug for PmCurrentRuntimeFactsView<'_>",
+        "<move-only; runtime-and-geoblock-bound>",
+        "<move-only; non-authoritative; future-consuming-recheck-required>",
+        "explicitly not mutation, dispatch, freshness, or transport authority",
+        "cannot be decomposed into custody",
+        "permit/transport-side consuming recheck immediately before dispatch",
+        "point-in-time check does not close",
+        "future permit/transport boundary must consume this",
+        "does not extend the point-in-time check's freshness",
+        "<borrowed; nonsecret; non-authority>",
+        "PmPhaseAPlaceCurrentRuntimeWitness { mut evidence }",
+        "effective_user_id: local.effective_user_id",
+        "geoblock_source_monotonic_provenance_ns",
+        "TrialPhase::APlaceCancel",
+        "validate_age_window(",
+        "checked_duration_since(first_monotonic)",
+        "duration_since(first_wall)",
+        "evidence.checked_wall_complete = local.wall_completed",
+        "evidence.checked_monotonic_complete = local.monotonic_completed",
+        "checked_wall_capture_unix_ns: unix_nanoseconds(local.wall_completed)?",
+        "evidence.checked_wall_capture_unix_ns = unix_nanoseconds(local.wall_completed)?",
+        "checked_add(cleanup_budget)",
+        "required_cleanup_boundary > cleanup_wall",
+        "const PROC_ROOT_PATH: &str = \"/proc\"",
+        "const PROC_SELF_EXE_ENTRY: &str = \"self/exe\"",
+        "rustix::fs::open(",
+        "rustix::fs::openat(",
+        "PROC_SELF_EXE_ENTRY",
+        "rustix::fs::fstatfs(&proc)",
+        "PROC_SUPER_MAGIC",
+        "linux_uts_nodename",
+        "linux_boot_identity",
+        "rustix::system::uname()",
+        "rustix::process::geteuid().as_raw()",
+        "const GETENT_PATH: &str = \"/usr/bin/getent\"",
+        "Command::new(GETENT_PATH)",
+        ".env_clear()",
+        ".stdout(Stdio::piped())",
+        "stdout.take((MAX_GETENT_STDOUT_BYTES + 1) as u64)",
+        "SystemTime::now()",
+        "Instant::now()",
+        "Sha256::new()",
+    ] {
+        assert!(
+            production.contains(required),
+            "current runtime is missing source pin `{required}`",
+        );
+    }
+    for borrowed_fact in [
+        "canonical_config_sha256(&self) -> &str",
+        "canonical_config_length(&self) -> u64",
+        "canonical_config_fingerprint(&self) -> &str",
+        "trial_plan_fingerprint(&self) -> &str",
+        "authorization_id(&self) -> &str",
+        "authorization_fingerprint(&self) -> &str",
+        "release_binary_sha256(&self) -> &str",
+        "release_binary_length(&self) -> u64",
+        "host_identity(&self) -> &str",
+        "boot_identity(&self) -> &str",
+        "runtime_user(&self) -> &str",
+        "linux_effective_user_id(&self) -> u32",
+        "borrowed V2 evidence fact and is never authority or a V1 schema field",
+        "authorized_egress_identity(&self) -> IpAddr",
+        "geoblock_reported_ip(&self) -> IpAddr",
+        "geoblock_blocked(&self) -> bool",
+        "geoblock_country(&self) -> &str",
+        "geoblock_region(&self) -> &str",
+        "geoblock_commitment(&self) -> PmGeoblockObservationCommitment",
+        "geoblock_wall_receive_ns(&self) -> u64",
+        "geoblock_source_monotonic_provenance_ns(&self) -> u64",
+        "checked_at_utc(&self) -> &str",
+        "checked_wall_capture_unix_ns(&self) -> u64",
+        "borrowed V2 evidence fact is not external UTC or freshness proof",
+        "maximum_age_ms(&self) -> u64",
+        "cleanup_not_after_utc(&self) -> &str",
+    ] {
+        assert!(
+            production.contains(borrowed_fact),
+            "current-runtime facts view lost `{borrowed_fact}`",
+        );
+    }
+    for (name, declaration) in [
+        (
+            "PmCurrentRuntimeObserver",
+            "pub(super) struct PmCurrentRuntimeObserver",
+        ),
+        (
+            "PmPhaseAPlaceCurrentRuntimeWitness",
+            "pub(super) struct PmPhaseAPlaceCurrentRuntimeWitness",
+        ),
+        (
+            "PmRevalidatedPhaseAPlaceCurrentRuntimeWitness",
+            "pub(super) struct PmRevalidatedPhaseAPlaceCurrentRuntimeWitness",
+        ),
+        (
+            "PmCurrentRuntimeFactsView",
+            "pub(super) struct PmCurrentRuntimeFactsView<'a>",
+        ),
+    ] {
+        let attributes = production
+            .split_once(declaration)
+            .expect("current-runtime type declaration")
+            .0
+            .rsplit("\n\n")
+            .next()
+            .expect("current-runtime type attributes");
+        for forbidden in ["Clone", "Copy", "Serialize", "Deserialize"] {
+            assert!(
+                !attributes.contains(forbidden),
+                "current runtime `{name}` gained forbidden `{forbidden}` derive",
+            );
+            assert!(
+                !production.contains(&format!("{forbidden} for {name}")),
+                "current runtime `{name}` gained forbidden `{forbidden}` impl",
+            );
+        }
+    }
+    for forbidden in [
+        "std::env::",
+        "current_exe(",
+        "Command::new(\"getent\")",
+        "Command::new(\"uname\")",
+        "getlogin",
+        "unsafe",
+        "reqwest",
+        "POST /order",
+        "DELETE /order",
+        "same_egress_as_clob",
+        "production_order_entry_authorized: true",
+        "real_order_submission_authorized: true",
+        "pub(super) fn from_",
+        "pub(super) fn into_",
+        "PmGeoblockObservation {",
+        "PmHttpReceiveClock {",
+        "DispatchAuthorized",
+        "SignedClobV2Order",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "current runtime gained forbidden escape `{forbidden}`",
+        );
+    }
+    assert!(MANIFEST.contains("chrono.workspace = true"));
+    assert!(MANIFEST.contains("reap-pm-controlled-trial.workspace = true"));
+    assert!(MANIFEST.contains(
+        "rustix = { version = \"=1.1.4\", features = [\"fs\", \"process\", \"system\"] }"
+    ));
+    assert!(MANIFEST.contains("sha2.workspace = true"));
+    assert_eq!(
+        production.matches("Command::new(").count(),
+        1,
+        "current runtime must use only the one fixed NSS helper",
+    );
+    assert_eq!(
+        production
+            .matches("Ok(PmPhaseAPlaceCurrentRuntimeWitness {")
+            .count(),
+        1,
+        "initial runtime witness must have one source-owned construction",
+    );
+    assert_eq!(
+        production
+            .matches("Ok(PmRevalidatedPhaseAPlaceCurrentRuntimeWitness { evidence })")
+            .count(),
+        1,
+        "final runtime witness must have one consuming construction",
+    );
+    assert_eq!(
+        production
+            .matches(
+                "validate_place_cancel_phase(config.value().phase, authorization.value().phase)?;"
+            )
+            .count(),
+        2,
+        "initial observation and consuming recheck must both reject non-Phase-A inputs",
+    );
+
+    let final_witness_impl = between(
+        production,
+        "impl PmRevalidatedPhaseAPlaceCurrentRuntimeWitness {",
+        "impl fmt::Debug for PmRevalidatedPhaseAPlaceCurrentRuntimeWitness",
+    );
+    assert!(final_witness_impl.contains("pub(super) const fn facts(&self)"));
+    for forbidden in [
+        "fn into_",
+        "fn authorize",
+        "fn permit",
+        "fn dispatch",
+        "fn transport",
+        "fn evidence",
+        "fn inner",
+    ] {
+        assert!(
+            !final_witness_impl.contains(forbidden),
+            "non-authoritative runtime witness gained decomposition/authority `{forbidden}`",
+        );
+    }
+}
+
+#[test]
+fn current_runtime_has_deterministic_drift_and_boundary_tests() {
+    for required in [
+        "getent_passwd_parser_requires_one_exact_uid_record",
+        "local_sources_capture_only_the_current_linux_runtime",
+        "executable_recheck_rejects_identity_hash_and_length_drift",
+        "local_runtime_recheck_rejects_each_identity_drift",
+        "clock_window_rejects_regression_and_expires_after_exact_boundary",
+        "geoblock_values_reject_blocked_future_stale_and_wrong_egress",
+        "config_authorization_pins_reject_each_swap",
+        "cleanup_runway_accepts_exact_boundary_and_rejects_shortfall",
+        "current_runtime_rejects_every_non_place_cancel_phase_pair",
+        "debug_is_redacted",
+    ] {
+        assert!(
+            CURRENT_RUNTIME.contains(required),
+            "current-runtime test matrix lost `{required}`",
+        );
     }
 }
 
@@ -94,6 +372,33 @@ fn public_book_uses_one_role_bundle_source_watermarks_and_internal_clock_edges()
 }
 
 #[test]
+fn phase_a_market_projection_cannot_be_detached_from_move_only_source_evidence() {
+    let production = production_prefix(PUBLIC_BOOK);
+    let projection = production
+        .split_once("pub(super) struct PmPhaseAMarketProjection")
+        .expect("Phase-A market projection")
+        .0
+        .rsplit_once("#[derive(")
+        .expect("projection derive")
+        .1
+        .split_once(")]")
+        .expect("projection derive terminator")
+        .0;
+    assert!(!projection.contains("Clone"));
+    assert!(!projection.contains("Copy"));
+    assert!(!projection.contains("Serialize"));
+    assert!(!projection.contains("Deserialize"));
+    assert!(!production.contains("impl Clone for PmPhaseAMarketProjection"));
+    assert!(!production.contains("impl Copy for PmPhaseAMarketProjection"));
+    assert!(!production.contains("Serialize for PmPhaseAMarketProjection"));
+    assert!(!production.contains("Deserialize for PmPhaseAMarketProjection"));
+    assert!(production.contains("fn duplicate_for_seal(&self) -> Self"));
+    assert!(!production.contains("pub fn duplicate_for_seal"));
+    assert!(!production.contains("pub(super) fn duplicate_for_seal"));
+    assert!(!production.contains("pub(crate) fn duplicate_for_seal"));
+}
+
+#[test]
 fn private_rest_and_user_stream_form_one_move_only_same_authority_cut() {
     for required in [
         "PmSameCredentialUserWsInput",
@@ -136,6 +441,148 @@ fn private_rest_and_user_stream_form_one_move_only_same_authority_cut() {
     }
     assert!(!PRIVATE_READS.contains("impl PmRecoveryExpectedOrderCandidate {\n    pub(super)"));
     assert!(!USER_STREAM.contains("pub(super) struct PmUserStreamSink"));
+}
+
+#[test]
+fn user_online_preflight_lease_is_move_only_source_owned_and_borrow_inspectable() {
+    let production = production_prefix(USER_STREAM);
+    let declaration = between(
+        production,
+        "pub(super) struct PmUserOnlinePreflightLease {",
+        "impl PmUserOnlinePreflightLease {",
+    );
+    assert!(declaration.contains("ticket: FinalCutTicket,"));
+    assert!(
+        declaration
+            .lines()
+            .all(|line| !line.trim_start().starts_with("pub")),
+        "online lease field became visible to sibling composition",
+    );
+    let declaration_prefix = production
+        .split_once("pub(super) struct PmUserOnlinePreflightLease {")
+        .expect("online lease declaration")
+        .0
+        .rsplit("\n\n")
+        .next()
+        .expect("online lease attributes");
+    for forbidden in ["Clone", "Copy", "Serialize", "Deserialize"] {
+        assert!(
+            !declaration_prefix.contains(forbidden),
+            "online lease gained forbidden `{forbidden}` derive",
+        );
+        assert!(
+            !production.contains(&format!("impl {forbidden} for PmUserOnlinePreflightLease")),
+            "online lease gained forbidden `{forbidden}` implementation",
+        );
+    }
+
+    let lease_impl = between(
+        production,
+        "impl PmUserOnlinePreflightLease {",
+        "impl fmt::Debug for PmUserOnlinePreflightLease",
+    );
+    for required in [
+        "pub(super) const fn scope(&self) -> PmWireScope",
+        "pub(super) const fn proxy_maker(&self) -> EvmAddress",
+        "pub(super) const fn stream_revision(&self) -> u64",
+        "pub(super) const fn initial_connection_epoch(&self) -> ConnectionEpoch",
+        "pub(super) const fn current_connection_epoch(&self) -> ConnectionEpoch",
+        "pub(super) const fn connection_open_generation(&self) -> u64",
+        "pub(super) const fn connection_open_clock(&self) -> PmUserWsEdgeClock",
+        "pub(super) const fn subscription_generation(&self) -> u64",
+        "pub(super) const fn subscription_clock(&self) -> PmUserWsEdgeClock",
+        "pub(super) const fn ping_generation(&self) -> u64",
+        "pub(super) const fn ping_clock(&self) -> PmUserWsEdgeClock",
+        "pub(super) const fn correlated_pong_generation(&self) -> u64",
+        "pub(super) const fn correlated_pong_clock(&self) -> PmUserWsEdgeClock",
+        "pub(super) const fn admitted_activity_generation(&self) -> u64",
+        "pub(super) const fn reconnect_count(&self) -> u8",
+        "pub(super) fn reconnect_history(&self) -> &[PmUserStreamReconnectEvidence]",
+        "pub(super) const fn business_basis(&self) -> &FinalCutBusinessBasis",
+        "pub(super) fn business_events(&self) -> &[PmUserStreamBusinessEventProjection]",
+        ") -> &[PmUserStreamBusinessEventProjection]",
+        "pub(super) fn matches_fresh_rest_cut(&self, cut: &PmFreshAuthenticatedRestCut) -> bool",
+        "pub(super) const fn open_order_rows(&self) -> usize",
+        "pub(super) const fn trade_rows(&self) -> usize",
+    ] {
+        assert!(
+            lease_impl.contains(required),
+            "online lease is missing borrowed/typed view `{required}`",
+        );
+    }
+    for forbidden in [
+        "fn new(",
+        "fn from_",
+        "into_ticket",
+        "into_parts",
+        "into_rest_cut_identity",
+        "into_business_events",
+        "fn rest_cut_identity(",
+        "PmRestCutIdentity",
+        "pub(super) fn marker(",
+        "pub(super) fn core(",
+        "PmLiveUserEvent",
+        "CredentialOwnedUserFrame",
+        "PmRecoveryAccountAuthenticatedRestCut",
+        "PmRecoveryExactAuthenticatedRestCut",
+        "Arc::clone",
+    ] {
+        assert!(
+            !lease_impl.contains(forbidden),
+            "online lease gained forbidden constructor/escape `{forbidden}`",
+        );
+    }
+
+    assert_eq!(
+        production
+            .matches("PmUserOnlinePreflightLease { ticket: self }")
+            .count(),
+        1,
+        "online lease must have one ticket-consuming construction",
+    );
+    assert!(
+        production.contains(
+            "pub(super) fn into_online_preflight_lease(self) -> PmUserOnlinePreflightLease"
+        )
+    );
+    assert!(
+        production
+            .contains("self.consume_online_preflight_lease(ticket.into_online_preflight_lease())")
+    );
+    assert!(production.contains(
+        "lease: PmUserOnlinePreflightLease,\n    ) -> Result<PmUserOnlinePreflightLease"
+    ));
+    assert!(
+        production
+            .contains("lease: PmUserOnlinePreflightLease,\n    ) -> Result<FinalCutJoinFields")
+    );
+    assert!(production.contains("self.shared.recheck_online_preflight_core(&ticket.core)"));
+    assert!(lease_impl.contains("cut.matches_rest_cut_identity(&self.ticket.rest_cut_identity)"));
+    assert!(PRIVATE_READS.contains("Arc::ptr_eq(&self.rest_cut_identity, identity)"));
+    assert!(production.contains("state.validate_final_core(core, before)?;"));
+    assert!(production.contains("state.validate_final_core(core, after)?;"));
+    assert!(production.contains("if self.activity.generation() != core.activity_generation"));
+
+    let final_fields_impl = between(
+        production,
+        "impl FinalCutJoinFields {",
+        "impl fmt::Debug for FinalCutJoinFields",
+    );
+    assert!(final_fields_impl.contains(
+        "pub(super) fn matches_fresh_rest_cut(&self, cut: &PmFreshAuthenticatedRestCut) -> bool"
+    ));
+    assert!(final_fields_impl.contains("cut.matches_rest_cut_identity(&self.rest_cut_identity)"));
+    for forbidden in [
+        "fn rest_cut_identity(",
+        "-> &Arc<PmRestCutIdentity>",
+        "PmRecoveryAccountAuthenticatedRestCut",
+        "PmRecoveryExactAuthenticatedRestCut",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "user-stream production surface retained forbidden identity escape `{forbidden}`",
+        );
+    }
 }
 
 #[test]

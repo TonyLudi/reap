@@ -1,5 +1,6 @@
 const MANIFEST: &str = include_str!("../Cargo.toml");
 const LIB: &str = include_str!("../src/lib.rs");
+const CLOB_HEALTH_HTTP: &str = include_str!("../src/clob_health_http.rs");
 const CONFIG: &str = include_str!("../src/config.rs");
 const GEOBLOCK_HTTP: &str = include_str!("../src/geoblock_http.rs");
 const HTTP_TRANSPORT: &str = include_str!("../src/http_transport.rs");
@@ -15,10 +16,24 @@ const PUBLIC_WS: &str = include_str!("../src/public_ws.rs");
 const PUBLIC_WS_CONFIG: &str = include_str!("../src/public_ws_config.rs");
 const READ_ONLY_PRIVATE: &str = include_str!("../src/read_only_private.rs");
 const RECONCILIATION: &str = include_str!("../src/reconciliation.rs");
+const STATUS_ANNOUNCEMENT_HTTP: &str = include_str!("../src/status_announcement_http.rs");
 const ACCOUNT: &str = include_str!("../src/account.rs");
 const USER_WS: &str = include_str!("../src/user_ws.rs");
 const USER_WS_CONFIG: &str = include_str!("../src/user_ws_config.rs");
 const TASK_GUARD: &str = include_str!("../src/task_guard.rs");
+
+fn production_prefix(source: &str) -> &str {
+    source
+        .split_once("#[cfg(test)]\nmod tests")
+        .map_or(source, |(head, _)| head)
+}
+
+fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    source
+        .split_once(start)
+        .and_then(|(_, tail)| tail.split_once(end).map(|(slice, _)| slice))
+        .expect("source policy markers must remain ordered")
+}
 
 #[test]
 fn phase3_foundation_has_only_role_specific_dependencies() {
@@ -29,6 +44,8 @@ fn phase3_foundation_has_only_role_specific_dependencies() {
         "reap-polymarket-auth.workspace = true",
         "reap-polymarket-wire.workspace = true",
         "reqwest.workspace = true",
+        "serde.workspace = true",
+        "serde_json.workspace = true",
         "futures-util.workspace = true",
         "tokio.workspace = true",
         "tokio-tungstenite.workspace = true",
@@ -53,6 +70,7 @@ fn phase3_foundation_has_only_role_specific_dependencies() {
 fn modules_are_separate_and_raw_transport_remains_private() {
     for module in [
         "mod config;",
+        "mod clob_health_http;",
         "mod error;",
         "mod geoblock_http;",
         "mod http_transport;",
@@ -67,6 +85,7 @@ fn modules_are_separate_and_raw_transport_remains_private() {
         "mod public_ws_config;",
         "mod read_only_private;",
         "mod reconciliation;",
+        "mod status_announcement_http;",
         "mod task_guard;",
         "mod account;",
         "mod user_ws;",
@@ -161,6 +180,378 @@ fn public_preflight_observations_are_source_clocked_committed_and_sealed() {
     let geoblock_carriers = &GEOBLOCK_HTTP[geoblock_start..geoblock_end];
     assert!(!geoblock_carriers.contains("raw_response:"));
     assert!(!geoblock_carriers.contains("body:"));
+}
+
+#[test]
+fn production_geoblock_observation_is_move_only_origin_proved_and_non_authoritative() {
+    let production = production_prefix(GEOBLOCK_HTTP);
+    for required in [
+        "pub struct PmProductionGeoblockObservation",
+        "observation: PmGeoblockObservation",
+        "_production_origin: ProductionGeoblockOrigin",
+        "struct ProductionGeoblockOrigin;",
+        "fn verify(mode: OriginMode) -> Result<Self, PmLiveAdapterError>",
+        "OriginMode::Production => Ok(Self)",
+        "OriginMode::LocalEvidence => Err(PmLiveAdapterError::InvalidConfiguration(",
+        "pub async fn production_status_observation(",
+        "let production_origin = ProductionGeoblockOrigin::verify(self.mode)?;",
+        "PmProductionGeoblockObservation::from_source(",
+        "impl std::fmt::Debug for PmProductionGeoblockObservation",
+        "<production-origin; sealed>",
+    ] {
+        assert!(
+            production.contains(required),
+            "production geoblock proof lost `{required}`",
+        );
+    }
+    assert!(LIB.contains("PmProductionGeoblockObservation,"));
+
+    let declaration = between(
+        production,
+        "pub struct PmProductionGeoblockObservation {",
+        "\n}\n\nimpl PmProductionGeoblockObservation",
+    );
+    assert_eq!(
+        declaration.trim(),
+        "observation: PmGeoblockObservation,",
+        "production geoblock proof must retain its exact sole private field",
+    );
+
+    let method = between(
+        production,
+        "pub async fn production_status_observation(",
+        "\n    #[must_use]\n    pub const fn production_order_entry_authorized",
+    );
+    let verify = method
+        .find("ProductionGeoblockOrigin::verify(self.mode)?")
+        .expect("private origin verification");
+    let fetch = method
+        .find("self.status_observation().await?")
+        .expect("fixed geoblock fetch");
+    let seal = method
+        .find("PmProductionGeoblockObservation::from_source(")
+        .expect("production observation seal");
+    assert!(verify < fetch && fetch < seal);
+    assert_eq!(
+        production
+            .matches("PmProductionGeoblockObservation::from_source(")
+            .count(),
+        1,
+        "production observation must have one mode-proved construction path",
+    );
+
+    let declaration_attributes = production
+        .split_once("pub struct PmProductionGeoblockObservation")
+        .expect("production observation declaration")
+        .0
+        .rsplit("\n\n")
+        .next()
+        .expect("production observation attributes");
+    for forbidden in ["Clone", "Copy", "Serialize", "Deserialize"] {
+        assert!(!declaration_attributes.contains(forbidden));
+        assert!(!production.contains(&format!("{forbidden} for PmProductionGeoblockObservation")));
+    }
+    for forbidden in [
+        "impl From<PmGeoblockObservation> for PmProductionGeoblockObservation",
+        "impl TryFrom<PmGeoblockObservation> for PmProductionGeoblockObservation",
+        "pub fn from_source(",
+        "pub fn into_observation(",
+        "pub fn into_parts(",
+        "Deref for PmProductionGeoblockObservation",
+        "AsRef<PmGeoblockObservation> for PmProductionGeoblockObservation",
+        "pub fn observation(&self)",
+        "pub const fn observation(&self)",
+        "production_order_entry_authorized: true",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "production geoblock proof gained escape `{forbidden}`",
+        );
+    }
+    for test_pin in [
+        "local_evidence_cannot_issue_a_production_observation",
+        "production_origin_proof_accepts_only_production_mode",
+    ] {
+        assert!(GEOBLOCK_HTTP.contains(test_pin));
+    }
+}
+
+#[test]
+fn clob_health_is_exact_bounded_origin_proved_and_liveness_only() {
+    let production = production_prefix(CLOB_HEALTH_HTTP);
+    for required in [
+        "const EXACT_CLOB_LIVENESS_HEALTH_BODY: &[u8; 4] = b\"\\\"OK\\\"\";",
+        r#"reap.pm.live-adapter.clob-liveness-health-observation.v1\0"#,
+        "pub struct PmClobLivenessHealthHttpRole",
+        "PmPublicHttpConfig::production(",
+        "PM_CLOB_PRODUCTION_ORIGIN,",
+        "PmPublicRoute::ClobHealth",
+        "EXACT_CLOB_LIVENESS_HEALTH_BODY.len()",
+        "if body.as_slice() != EXACT_CLOB_LIVENESS_HEALTH_BODY",
+        "let receive_clock = self.clock.observe()?;",
+        "pub struct PmProductionClobLivenessHealthObservation",
+        "observation: PmClobLivenessHealthObservation",
+        "struct ProductionClobHealthOrigin;",
+        "let production_origin = ProductionClobHealthOrigin::verify(self.mode)?;",
+        "self.liveness_health_observation().await?",
+        "liveness/health evidence only",
+        "not evidence about matching",
+        "does not prove",
+    ] {
+        assert!(
+            production.contains(required),
+            "health role lost `{required}`"
+        );
+    }
+    for required in [
+        "PmClobLivenessHealthHttpRole",
+        "PmClobLivenessHealthObservationCommitment",
+        "PmProductionClobLivenessHealthObservation",
+    ] {
+        assert!(LIB.contains(required));
+    }
+
+    let wrapper = between(
+        production,
+        "pub struct PmProductionClobLivenessHealthObservation {",
+        "\n}\n\nimpl PmProductionClobLivenessHealthObservation",
+    );
+    assert_eq!(
+        wrapper.trim(),
+        "observation: PmClobLivenessHealthObservation,",
+    );
+    let method = between(
+        production,
+        "pub async fn production_liveness_health_observation(",
+        "\n    #[must_use]\n    pub const fn production_order_entry_authorized",
+    );
+    let verify = method
+        .find("ProductionClobHealthOrigin::verify(self.mode)?")
+        .unwrap();
+    let fetch = method
+        .find("self.liveness_health_observation().await?")
+        .unwrap();
+    let seal = method
+        .find("PmProductionClobLivenessHealthObservation::from_source(")
+        .unwrap();
+    assert!(verify < fetch && fetch < seal);
+
+    let wrapper_attributes = production
+        .split_once("pub struct PmProductionClobLivenessHealthObservation")
+        .unwrap()
+        .0
+        .rsplit("\n\n")
+        .next()
+        .unwrap();
+    for forbidden in ["Clone", "Copy", "Serialize", "Deserialize"] {
+        assert!(!wrapper_attributes.contains(forbidden));
+        assert!(!production.contains(&format!(
+            "{forbidden} for PmProductionClobLivenessHealthObservation"
+        )));
+    }
+    for forbidden in [
+        "impl From<PmClobLivenessHealthObservation>",
+        "impl TryFrom<PmClobLivenessHealthObservation>",
+        "Deref for PmProductionClobLivenessHealthObservation",
+        "AsRef<PmClobLivenessHealthObservation>",
+        "pub fn into_observation(",
+        "pub fn raw_body(",
+        "pub fn client(",
+        "pub fn origin(",
+        "pub fn path(",
+        "pub fn retry(",
+        "production_order_entry_authorized: true",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "health escape: {forbidden}"
+        );
+    }
+    for test_pin in [
+        "unquoted_case_newline_whitespace_and_trailing_bytes_fail_closed",
+        "declared_and_streamed_oversize_bodies_are_bounded",
+        "redirects_non_success_and_timeout_fail_closed",
+        "local_evidence_cannot_issue_production_proof_and_checks_before_io",
+    ] {
+        assert!(CLOB_HEALTH_HTTP.contains(test_pin));
+    }
+}
+
+#[test]
+fn status_cut_is_ordered_strict_complete_and_announcement_only() {
+    let production = production_prefix(STATUS_ANNOUNCEMENT_HTTP);
+    for required in [
+        r#"reap.pm.live-adapter.status-announcement-observation.v1\0"#,
+        "summary-object-v3+components-wrapper-object-v3/current-announcements-only",
+        "pub const MAX_PM_STATUS_SUMMARY_BODY_BYTES: usize = 256 * 1024;",
+        "pub const MAX_PM_STATUS_COMPONENTS_BODY_BYTES: usize = 512 * 1024;",
+        "pub const MAX_PM_STATUS_ACTIVE_INCIDENTS: usize = 64;",
+        "pub const MAX_PM_STATUS_ACTIVE_MAINTENANCES: usize = 64;",
+        "pub const MAX_PM_STATUS_COMPONENTS: usize = 256;",
+        "pub struct PmStatusAnnouncementHttpRole",
+        "PmStatusHttpConfig::production(",
+        "PmPublicRoute::StatusSummary",
+        "let summary_receive_clock = self.clock.observe()?;",
+        "let summary = parse_status_summary(&summary_body)?;",
+        "PmPublicRoute::StatusComponents",
+        "let components_receive_clock = self.clock.observe()?;",
+        "let components = parse_status_components(&components_body)?;",
+        "status_announcement_observation_commitment(",
+        "encode_status_bytes(&mut digest, summary_body);",
+        "encode_status_bytes(&mut digest, components_body);",
+        "#[serde(default)]\n    active_incidents",
+        "#[serde(default)]\n    active_maintenances",
+        "struct RawStatusComponentsEnvelope",
+        "components: Vec<RawStatusComponent>",
+        "#[serde(deny_unknown_fields)]",
+        "announcement evidence only",
+        "excludes components",
+        "historical notices",
+        "does not prove the egress",
+    ] {
+        assert!(
+            production.contains(required),
+            "status role lost `{required}`"
+        );
+    }
+
+    let summary_fetch = production.find("PmPublicRoute::StatusSummary").unwrap();
+    let summary_clock = production
+        .find("let summary_receive_clock = self.clock.observe()?;")
+        .unwrap();
+    let component_fetch = production.find("PmPublicRoute::StatusComponents").unwrap();
+    let component_clock = production
+        .find("let components_receive_clock = self.clock.observe()?;")
+        .unwrap();
+    assert!(summary_fetch < summary_clock && summary_clock < component_fetch);
+    assert!(component_fetch < component_clock);
+
+    let component_fields = between(
+        production,
+        "struct RawStatusComponent {",
+        "\n}\n\n#[derive(Deserialize)]\n#[serde(deny_unknown_fields)]\nstruct RawStatusComponentGroup",
+    );
+    for exact in [
+        "id: String,",
+        "name: String,",
+        "description: String,",
+        "status: RawStatusComponentState,",
+        "group: RawStatusComponentGroupField,",
+    ] {
+        assert!(component_fields.contains(exact));
+    }
+    for invented in [
+        "active_incidents",
+        "active_maintenances",
+        "is_parent",
+        "children",
+    ] {
+        assert!(!component_fields.contains(invented));
+    }
+    assert!(production.contains("currently shows a stale bare-array shape"));
+    assert!(production.contains("parser intentionally rejects that alternate shape"));
+
+    for forbidden in [
+        "pub fn raw_body(",
+        "pub fn summary_body(",
+        "pub fn components_body(",
+        "pub fn client(",
+        "pub fn origin(",
+        "pub fn path(",
+        "pub fn retry(",
+        "L2Credentials",
+        "PrivateKey",
+        "authenticate_",
+        "place_order",
+        "cancel_order",
+        "production_order_entry_authorized: true",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "status escape: {forbidden}"
+        );
+    }
+    for test_pin in [
+        "fixed_ordered_cut_retains_all_typed_current_announcement_rows",
+        "omitted_empty_summary_issue_arrays_match_current_production_shape",
+        "stale_documentation_bare_array_shape_and_unreviewed_issue_fields_are_rejected",
+        "summary_unknown_duplicate_missing_type_and_enum_drift_fail_closed",
+        "active_issue_rows_reject_missing_unknown_duplicate_ids_and_bad_scalars",
+        "component_rows_reject_unknown_duplicate_missing_group_and_inconsistent_parent",
+        "summary_and_components_declared_body_bounds_fail_before_parse",
+        "streamed_body_bound_is_enforced_without_content_length",
+        "local_evidence_cannot_issue_production_proof_and_checks_before_io",
+    ] {
+        assert!(STATUS_ANNOUNCEMENT_HTTP.contains(test_pin));
+    }
+}
+
+#[test]
+fn production_status_wrapper_is_move_only_origin_proved_and_redacted() {
+    let production = production_prefix(STATUS_ANNOUNCEMENT_HTTP);
+    let wrapper = between(
+        production,
+        "pub struct PmProductionStatusAnnouncementObservation {",
+        "\n}\n\nimpl PmProductionStatusAnnouncementObservation",
+    );
+    assert_eq!(
+        wrapper.trim(),
+        "observation: PmStatusAnnouncementObservation,",
+    );
+    for required in [
+        "struct ProductionStatusOrigin;",
+        "OriginMode::Production => Ok(Self)",
+        "OriginMode::LocalEvidence => Err(PmLiveAdapterError::InvalidConfiguration(",
+        "pub async fn production_ordered_announcement_observation(",
+        "let production_origin = ProductionStatusOrigin::verify(self.mode)?;",
+        "self.ordered_announcement_observation().await?",
+        "PmProductionStatusAnnouncementObservation::from_source(",
+        "PmProductionStatusAnnouncementObservation(<production-origin; announcement-only; sealed>)",
+    ] {
+        assert!(production.contains(required));
+    }
+    let method = between(
+        production,
+        "pub async fn production_ordered_announcement_observation(",
+        "\n    #[must_use]\n    pub const fn production_order_entry_authorized",
+    );
+    let verify = method
+        .find("ProductionStatusOrigin::verify(self.mode)?")
+        .unwrap();
+    let fetch = method
+        .find("self.ordered_announcement_observation().await?")
+        .unwrap();
+    let seal = method
+        .find("PmProductionStatusAnnouncementObservation::from_source(")
+        .unwrap();
+    assert!(verify < fetch && fetch < seal);
+
+    let wrapper_attributes = production
+        .split_once("pub struct PmProductionStatusAnnouncementObservation")
+        .unwrap()
+        .0
+        .rsplit("\n\n")
+        .next()
+        .unwrap();
+    for forbidden in ["Clone", "Copy", "Serialize", "Deserialize"] {
+        assert!(!wrapper_attributes.contains(forbidden));
+        assert!(!production.contains(&format!(
+            "{forbidden} for PmProductionStatusAnnouncementObservation"
+        )));
+    }
+    for forbidden in [
+        "impl From<PmStatusAnnouncementObservation>",
+        "impl TryFrom<PmStatusAnnouncementObservation>",
+        "Deref for PmProductionStatusAnnouncementObservation",
+        "AsRef<PmStatusAnnouncementObservation>",
+        "pub fn into_observation(",
+        "pub fn into_parts(",
+        "pub fn observation(&self)",
+        "pub const fn observation(&self)",
+    ] {
+        assert!(!production.contains(forbidden));
+    }
+    assert!(LIB.contains("PmProductionStatusAnnouncementObservation"));
 }
 
 #[test]
@@ -1279,12 +1670,18 @@ fn authenticated_user_websocket_is_fixed_bound_and_has_no_raw_or_mutation_escape
 
 #[test]
 fn public_routes_are_exactly_the_reviewed_get_only_surface() {
+    assert!(HTTP_TRANSPORT.contains("url.set_path(\"/ok\")"));
     assert!(HTTP_TRANSPORT.contains("url.set_path(\"/time\")"));
     assert!(HTTP_TRANSPORT.contains("url.set_path(\"/book\")"));
     assert!(HTTP_TRANSPORT.contains(".append_pair(\"token_id\""));
     assert!(HTTP_TRANSPORT.contains("format!(\"/markets/{condition}\")"));
     assert!(HTTP_TRANSPORT.contains("format!(\"/clob-markets/{condition}\")"));
     assert!(HTTP_TRANSPORT.contains("url.set_path(\"/api/geoblock\")"));
+    assert!(HTTP_TRANSPORT.contains("url.set_path(\"/v3/summary.json\")"));
+    assert!(HTTP_TRANSPORT.contains("url.set_path(\"/v3/components.json\")"));
+    assert!(CLOB_HEALTH_HTTP.contains("PmPublicRoute::ClobHealth"));
+    assert!(STATUS_ANNOUNCEMENT_HTTP.contains("PmPublicRoute::StatusSummary"));
+    assert!(STATUS_ANNOUNCEMENT_HTTP.contains("PmPublicRoute::StatusComponents"));
     assert!(GEOBLOCK_HTTP.contains("PmPublicRoute::Geoblock"));
     assert!(GEOBLOCK_HTTP.contains("MAX_PM_GEOBLOCK_BODY_BYTES"));
     assert!(METADATA_HTTP.contains("PmLiveMetadataPair"));
@@ -1308,10 +1705,12 @@ fn public_routes_are_exactly_the_reviewed_get_only_surface() {
 fn public_role_has_no_auth_private_ws_or_mutation_capability() {
     let production = [
         CONFIG,
+        CLOB_HEALTH_HTTP,
         GEOBLOCK_HTTP,
         HTTP_TRANSPORT,
         PUBLIC_HTTP,
         METADATA_HTTP,
+        STATUS_ANNOUNCEMENT_HTTP,
     ]
     .join("\n");
     for forbidden in [

@@ -7,9 +7,10 @@ use reap_polymarket_adapter::{
     PmAuthoritativeMetadata, PmMetadataJoinError, PmMetadataRevisionInput,
 };
 use reap_polymarket_live_adapter::{
-    PmActorProductClock, PmAuthenticatedHttpOwner, PmAuthenticatedUserWsRole, PmLiveMetadataPair,
-    PmLiveMetadataPairSink, PmLoopbackMutationAuthError, PmMutationServerTimeHttpRole,
-    PmMutationServerTimeValidator, PmOkxProductClock, PmPrivateReadProductClock,
+    PmActorProductClock, PmAuthenticatedHttpOwner, PmAuthenticatedUserWsRole,
+    PmCancelMutationTimeFinalizer, PmCancelServerTimeHttpRole, PmLiveMetadataPair,
+    PmLiveMetadataPairSink, PmLoopbackMutationAuthError, PmOkxProductClock,
+    PmPlaceMutationTimeFinalizer, PmPlaceServerTimeHttpRole, PmPrivateReadProductClock,
     PmProductClockError, PmPublicHttpRole, PmPublicMarketWsRole, PmPublicMetadataDeliveryError,
     PmPublicMetadataHttpRole, PmPublicWsTransportPolicy, PmReadServerTimeHttpRole,
 };
@@ -43,15 +44,16 @@ pub(super) struct PmAuthenticatedLoopbackReady<M: PmQuoteModel> {
     pub(super) book_http: Option<PmPublicHttpRole>,
     pub(super) read_server_time_http: Option<PmReadServerTimeHttpRole>,
     pub(super) private_read_clock: Option<PmPrivateReadProductClock>,
-    pub(super) place_server_time_http: Option<PmMutationServerTimeHttpRole>,
-    pub(super) cancel_server_time_http: Option<PmMutationServerTimeHttpRole>,
+    pub(super) place_server_time_http: Option<PmPlaceServerTimeHttpRole>,
+    pub(super) cancel_server_time_http: Option<PmCancelServerTimeHttpRole>,
     pub(super) public_ws: Option<PmPublicMarketWsRole>,
     pub(super) authenticated_http: Option<PmAuthenticatedHttpOwner>,
     pub(super) authenticated_user_ws: Option<PmAuthenticatedUserWsRole>,
     pub(super) mutation_workers: PmLoopbackAuthenticatedMutationWorkers,
     pub(super) actor_clock: PmActorProductClock,
     pub(super) okx_clock: PmOkxProductClock,
-    pub(super) mutation_time_validator: PmMutationServerTimeValidator,
+    pub(super) place_time_finalizer: PmPlaceMutationTimeFinalizer,
+    pub(super) cancel_time_finalizer: PmCancelMutationTimeFinalizer,
     pub(super) occurrence_issuer: PmLiveOccurrenceIssuer,
     pub(super) goal_f_bridge_timeout: Duration,
     pub(super) controlled_shutdown_timeout: Duration,
@@ -84,7 +86,8 @@ impl<M: PmQuoteModel> PmAuthenticatedLoopbackReady<M> {
             mutation_workers,
             actor_clock,
             okx_clock,
-            mutation_time_validator,
+            place_time_finalizer,
+            cancel_time_finalizer,
             occurrence_issuer: _,
             goal_f_bridge_timeout: _,
             controlled_shutdown_timeout: _,
@@ -104,7 +107,8 @@ impl<M: PmQuoteModel> PmAuthenticatedLoopbackReady<M> {
         drop(mutation_workers);
         drop(actor_clock);
         drop(okx_clock);
-        drop(mutation_time_validator);
+        drop(place_time_finalizer);
+        drop(cancel_time_finalizer);
         let coordinator_result = coordinator.shutdown().await;
         let authenticated_result = shutdown.shutdown().await;
         match (coordinator_result, authenticated_result) {
@@ -206,14 +210,15 @@ impl<M: PmQuoteModel> PmAuthenticatedLoopbackProduct<M> {
             book_http,
             read_server_time_http,
             private_read_clock,
-            place_server_time_http,
-            cancel_server_time_http,
+            place_mutation_time,
+            cancel_mutation_time,
             public_ws,
             user_ws_clock,
             mut actor_clock,
             okx_clock,
-            mutation_time_validator,
         ) = public_connectivity.into_roles().into_roles();
+        let (place_server_time_http, place_time_finalizer) = place_mutation_time.into_roles();
+        let (cancel_server_time_http, cancel_time_finalizer) = cancel_mutation_time.into_roles();
         validate_public_ws_policy(public_ws.transport_policy(), session_policy)?;
         let mut metadata_sink = AuthoritativeMetadataSink {
             instrument: public_config.instrument(),
@@ -346,7 +351,8 @@ impl<M: PmQuoteModel> PmAuthenticatedLoopbackProduct<M> {
             mutation_workers,
             actor_clock,
             okx_clock,
-            mutation_time_validator,
+            place_time_finalizer,
+            cancel_time_finalizer,
             occurrence_issuer: PmLiveOccurrenceIssuer::new(
                 public_config.expected_metadata().condition(),
             ),

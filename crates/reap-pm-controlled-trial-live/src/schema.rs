@@ -600,6 +600,7 @@ pub enum PmCancelResultKindV1 {
     NotCanceled,
     OutOfProfile,
     AcknowledgementUnknown,
+    DefinitelyNotDispatched,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

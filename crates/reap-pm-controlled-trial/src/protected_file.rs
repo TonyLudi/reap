@@ -15,6 +15,8 @@ use zeroize::Zeroizing;
 pub(crate) enum ProtectedFileKind {
     Config,
     Authorization,
+    OnlinePolicyV2,
+    OnlineAuthorizationV2,
     ConsumptionEvidence,
     PrivateKey,
     ApiKey,
@@ -27,6 +29,8 @@ impl std::fmt::Display for ProtectedFileKind {
         formatter.write_str(match self {
             Self::Config => "config",
             Self::Authorization => "authorization",
+            Self::OnlinePolicyV2 => "online-policy V2",
+            Self::OnlineAuthorizationV2 => "online-authorization V2",
             Self::ConsumptionEvidence => "authorization-consumption evidence",
             Self::PrivateKey => "private-key",
             Self::ApiKey => "API-key",

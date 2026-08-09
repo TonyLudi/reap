@@ -12,8 +12,10 @@ use std::{
 
 use async_trait::async_trait;
 use reap_pm_core::{
-    ConnectionEpoch, IngressSequence, PmBookTop, PmBookUpdate, PmConnectionId, PmMarketMetadata,
-    PmProductSource, PmPublicObservationGrant, ReceivedEventClock, SnapshotRevision,
+    ConnectionEpoch, EvmAddress, IngressSequence, PmAssetId, PmBookTop, PmBookUpdate, PmChainId,
+    PmConditionId, PmConnectionId, PmGoalFTradingDomain, PmMarketId, PmMarketLifecycle,
+    PmMarketMetadata, PmOutcomeMetadata, PmProductSource, PmPublicObservationGrant, PmQuantity,
+    PmSpenderDomain, PmSpenderRequirement, PmTick, ReceivedEventClock, SnapshotRevision,
 };
 use reap_pm_state::{
     PmBookBatchEvidence, PmBookFreshness, PmBookReducer, PmBookReducerAuthorityId,
@@ -37,9 +39,11 @@ use reap_polymarket_live_adapter::{
     PmPublicWsReconnectDirective, PmPublicWsRetirement, PmPublicWsRunError,
     PmPublicWsShutdownSignal, PmPublicWsTransportPolicy, PmReadServerTimeHttpRole,
     PmRestBookDeliveryError, PmRestBookPurpose, PmRestBookSnapshotSink, PmRestResponseClock,
-    PmUserWsProductClock,
+    PmTypedLiveMarketDetails, PmUserWsProductClock,
 };
-use reap_polymarket_wire::PmBookMarketBinding;
+use reap_polymarket_wire::{
+    PmBookMarketBinding, PmBookParserConfig, PmClobFeeDecimal, PmLifecycleTimeString,
+};
 use reap_transport::ReconnectPolicy;
 use thiserror::Error;
 
@@ -554,11 +558,405 @@ pub(super) enum PmPublicBookSnapshotSource {
     RestResync,
 }
 
+/// Closed runner-owned projection of every live market fact needed by the
+/// Phase-A place decision.
+///
+/// Production construction is deliberately confined to [`Self::from_joined_source`],
+/// which consumes no caller assertions: it projects the typed live response
+/// pair and checks it against the authoritative metadata joined from those
+/// same source bytes. The source commitment and receive edge travel beside
+/// this value in snapshot evidence and leases.
+#[derive(PartialEq, Eq)]
+pub(super) struct PmPhaseAMarketProjection {
+    condition: PmConditionId,
+    question: PmMarketId,
+    reported_condition: Option<PmConditionId>,
+    book_market_binding: PmBookMarketBinding,
+    token_membership: [PmOutcomeMetadata; 2],
+    configured_outcome: PmOutcomeMetadata,
+    trading_domain: PmGoalFTradingDomain,
+    lifecycle: PmMarketLifecycle,
+    tick: PmTick,
+    minimum_order_size: PmQuantity,
+    maker_base_fee_bps: u64,
+    taker_base_fee_bps: u64,
+    fee_rate: Option<PmClobFeeDecimal>,
+    fee_exponent: Option<PmClobFeeDecimal>,
+    fee_taker_only: Option<bool>,
+    seconds_delay: u64,
+    reported_seconds_delay: Option<u64>,
+    take_only_delay_enabled: bool,
+    cancel_book_on_start: Option<bool>,
+    minimum_order_age_seconds: u64,
+    accepting_orders_reported: Option<bool>,
+    rfq_enabled: Option<bool>,
+    bonding_curve_enabled: Option<bool>,
+    accepting_order_timestamp: Option<PmLifecycleTimeString>,
+    reported_accepting_order_timestamp: Option<PmLifecycleTimeString>,
+    game_start_time: Option<PmLifecycleTimeString>,
+    reported_game_start_time: Option<PmLifecycleTimeString>,
+    end_time: PmLifecycleTimeString,
+}
+
+impl PmPhaseAMarketProjection {
+    fn from_joined_source(
+        details: &PmTypedLiveMarketDetails,
+        metadata: PmMarketMetadata,
+        parser: PmBookParserConfig,
+    ) -> Result<Self, PmPublicBookRuntimeError> {
+        let lifecycle = details.lifecycle();
+        let lifecycle_details = details.lifecycle_details();
+        let clob = details.clob();
+        let token_membership = match clob.tokens() {
+            [first, second] => [first.outcome(), second.outcome()],
+            _ => {
+                return Err(PmPublicBookRuntimeError::Configuration(
+                    "live Phase-A market projection does not contain exactly two tokens",
+                ));
+            }
+        };
+        let trading_domain = PmGoalFTradingDomain::from_metadata(metadata).map_err(|_| {
+            PmPublicBookRuntimeError::Configuration(
+                "live Phase-A market projection is outside the fixed Goal-F trading domain",
+            )
+        })?;
+
+        let projection = Self {
+            condition: lifecycle.condition(),
+            question: lifecycle.market(),
+            reported_condition: clob.reported_condition(),
+            book_market_binding: parser.market_binding(),
+            token_membership,
+            configured_outcome: clob.configured_outcome(),
+            trading_domain,
+            lifecycle: lifecycle.lifecycle(),
+            tick: clob.tick(),
+            minimum_order_size: clob.minimum_order_size(),
+            maker_base_fee_bps: clob.maker_base_fee_bps(),
+            taker_base_fee_bps: clob.taker_base_fee_bps(),
+            fee_rate: clob.fee_details().rate().cloned(),
+            fee_exponent: clob.fee_details().exponent().cloned(),
+            fee_taker_only: clob.fee_details().taker_only(),
+            seconds_delay: lifecycle_details.seconds_delay(),
+            reported_seconds_delay: clob.seconds_delay(),
+            take_only_delay_enabled: clob.take_only_delay_enabled(),
+            cancel_book_on_start: clob.cancel_book_on_start(),
+            minimum_order_age_seconds: clob.minimum_order_age_seconds(),
+            accepting_orders_reported: clob.accepting_orders(),
+            rfq_enabled: clob.rfq_enabled(),
+            bonding_curve_enabled: clob.bonding_curve_enabled(),
+            accepting_order_timestamp: lifecycle_details.accepting_order_timestamp().cloned(),
+            reported_accepting_order_timestamp: clob.accepting_order_timestamp().cloned(),
+            game_start_time: lifecycle_details.game_start_time().cloned(),
+            reported_game_start_time: clob.game_start_time().cloned(),
+            end_time: lifecycle_details.end_date_iso().clone(),
+        };
+        if !projection.matches_authoritative(metadata, parser) {
+            return Err(PmPublicBookRuntimeError::MetadataProvenanceMismatch);
+        }
+        Ok(projection)
+    }
+
+    /// Duplicates immutable source evidence only for this module's snapshot and
+    /// lease sealing paths. Keeping this narrower than `Clone` prevents callers
+    /// from detaching the projection from its commitment, receive clocks, and
+    /// move-only enclosing evidence.
+    fn duplicate_for_seal(&self) -> Self {
+        Self {
+            condition: self.condition,
+            question: self.question,
+            reported_condition: self.reported_condition,
+            book_market_binding: self.book_market_binding,
+            token_membership: self.token_membership,
+            configured_outcome: self.configured_outcome,
+            trading_domain: self.trading_domain,
+            lifecycle: self.lifecycle,
+            tick: self.tick,
+            minimum_order_size: self.minimum_order_size,
+            maker_base_fee_bps: self.maker_base_fee_bps,
+            taker_base_fee_bps: self.taker_base_fee_bps,
+            fee_rate: self.fee_rate.clone(),
+            fee_exponent: self.fee_exponent.clone(),
+            fee_taker_only: self.fee_taker_only,
+            seconds_delay: self.seconds_delay,
+            reported_seconds_delay: self.reported_seconds_delay,
+            take_only_delay_enabled: self.take_only_delay_enabled,
+            cancel_book_on_start: self.cancel_book_on_start,
+            minimum_order_age_seconds: self.minimum_order_age_seconds,
+            accepting_orders_reported: self.accepting_orders_reported,
+            rfq_enabled: self.rfq_enabled,
+            bonding_curve_enabled: self.bonding_curve_enabled,
+            accepting_order_timestamp: self.accepting_order_timestamp.clone(),
+            reported_accepting_order_timestamp: self.reported_accepting_order_timestamp.clone(),
+            game_start_time: self.game_start_time.clone(),
+            reported_game_start_time: self.reported_game_start_time.clone(),
+            end_time: self.end_time.clone(),
+        }
+    }
+
+    fn matches_authoritative(
+        &self,
+        metadata: PmMarketMetadata,
+        parser: PmBookParserConfig,
+    ) -> bool {
+        let Ok(domain) = PmGoalFTradingDomain::from_metadata(metadata) else {
+            return false;
+        };
+        let scope = parser.scope();
+        self.condition == metadata.condition()
+            && self.question == metadata.market()
+            && self.configured_outcome == metadata.outcome()
+            && self
+                .token_membership
+                .iter()
+                .any(|outcome| *outcome == metadata.outcome())
+            && self.trading_domain == domain
+            && self.lifecycle == metadata.lifecycle()
+            && self.tick == metadata.tick()
+            && self.minimum_order_size == metadata.minimum_order_size()
+            && self.trading_domain.spender_domain()
+                == if metadata.negative_risk() {
+                    PmSpenderDomain::NegativeRisk
+                } else {
+                    PmSpenderDomain::Standard
+                }
+            && self.book_market_binding == PmBookMarketBinding::ConditionId
+            && parser.market_binding() == self.book_market_binding
+            && scope.condition() == self.condition
+            && scope.market() == self.question
+            && scope.token() == self.configured_outcome.token()
+            && parser.tick() == self.tick
+            && parser.minimum_order_size() == self.minimum_order_size
+            && parser.negative_risk() == metadata.negative_risk()
+            && self
+                .reported_condition
+                .is_none_or(|condition| condition == self.condition)
+            && self
+                .accepting_orders_reported
+                .is_none_or(|accepting| accepting == self.lifecycle.accepting_orders())
+            && self
+                .reported_seconds_delay
+                .is_none_or(|delay| delay == self.seconds_delay)
+            && self
+                .reported_accepting_order_timestamp
+                .as_ref()
+                .is_none_or(|reported| self.accepting_order_timestamp.as_ref() == Some(reported))
+            && self
+                .reported_game_start_time
+                .as_ref()
+                .is_none_or(|reported| self.game_start_time.as_ref() == Some(reported))
+    }
+
+    #[must_use]
+    pub(super) const fn condition(&self) -> PmConditionId {
+        self.condition
+    }
+
+    #[must_use]
+    pub(super) const fn question(&self) -> PmMarketId {
+        self.question
+    }
+
+    #[must_use]
+    pub(super) const fn reported_condition(&self) -> Option<PmConditionId> {
+        self.reported_condition
+    }
+
+    #[must_use]
+    pub(super) const fn book_market_binding(&self) -> PmBookMarketBinding {
+        self.book_market_binding
+    }
+
+    #[must_use]
+    pub(super) const fn token_membership(&self) -> &[PmOutcomeMetadata; 2] {
+        &self.token_membership
+    }
+
+    #[must_use]
+    pub(super) const fn configured_outcome(&self) -> PmOutcomeMetadata {
+        self.configured_outcome
+    }
+
+    #[must_use]
+    pub(super) const fn trading_domain(&self) -> PmGoalFTradingDomain {
+        self.trading_domain
+    }
+
+    #[must_use]
+    pub(super) const fn chain(&self) -> PmChainId {
+        self.trading_domain.chain()
+    }
+
+    #[must_use]
+    pub(super) const fn spender_domain(&self) -> PmSpenderDomain {
+        self.trading_domain.spender_domain()
+    }
+
+    #[must_use]
+    pub(super) const fn exchange(&self) -> EvmAddress {
+        self.trading_domain.exchange()
+    }
+
+    #[must_use]
+    pub(super) const fn collateral_asset(&self) -> PmAssetId {
+        self.trading_domain.collateral()
+    }
+
+    #[must_use]
+    pub(super) const fn outcome_asset(&self) -> PmAssetId {
+        self.trading_domain.outcome()
+    }
+
+    #[must_use]
+    pub(super) const fn required_spenders(&self) -> [PmSpenderRequirement; 2] {
+        self.trading_domain.required_spenders()
+    }
+
+    #[must_use]
+    pub(super) const fn lifecycle(&self) -> PmMarketLifecycle {
+        self.lifecycle
+    }
+
+    #[must_use]
+    pub(super) const fn tick(&self) -> PmTick {
+        self.tick
+    }
+
+    #[must_use]
+    pub(super) const fn minimum_order_size(&self) -> PmQuantity {
+        self.minimum_order_size
+    }
+
+    #[must_use]
+    pub(super) const fn maker_base_fee_bps(&self) -> u64 {
+        self.maker_base_fee_bps
+    }
+
+    #[must_use]
+    pub(super) const fn taker_base_fee_bps(&self) -> u64 {
+        self.taker_base_fee_bps
+    }
+
+    #[must_use]
+    pub(super) const fn fee_rate(&self) -> Option<&PmClobFeeDecimal> {
+        self.fee_rate.as_ref()
+    }
+
+    #[must_use]
+    pub(super) const fn fee_exponent(&self) -> Option<&PmClobFeeDecimal> {
+        self.fee_exponent.as_ref()
+    }
+
+    #[must_use]
+    pub(super) const fn fee_taker_only(&self) -> Option<bool> {
+        self.fee_taker_only
+    }
+
+    #[must_use]
+    pub(super) const fn seconds_delay(&self) -> u64 {
+        self.seconds_delay
+    }
+
+    #[must_use]
+    pub(super) const fn reported_seconds_delay(&self) -> Option<u64> {
+        self.reported_seconds_delay
+    }
+
+    #[must_use]
+    pub(super) const fn take_only_delay_enabled(&self) -> bool {
+        self.take_only_delay_enabled
+    }
+
+    #[must_use]
+    pub(super) const fn cancel_book_on_start(&self) -> Option<bool> {
+        self.cancel_book_on_start
+    }
+
+    #[must_use]
+    pub(super) const fn minimum_order_age_seconds(&self) -> u64 {
+        self.minimum_order_age_seconds
+    }
+
+    #[must_use]
+    pub(super) const fn accepting_orders_reported(&self) -> Option<bool> {
+        self.accepting_orders_reported
+    }
+
+    #[must_use]
+    pub(super) const fn rfq_enabled(&self) -> Option<bool> {
+        self.rfq_enabled
+    }
+
+    #[must_use]
+    pub(super) const fn bonding_curve_enabled(&self) -> Option<bool> {
+        self.bonding_curve_enabled
+    }
+
+    #[must_use]
+    pub(super) const fn accepting_order_timestamp(&self) -> Option<&PmLifecycleTimeString> {
+        self.accepting_order_timestamp.as_ref()
+    }
+
+    #[must_use]
+    pub(super) const fn reported_accepting_order_timestamp(
+        &self,
+    ) -> Option<&PmLifecycleTimeString> {
+        self.reported_accepting_order_timestamp.as_ref()
+    }
+
+    #[must_use]
+    pub(super) const fn game_start_time(&self) -> Option<&PmLifecycleTimeString> {
+        self.game_start_time.as_ref()
+    }
+
+    #[must_use]
+    pub(super) const fn reported_game_start_time(&self) -> Option<&PmLifecycleTimeString> {
+        self.reported_game_start_time.as_ref()
+    }
+
+    /// This is only a source-derived presence fact. It deliberately does not
+    /// claim that absence proves a reviewed non-sports market.
+    #[must_use]
+    pub(super) const fn game_start_time_present(&self) -> bool {
+        self.game_start_time.is_some()
+    }
+
+    #[must_use]
+    pub(super) const fn end_time(&self) -> &PmLifecycleTimeString {
+        &self.end_time
+    }
+}
+
+impl fmt::Debug for PmPhaseAMarketProjection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PmPhaseAMarketProjection")
+            .field("book_market_binding", &self.book_market_binding)
+            .field("token_count", &self.token_membership.len())
+            .field("lifecycle", &self.lifecycle)
+            .field("tick", &self.tick)
+            .field("minimum_order_size", &self.minimum_order_size)
+            .field("maker_base_fee_bps", &self.maker_base_fee_bps)
+            .field("taker_base_fee_bps", &self.taker_base_fee_bps)
+            .field("fee_rate_present", &self.fee_rate.is_some())
+            .field("fee_exponent_present", &self.fee_exponent.is_some())
+            .field("fee_taker_only", &self.fee_taker_only)
+            .field("seconds_delay", &self.seconds_delay)
+            .field("reported_seconds_delay", &self.reported_seconds_delay)
+            .field("take_only_delay_enabled", &self.take_only_delay_enabled)
+            .field("cancel_book_on_start", &self.cancel_book_on_start)
+            .field("minimum_order_age_seconds", &self.minimum_order_age_seconds)
+            .field("game_start_time_present", &self.game_start_time_present())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Move-only proof of an exact snapshot commit and correlated flow opening.
 pub(super) struct PmPublicBookSnapshotEvidence {
     proof: PmSnapshotCommitProof,
     source: PmPublicBookSnapshotSource,
     top: PmBookTop,
+    phase_a_market: PmPhaseAMarketProjection,
     state_generation: u64,
     admitted_activity_generation: u64,
     source_high_water: u64,
@@ -598,6 +996,11 @@ impl PmPublicBookSnapshotEvidence {
     #[must_use]
     pub(super) const fn ready_top(&self) -> PmBookTop {
         self.top
+    }
+
+    #[must_use]
+    pub(super) const fn phase_a_market(&self) -> &PmPhaseAMarketProjection {
+        &self.phase_a_market
     }
 
     #[must_use]
@@ -684,6 +1087,7 @@ pub(super) struct PmPublicBookLease {
     snapshot_revision: SnapshotRevision,
     local_ingress_sequence: IngressSequence,
     top: PmBookTop,
+    phase_a_market: PmPhaseAMarketProjection,
     heartbeat: PmPublicHeartbeatEvidence,
     heartbeat_activity_generation: u64,
     activity_generation: u64,
@@ -726,6 +1130,11 @@ impl PmPublicBookLease {
     #[must_use]
     pub(super) const fn ready_top(&self) -> PmBookTop {
         self.top
+    }
+
+    #[must_use]
+    pub(super) const fn phase_a_market(&self) -> &PmPhaseAMarketProjection {
+        &self.phase_a_market
     }
 
     #[must_use]
@@ -820,6 +1229,7 @@ struct PmPublicBookState {
     session: PmPublicSession,
     reducer: PmBookReducer,
     freshness: PmBookFreshness,
+    phase_a_market: PmPhaseAMarketProjection,
     metadata_source_receive_clock: PmHttpReceiveClock,
     metadata_observation_commitment: PmLiveMetadataObservationCommitment,
     metadata_control_begin_clock: ReceivedEventClock,
@@ -880,6 +1290,12 @@ impl PmPublicBookState {
         if authoritative.monotonic_receive_ns() != live.receive_clock().monotonic_receive_ns() {
             return Err(PmPublicBookRuntimeError::MetadataProvenanceMismatch);
         }
+        let metadata_event = authoritative.event();
+        let phase_a_market = PmPhaseAMarketProjection::from_joined_source(
+            live.details(),
+            metadata_event.metadata(),
+            parser,
+        )?;
 
         let role = PmPublicRole::new(
             config.observation_grant,
@@ -893,7 +1309,6 @@ impl PmPublicBookState {
         let domain_fingerprint = PmDomainFingerprint::new(authoritative.domain_fingerprint())?;
         let metadata_contract =
             PmMetadataContract::goal_f_clob_v2(config.expected_metadata, domain_fingerprint);
-        let metadata_event = authoritative.event();
         let metadata_source_receive_clock = live.receive_clock();
         let metadata_observation_commitment = live.commitment();
         if metadata_control_complete.monotonic_receive_ns()
@@ -968,6 +1383,7 @@ impl PmPublicBookState {
             session,
             reducer,
             freshness: config.freshness,
+            phase_a_market,
             metadata_source_receive_clock,
             metadata_observation_commitment,
             metadata_control_begin_clock: metadata_control_begin,
@@ -1549,6 +1965,7 @@ impl PmPublicBookState {
             proof: core.proof,
             source: core.source,
             top: core.top,
+            phase_a_market: self.phase_a_market.duplicate_for_seal(),
             state_generation: self.state_generation,
             admitted_activity_generation: self.admitted_activity_generation,
             source_high_water,
@@ -1691,6 +2108,12 @@ impl PmPublicBookState {
             .reducer
             .ready_top()
             .ok_or(PmPublicBookRuntimeError::ReadyTopUnavailable)?;
+        if !self.phase_a_market.matches_authoritative(
+            self.session.metadata_event().metadata(),
+            self.session.role().parser_config(),
+        ) {
+            return Err(PmPublicBookRuntimeError::LeaseStateMismatch);
+        }
         let heartbeat = self
             .last_heartbeat
             .as_ref()
@@ -1717,6 +2140,7 @@ impl PmPublicBookState {
             snapshot_revision,
             local_ingress_sequence: ingress,
             top,
+            phase_a_market: self.phase_a_market.duplicate_for_seal(),
             heartbeat: heartbeat.evidence,
             heartbeat_activity_generation: heartbeat.activity_generation,
             activity_generation: self.admitted_activity_generation,
@@ -1747,16 +2171,29 @@ impl PmPublicBookState {
             || lease.metadata_revision != self.session.metadata_revision()
             || lease.local_ingress_sequence != self.session.local_ingress_sequence()
             || self.reducer.ready_top() != Some(lease.top)
+            || lease.phase_a_market != self.phase_a_market
             || lease.activity_generation != self.admitted_activity_generation
             || lease.source_high_water != lease.activity_generation
             || source_high_water != lease.source_high_water
+            || lease.metadata_source_receive_clock != self.metadata_source_receive_clock
+            || lease.metadata_observation_commitment != self.metadata_observation_commitment
+            || lease.metadata_control_begin_clock != self.metadata_control_begin_clock
+            || lease.metadata_control_complete_clock != self.metadata_control_complete_clock
+            || Some(lease.book_receive_clock) != self.book_receive_clock
             || now_monotonic_ns < lease.checked_at_control_clock.monotonic_receive_ns()
             || now_monotonic_ns > lease.fresh_until_monotonic_ns
         {
             return Err(PmPublicBookRuntimeError::LeaseStateMismatch);
         }
         let successor = self.issue_lease(now, source_high_water)?;
-        if successor.fresh_until_monotonic_ns != lease.fresh_until_monotonic_ns {
+        if successor.phase_a_market != lease.phase_a_market
+            || successor.metadata_source_receive_clock != lease.metadata_source_receive_clock
+            || successor.metadata_observation_commitment != lease.metadata_observation_commitment
+            || successor.metadata_control_begin_clock != lease.metadata_control_begin_clock
+            || successor.metadata_control_complete_clock != lease.metadata_control_complete_clock
+            || successor.book_receive_clock != lease.book_receive_clock
+            || successor.fresh_until_monotonic_ns != lease.fresh_until_monotonic_ns
+        {
             return Err(PmPublicBookRuntimeError::LeaseStateMismatch);
         }
         Ok(successor)
@@ -2423,7 +2860,10 @@ mod tests {
         )
     }
 
-    async fn metadata_role() -> (PmPublicMetadataHttpRole, tokio::task::JoinHandle<()>) {
+    async fn metadata_role_with(
+        long_market_body: String,
+        short_market_body: String,
+    ) -> (PmPublicMetadataHttpRole, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind metadata loopback");
@@ -2445,9 +2885,9 @@ mod tests {
                 }
                 let request = String::from_utf8(request).expect("HTTP request");
                 let body = if request.starts_with("GET /markets/") {
-                    long_market()
+                    &long_market_body
                 } else if request.starts_with("GET /clob-markets/") {
-                    short_market()
+                    &short_market_body
                 } else {
                     panic!("unexpected metadata route: {request}");
                 };
@@ -2501,8 +2941,13 @@ mod tests {
         .transport_policy()
     }
 
-    async fn state_with_bracket(begin_ns: u64, complete_ns: u64) -> PmPublicBookState {
-        let (metadata, server) = metadata_role().await;
+    async fn state_with_source(
+        long_market_body: String,
+        short_market_body: String,
+        begin_ns: u64,
+        complete_ns: u64,
+    ) -> PmPublicBookState {
+        let (metadata, server) = metadata_role_with(long_market_body, short_market_body).await;
         let joined = metadata
             .refresh_authoritative_observation(
                 instrument(),
@@ -2542,6 +2987,10 @@ mod tests {
             .mark_subscription_sent(SUBSCRIBE_NS.max(complete_ns + 1))
             .expect("canonical subscription transition");
         state
+    }
+
+    async fn state_with_bracket(begin_ns: u64, complete_ns: u64) -> PmPublicBookState {
+        state_with_source(long_market(), short_market(), begin_ns, complete_ns).await
     }
 
     async fn state() -> PmPublicBookState {
@@ -2768,6 +3217,156 @@ mod tests {
             .expect("PONG");
         let lease = harness.handle.lease().expect("ready lease");
         (harness, lease)
+    }
+
+    #[tokio::test]
+    async fn source_projection_is_exact_redacted_and_carried_by_snapshot_and_lease() {
+        let mut state = state().await;
+        let expected = state.phase_a_market.duplicate_for_seal();
+        let market = &state.phase_a_market;
+        assert_eq!(market.condition(), scope().condition());
+        assert_eq!(market.question(), scope().market());
+        assert_eq!(market.reported_condition(), Some(scope().condition()));
+        assert_eq!(
+            market.book_market_binding(),
+            PmBookMarketBinding::ConditionId
+        );
+        assert_eq!(market.token_membership().len(), 2);
+        assert_eq!(market.token_membership()[0], expected_metadata().outcome());
+        assert_eq!(market.configured_outcome(), expected_metadata().outcome());
+        assert_eq!(market.chain(), PmChainId::new(137).expect("chain"));
+        assert_eq!(market.spender_domain(), PmSpenderDomain::Standard);
+        assert_eq!(
+            market.exchange(),
+            EvmAddress::parse(STANDARD_EXCHANGE).expect("exchange")
+        );
+        assert_eq!(
+            market.collateral_asset(),
+            PmAssetId::collateral(EvmAddress::parse(PUSD).expect("collateral"))
+        );
+        assert_eq!(
+            market.outcome_asset(),
+            PmAssetId::outcome(
+                EvmAddress::parse(CONDITIONAL_TOKENS).expect("conditional tokens"),
+                scope().token(),
+            )
+        );
+        assert_eq!(market.required_spenders().len(), 2);
+        assert_eq!(
+            market.trading_domain(),
+            PmGoalFTradingDomain::from_metadata(expected_metadata()).expect("domain")
+        );
+        assert_eq!(market.lifecycle(), expected_metadata().lifecycle());
+        assert_eq!(market.tick(), expected_metadata().tick());
+        assert_eq!(
+            market.minimum_order_size(),
+            expected_metadata().minimum_order_size()
+        );
+        assert_eq!(market.maker_base_fee_bps(), 0);
+        assert_eq!(market.taker_base_fee_bps(), 0);
+        assert_eq!(
+            market.fee_rate().map(PmClobFeeDecimal::as_str),
+            Some("0.02")
+        );
+        assert_eq!(
+            market.fee_exponent().map(PmClobFeeDecimal::as_str),
+            Some("2")
+        );
+        assert_eq!(market.fee_taker_only(), Some(true));
+        assert_eq!(market.seconds_delay(), 0);
+        assert_eq!(market.reported_seconds_delay(), Some(0));
+        assert!(!market.take_only_delay_enabled());
+        assert_eq!(market.cancel_book_on_start(), Some(true));
+        assert_eq!(market.minimum_order_age_seconds(), 0);
+        assert_eq!(market.accepting_orders_reported(), Some(true));
+        assert_eq!(market.rfq_enabled(), Some(false));
+        assert_eq!(market.bonding_curve_enabled(), Some(true));
+        assert_eq!(
+            market
+                .accepting_order_timestamp()
+                .map(PmLifecycleTimeString::as_str),
+            Some("2026-08-08T00:00:00Z")
+        );
+        assert_eq!(
+            market
+                .reported_accepting_order_timestamp()
+                .map(PmLifecycleTimeString::as_str),
+            Some("2026-08-08T00:00:00Z")
+        );
+        assert!(market.game_start_time().is_none());
+        assert!(market.reported_game_start_time().is_none());
+        assert!(!market.game_start_time_present());
+        assert_eq!(market.end_time().as_str(), "2027-01-01T00:00:00Z");
+
+        let debug = format!("{market:?}");
+        for source_text in [CONDITION, MARKET, "Yes", "2026-08-08T00:00:00Z"] {
+            assert!(!debug.contains(source_text));
+        }
+
+        admit_frame(
+            &mut state,
+            snapshot(1_000).as_bytes(),
+            SNAPSHOT_NS,
+            1,
+            PmPublicBookSnapshotSource::WebSocket,
+        )
+        .expect("snapshot");
+        let snapshot = state.take_snapshot_evidence().expect("snapshot evidence");
+        assert_eq!(snapshot.phase_a_market(), &expected);
+        assert_eq!(
+            snapshot.metadata_observation_commitment(),
+            state.metadata_observation_commitment
+        );
+
+        admit_ping(&mut state, PING_NS, 2).expect("PING");
+        admit_pong(&mut state, PONG_NS, 3).expect("PONG");
+        let lease = state
+            .issue_lease(control_clock(PONG_NS + 1), 3)
+            .expect("lease");
+        assert_eq!(lease.phase_a_market(), &expected);
+        assert_eq!(
+            lease.metadata_observation_commitment(),
+            state.metadata_observation_commitment
+        );
+    }
+
+    #[tokio::test]
+    async fn source_field_or_commitment_drift_is_rejected_by_consuming_recheck() {
+        let changed_short = short_market().replace(r#""r":0.02"#, r#""r":0.03"#);
+        let changed = state_with_source(
+            long_market(),
+            changed_short,
+            CONTROL_BEGIN_NS,
+            CONTROL_COMPLETE_NS,
+        )
+        .await;
+        assert_eq!(
+            changed
+                .phase_a_market
+                .fee_rate()
+                .map(PmClobFeeDecimal::as_str),
+            Some("0.03")
+        );
+
+        let (mut field_drift, mut field_lease) = ready_harness(&[PONG_NS + 1, PONG_NS + 2]).await;
+        assert_ne!(field_lease.phase_a_market, changed.phase_a_market);
+        field_lease.phase_a_market = changed.phase_a_market.duplicate_for_seal();
+        assert!(matches!(
+            field_drift.handle.recheck_lease(field_lease),
+            Err(PmPublicBookRuntimeError::LeaseStateMismatch)
+        ));
+
+        let (mut commitment_drift, mut commitment_lease) =
+            ready_harness(&[PONG_NS + 1, PONG_NS + 2]).await;
+        assert_ne!(
+            commitment_lease.metadata_observation_commitment,
+            changed.metadata_observation_commitment
+        );
+        commitment_lease.metadata_observation_commitment = changed.metadata_observation_commitment;
+        assert!(matches!(
+            commitment_drift.handle.recheck_lease(commitment_lease),
+            Err(PmPublicBookRuntimeError::LeaseStateMismatch)
+        ));
     }
 
     #[tokio::test]

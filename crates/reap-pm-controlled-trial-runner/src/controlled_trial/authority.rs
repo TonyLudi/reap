@@ -9,18 +9,20 @@ use std::{
 
 use async_trait::async_trait;
 use reap_pm_controlled_trial_live::{
-    PmDurablePlacePreparedAckV1, PmRevalidatedPhaseAPlaceLiveDispatchOwnerV1,
+    PmCancelDispatchClassV1, PmDurablePlacePreparedAckV1,
+    PmRevalidatedPhaseALiveCancelDispatchOwnerV1, PmRevalidatedPhaseAPlaceLiveDispatchOwnerV1,
 };
 use reap_pm_core::PmConditionId;
 use reap_polymarket_auth::{
-    AuthenticatedL2Headers, AuthenticatedPlaceRequest, AuthenticatedUserSubscription,
-    CredentialOwnedUserFrame, FixedEoaSigner, L2Credentials, L2Timestamp,
-    PlacePublicRequestIdentity, PmAuthError, PmClobDomain, SerializedPlaceRequest,
+    AuthenticatedL2Headers, AuthenticatedOwnedCancelRequest, AuthenticatedPlaceRequest,
+    AuthenticatedUserSubscription, CredentialOwnedUserFrame, FixedEoaSigner, L2Credentials,
+    L2Timestamp, PlacePublicRequestIdentity, PmAuthError, PmClobDomain, SerializedPlaceRequest,
     derive_place_public_request_identity,
 };
 use reap_polymarket_live_adapter::{
-    PmHttpReadAuthorityProvider, PmLiveAdapterError, PmPlaceMutationAuthenticationError,
-    PmPlaceMutationTimeFinalizer, PmPlaceMutationTimeProof, PmUserWsReadAuthorityProvider,
+    PmCancelMutationTimeFinalizer, PmCancelMutationTimeProof, PmHttpReadAuthorityProvider,
+    PmLiveAdapterError, PmPlaceMutationAuthenticationError, PmPlaceMutationTimeFinalizer,
+    PmPlaceMutationTimeProof, PmUserWsReadAuthorityProvider,
 };
 use reap_polymarket_wire::{
     PmClobV2SignatureType, PmLiveOpenOrderPage, PmLiveOrder, PmLiveTradePage, PmLiveUserFrame,
@@ -32,8 +34,8 @@ use tokio::{
 };
 
 use super::{
-    AuthenticatedExactOwnedCancel, AuthenticatedExactOwnedOrderRead, AuthorizedL2Timestamp,
-    SealedExactOwnedCancelAuthentication, SealedExactOwnedOrderReadAuthentication,
+    AuthenticatedExactOwnedOrderRead, AuthorizedL2Timestamp,
+    SealedExactOwnedOrderReadAuthentication,
 };
 use crate::credentials::{
     FreshPlaceCredentialHandoff, FreshPlaceCredentialTeardown, RecoveryOnlyCredentialHandoff,
@@ -42,6 +44,7 @@ use crate::credentials::{
 
 const COMMON_AUTHORITY_CAPACITY: usize = 8;
 const PLACE_AUTHORITY_CAPACITY: usize = 1;
+const CANCEL_AUTHORITY_CAPACITY: usize = 1;
 const MAX_EXACT_CANCEL_AUTHENTICATIONS_PER_AUTHORITY: u8 = 3;
 const MAX_JOIN_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -53,6 +56,20 @@ struct PlaceRequestTestPause {
 
 #[cfg(test)]
 impl PlaceRequestTestPause {
+    fn wait(self) {
+        let _ = self.admitted.send(());
+        let _ = self.release.recv();
+    }
+}
+
+#[cfg(test)]
+struct CancelRequestTestPause {
+    admitted: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+impl CancelRequestTestPause {
     fn wait(self) {
         let _ = self.admitted.send(());
         let _ = self.release.recv();
@@ -83,8 +100,6 @@ pub(super) enum CredentialAuthorityError {
     PlaceAuthentication(#[from] PmPlaceMutationAuthenticationError),
     #[error("the L2 signer does not match the sealed proxy order signer")]
     PlaceSignerMismatch,
-    #[error("the fixed local exact-cancel authentication ceiling was exhausted")]
-    CancelAuthenticationBudgetExhausted,
     #[error("the authenticated response owner does not match the sole L2 bundle")]
     CredentialOwnerMismatch,
     #[error("the task-local EOA signer has not yet been destroyed")]
@@ -244,9 +259,10 @@ impl FreshCredentialAuthorityOwner {
         Self { custody }
     }
 
-    pub(super) fn spawn(
+    pub(super) fn spawn_with_mutation_time_finalizers(
         self,
         place_time_finalizer: PmPlaceMutationTimeFinalizer,
+        cancel_time_finalizer: PmCancelMutationTimeFinalizer,
     ) -> Result<FreshCredentialAuthorityRoles, CredentialAuthorityError> {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| CredentialAuthorityError::ActiveRuntimeRequired)?;
@@ -254,14 +270,19 @@ impl FreshCredentialAuthorityOwner {
         let identity = Arc::new(AuthorityIdentity::new());
         let (common_sender, common_receiver) = mpsc::channel(COMMON_AUTHORITY_CAPACITY);
         let (place_sender, place_receiver) = mpsc::channel(PLACE_AUTHORITY_CAPACITY);
+        let (cancel_sender, cancel_receiver) = mpsc::channel(CANCEL_AUTHORITY_CAPACITY);
         let (shutdown, shutdown_receiver) = oneshot::channel();
         let task = runtime.spawn(run_fresh_authority(
             TaskSignerCustody::new(signer, Arc::clone(&identity)),
             credentials,
-            place_time_finalizer,
-            common_receiver,
-            place_receiver,
-            shutdown_receiver,
+            FreshAuthorityTaskInputs {
+                place_time_finalizer,
+                cancel_time_finalizer,
+                common: common_receiver,
+                place: place_receiver,
+                cancel: cancel_receiver,
+                shutdown: shutdown_receiver,
+            },
         ));
         let task = ArmedTaskSupervisor::new(shutdown, task);
 
@@ -269,7 +290,7 @@ impl FreshCredentialAuthorityOwner {
             place: FreshPlaceAuthenticationOnce {
                 sender: place_sender,
             },
-            cancel: ExactOwnedCancelAuthenticationRole::new(common_sender.clone()),
+            cancel: ExactOwnedCancelAuthenticationRole::new(cancel_sender),
             http: FixedHttpAuthenticationRole {
                 sender: common_sender.clone(),
             },
@@ -283,6 +304,17 @@ impl FreshCredentialAuthorityOwner {
                 private_key_removed: false,
             },
         })
+    }
+
+    #[cfg(test)]
+    fn spawn(
+        self,
+        place_time_finalizer: PmPlaceMutationTimeFinalizer,
+    ) -> Result<FreshCredentialAuthorityRoles, CredentialAuthorityError> {
+        self.spawn_with_mutation_time_finalizers(
+            place_time_finalizer,
+            tests::unused_cancel_time_finalizer(),
+        )
     }
 }
 
@@ -303,23 +335,27 @@ impl RecoveryCredentialAuthorityOwner {
         Self { custody }
     }
 
-    pub(super) fn spawn(
+    pub(super) fn spawn_with_cancel_time_finalizer(
         self,
+        cancel_time_finalizer: PmCancelMutationTimeFinalizer,
     ) -> Result<RecoveryCredentialAuthorityRoles, CredentialAuthorityError> {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| CredentialAuthorityError::ActiveRuntimeRequired)?;
         let (credentials, teardown) = self.custody.into_authority_and_teardown();
         let (common_sender, common_receiver) = mpsc::channel(COMMON_AUTHORITY_CAPACITY);
+        let (cancel_sender, cancel_receiver) = mpsc::channel(CANCEL_AUTHORITY_CAPACITY);
         let (shutdown, shutdown_receiver) = oneshot::channel();
         let task = runtime.spawn(run_recovery_authority(
             credentials,
+            cancel_time_finalizer,
             common_receiver,
+            cancel_receiver,
             shutdown_receiver,
         ));
         let task = ArmedTaskSupervisor::new(shutdown, task);
 
         Ok(RecoveryCredentialAuthorityRoles {
-            cancel: ExactOwnedCancelAuthenticationRole::new(common_sender.clone()),
+            cancel: ExactOwnedCancelAuthenticationRole::new(cancel_sender),
             http: FixedHttpAuthenticationRole {
                 sender: common_sender.clone(),
             },
@@ -328,6 +364,13 @@ impl RecoveryCredentialAuthorityOwner {
             },
             supervisor: RecoveryCredentialAuthoritySupervisor { task, teardown },
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn spawn(
+        self,
+    ) -> Result<RecoveryCredentialAuthorityRoles, CredentialAuthorityError> {
+        self.spawn_with_cancel_time_finalizer(tests::unused_cancel_time_finalizer())
     }
 }
 
@@ -662,37 +705,145 @@ impl fmt::Debug for OpaqueAuthenticatedPlaceRequest {
 /// budgets remain an upper journal responsibility; this independent ceiling
 /// prevents an unbounded in-process caller loop.
 pub(super) struct ExactOwnedCancelAuthenticationRole {
-    sender: mpsc::Sender<CommonAuthorityRequest>,
+    sender: mpsc::Sender<CancelAuthorityRequest>,
     remaining_attempts: u8,
 }
 
 impl ExactOwnedCancelAuthenticationRole {
-    fn new(sender: mpsc::Sender<CommonAuthorityRequest>) -> Self {
+    fn new(sender: mpsc::Sender<CancelAuthorityRequest>) -> Self {
         Self {
             sender,
             remaining_attempts: MAX_EXACT_CANCEL_AUTHENTICATIONS_PER_AUTHORITY,
         }
     }
 
+    /// Consume one positive A3 cancel owner and one cancel-purpose source proof.
+    /// The owner can leave the credential task only sealed with the exact
+    /// authenticated request, or unchanged inside a typed proven pre-send
+    /// failure. Once admitted, cancellation or a lost reply is process-fatal.
     pub(super) async fn authenticate_exact_owned_cancel(
         &mut self,
-        request: SealedExactOwnedCancelAuthentication,
-    ) -> Result<AuthenticatedExactOwnedCancel, CredentialAuthorityError> {
+        owner: PmRevalidatedPhaseALiveCancelDispatchOwnerV1,
+        proof: PmCancelMutationTimeProof,
+    ) -> Result<OpaqueAuthenticatedExactOwnedCancel, CancelAuthenticationPreSendFailure> {
         if self.remaining_attempts == 0 {
-            return Err(CredentialAuthorityError::CancelAuthenticationBudgetExhausted);
+            return Err(CancelAuthenticationPreSendFailure::new(
+                owner,
+                CancelAuthenticationPreSendFailureKind::BudgetExhausted,
+            ));
         }
         self.remaining_attempts -= 1;
-        request_common(&self.sender, |response| CommonAuthorityRequest::Cancel {
-            request,
-            response,
-        })
+        request_cancel(
+            &self.sender,
+            CancelHmacAdmission {
+                owner,
+                proof,
+                #[cfg(test)]
+                test_pause: None,
+            },
+        )
         .await
+    }
+
+    #[cfg(test)]
+    async fn admit_pause_for_cancellation_test(
+        &mut self,
+        pause: CancelRequestTestPause,
+    ) -> Result<(), CredentialAuthorityError> {
+        request_cancel_pause(&self.sender, pause).await
     }
 }
 
 impl fmt::Debug for ExactOwnedCancelAuthenticationRole {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("ExactOwnedCancelAuthenticationRole(<opaque>)")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CancelAuthenticationPreSendFailureKind {
+    BudgetExhausted,
+    AuthoritySaturated,
+    AuthorityClosed,
+    DispatchClassMismatch,
+    RequestBindingMismatch,
+    AuthenticationFailed,
+}
+
+/// Closed failure retaining the unchanged positive A3 owner. It contains no
+/// request bytes, timestamp capability, signature, credentials, or transport.
+#[must_use = "the positive cancel owner must be recovered or terminalized"]
+pub(super) struct CancelAuthenticationPreSendFailure {
+    owner: Box<PmRevalidatedPhaseALiveCancelDispatchOwnerV1>,
+    kind: CancelAuthenticationPreSendFailureKind,
+}
+
+impl CancelAuthenticationPreSendFailure {
+    fn new(
+        owner: PmRevalidatedPhaseALiveCancelDispatchOwnerV1,
+        kind: CancelAuthenticationPreSendFailureKind,
+    ) -> Self {
+        Self {
+            owner: Box::new(owner),
+            kind,
+        }
+    }
+
+    #[must_use]
+    pub(super) const fn kind(&self) -> CancelAuthenticationPreSendFailureKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub(super) fn into_owner(self) -> PmRevalidatedPhaseALiveCancelDispatchOwnerV1 {
+        *self.owner
+    }
+}
+
+impl fmt::Debug for CancelAuthenticationPreSendFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CancelAuthenticationPreSendFailure")
+            .field("kind", &self.kind)
+            .field("positive_owner_retained", &true)
+            .finish()
+    }
+}
+
+struct CancelHmacAdmission {
+    owner: PmRevalidatedPhaseALiveCancelDispatchOwnerV1,
+    proof: PmCancelMutationTimeProof,
+    #[cfg(test)]
+    test_pause: Option<CancelRequestTestPause>,
+}
+
+impl CancelHmacAdmission {
+    fn wait_for_test_pause(&mut self) {
+        #[cfg(test)]
+        if let Some(pause) = self.test_pause.take() {
+            pause.wait();
+        }
+    }
+}
+
+impl fmt::Debug for CancelHmacAdmission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CancelHmacAdmission(<opaque-positive-owner-and-time-proof>)")
+    }
+}
+
+/// Final exact-owned cancel HMAC inseparably sealed with the positive A3
+/// owner. No production getter, decomposition, dispatch, or transport method
+/// exists in this slice.
+#[must_use = "the authenticated positive cancel remains a linear authority"]
+pub(super) struct OpaqueAuthenticatedExactOwnedCancel {
+    request: AuthenticatedOwnedCancelRequest,
+    owner: PmRevalidatedPhaseALiveCancelDispatchOwnerV1,
+}
+
+impl fmt::Debug for OpaqueAuthenticatedExactOwnedCancel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OpaqueAuthenticatedExactOwnedCancel([REDACTED])")
     }
 }
 
@@ -1195,11 +1346,38 @@ struct RetainedPreparedPlace {
     public_identity: PlacePublicRequestIdentity,
 }
 
-enum CommonAuthorityRequest {
-    Cancel {
-        request: SealedExactOwnedCancelAuthentication,
-        response: oneshot::Sender<Result<AuthenticatedExactOwnedCancel, CredentialAuthorityError>>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelAuthorityMode {
+    FreshPrimary,
+    RecoveryOnly,
+}
+
+impl CancelAuthorityMode {
+    const fn accepts(self, class: PmCancelDispatchClassV1) -> bool {
+        matches!(
+            (self, class),
+            (Self::FreshPrimary, PmCancelDispatchClassV1::Primary)
+                | (Self::RecoveryOnly, PmCancelDispatchClassV1::Recovery { .. })
+        )
+    }
+}
+
+type CancelAuthenticationResponse =
+    Result<OpaqueAuthenticatedExactOwnedCancel, CancelAuthenticationPreSendFailure>;
+
+enum CancelAuthorityRequest {
+    Authenticate {
+        admission: Box<CancelHmacAdmission>,
+        response: oneshot::Sender<CancelAuthenticationResponse>,
     },
+    #[cfg(test)]
+    PauseForCancellationTest {
+        pause: CancelRequestTestPause,
+        response: oneshot::Sender<()>,
+    },
+}
+
+enum CommonAuthorityRequest {
     OpenOrders {
         timestamp: L2Timestamp,
         response: oneshot::Sender<Result<AuthenticatedL2Headers, CredentialAuthorityError>>,
@@ -1243,16 +1421,31 @@ enum CommonAuthorityRequest {
     },
 }
 
+struct FreshAuthorityTaskInputs {
+    place_time_finalizer: PmPlaceMutationTimeFinalizer,
+    cancel_time_finalizer: PmCancelMutationTimeFinalizer,
+    common: mpsc::Receiver<CommonAuthorityRequest>,
+    place: mpsc::Receiver<PlaceAuthorityRequest>,
+    cancel: mpsc::Receiver<CancelAuthorityRequest>,
+    shutdown: oneshot::Receiver<()>,
+}
+
 async fn run_fresh_authority(
     mut signer: TaskSignerCustody,
     credentials: L2Credentials,
-    mut place_time_finalizer: PmPlaceMutationTimeFinalizer,
-    mut common: mpsc::Receiver<CommonAuthorityRequest>,
-    mut place: mpsc::Receiver<PlaceAuthorityRequest>,
-    mut shutdown: oneshot::Receiver<()>,
+    inputs: FreshAuthorityTaskInputs,
 ) {
+    let FreshAuthorityTaskInputs {
+        mut place_time_finalizer,
+        mut cancel_time_finalizer,
+        mut common,
+        mut place,
+        mut cancel,
+        mut shutdown,
+    } = inputs;
     let mut common_open = true;
     let mut place_open = true;
+    let mut cancel_open = true;
     let mut retained_place = None;
     loop {
         tokio::select! {
@@ -1260,6 +1453,7 @@ async fn run_fresh_authority(
             _ = &mut shutdown => {
                 common.close();
                 place.close();
+                cancel.close();
                 return;
             }
             request = common.recv(), if common_open => match request {
@@ -1276,6 +1470,15 @@ async fn run_fresh_authority(
                 ),
                 None => place_open = false,
             },
+            request = cancel.recv(), if cancel_open => match request {
+                Some(request) => handle_cancel_request(
+                    request,
+                    CancelAuthorityMode::FreshPrimary,
+                    &credentials,
+                    &mut cancel_time_finalizer,
+                ),
+                None => cancel_open = false,
+            },
             else => return,
         }
     }
@@ -1284,22 +1487,35 @@ async fn run_fresh_authority(
 // BEGIN RECOVERY_TASK
 async fn run_recovery_authority(
     credentials: L2Credentials,
+    mut cancel_time_finalizer: PmCancelMutationTimeFinalizer,
     mut common: mpsc::Receiver<CommonAuthorityRequest>,
+    mut cancel: mpsc::Receiver<CancelAuthorityRequest>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
+    let mut common_open = true;
+    let mut cancel_open = true;
     loop {
         tokio::select! {
             biased;
             _ = &mut shutdown => {
                 common.close();
+                cancel.close();
                 return;
             }
-            request = common.recv() => {
-                let Some(request) = request else {
-                    return;
-                };
-                handle_common_request(&credentials, request);
-            }
+            request = common.recv(), if common_open => match request {
+                Some(request) => handle_common_request(&credentials, request),
+                None => common_open = false,
+            },
+            request = cancel.recv(), if cancel_open => match request {
+                Some(request) => handle_cancel_request(
+                    request,
+                    CancelAuthorityMode::RecoveryOnly,
+                    &credentials,
+                    &mut cancel_time_finalizer,
+                ),
+                None => cancel_open = false,
+            },
+            else => return,
         }
     }
 }
@@ -1430,17 +1646,114 @@ fn respond_place_finalization(
     let _ = response.send(authenticated);
 }
 
+fn handle_cancel_request(
+    request: CancelAuthorityRequest,
+    mode: CancelAuthorityMode,
+    credentials: &L2Credentials,
+    cancel_time_finalizer: &mut PmCancelMutationTimeFinalizer,
+) {
+    match request {
+        CancelAuthorityRequest::Authenticate {
+            admission,
+            response,
+        } => {
+            let value =
+                authenticate_cancel_admission(*admission, mode, credentials, cancel_time_finalizer);
+            if response.send(value).is_err() {
+                // Losing the sole positive owner or an authenticated request
+                // after admission makes send status/custody ambiguous.
+                std::process::abort();
+            }
+        }
+        #[cfg(test)]
+        CancelAuthorityRequest::PauseForCancellationTest { pause, response } => {
+            pause.wait();
+            if response.send(()).is_err() {
+                std::process::abort();
+            }
+        }
+    }
+}
+
+fn authenticate_cancel_admission(
+    mut admission: CancelHmacAdmission,
+    mode: CancelAuthorityMode,
+    credentials: &L2Credentials,
+    cancel_time_finalizer: &mut PmCancelMutationTimeFinalizer,
+) -> Result<OpaqueAuthenticatedExactOwnedCancel, CancelAuthenticationPreSendFailure> {
+    admission.wait_for_test_pause();
+    let CancelHmacAdmission { owner, proof, .. } = admission;
+    if !mode.accepts(owner.dispatch_class()) {
+        return Err(CancelAuthenticationPreSendFailure::new(
+            owner,
+            CancelAuthenticationPreSendFailureKind::DispatchClassMismatch,
+        ));
+    }
+
+    let order_id = owner.exact_venue_order_id();
+    let semantic_request_commitment = owner.semantic_request_commitment();
+    let expected_l2_timestamp_seconds = owner.l2_timestamp_seconds();
+    let preparation = owner.preparation();
+    if preparation.exact_venue_order_id() != order_id
+        || preparation.semantic_request_commitment() != semantic_request_commitment
+        || preparation.l2_timestamp_seconds() != expected_l2_timestamp_seconds
+    {
+        return Err(CancelAuthenticationPreSendFailure::new(
+            owner,
+            CancelAuthenticationPreSendFailureKind::RequestBindingMismatch,
+        ));
+    }
+
+    let serialized = match credentials.serialize_owned_cancel(order_id) {
+        Ok(serialized) => serialized,
+        Err(_) => {
+            return Err(CancelAuthenticationPreSendFailure::new(
+                owner,
+                CancelAuthenticationPreSendFailureKind::AuthenticationFailed,
+            ));
+        }
+    };
+    if serialized.order_id() != order_id
+        || serialized.semantic_request_commitment() != semantic_request_commitment
+    {
+        return Err(CancelAuthenticationPreSendFailure::new(
+            owner,
+            CancelAuthenticationPreSendFailureKind::RequestBindingMismatch,
+        ));
+    }
+
+    let authenticated = match cancel_time_finalizer.authenticate_exact_owned_cancel(
+        proof,
+        expected_l2_timestamp_seconds,
+        credentials,
+        serialized,
+    ) {
+        Ok(authenticated) => authenticated,
+        Err(_error) => {
+            return Err(CancelAuthenticationPreSendFailure::new(
+                owner,
+                CancelAuthenticationPreSendFailureKind::AuthenticationFailed,
+            ));
+        }
+    };
+    if authenticated.order_id() != order_id
+        || authenticated.semantic_request_commitment() != semantic_request_commitment
+        || owner.dispatch_class() != preparation.dispatch_class()
+    {
+        return Err(CancelAuthenticationPreSendFailure::new(
+            owner,
+            CancelAuthenticationPreSendFailureKind::RequestBindingMismatch,
+        ));
+    }
+
+    Ok(OpaqueAuthenticatedExactOwnedCancel {
+        request: authenticated,
+        owner,
+    })
+}
+
 fn handle_common_request(credentials: &L2Credentials, request: CommonAuthorityRequest) {
     match request {
-        CommonAuthorityRequest::Cancel { request, response } => {
-            let timestamp = request.timestamp.into_inner();
-            let value = credentials
-                .serialize_owned_cancel(request.order_id)
-                .and_then(|serialized| credentials.authenticate_owned_cancel(timestamp, serialized))
-                .map(|authenticated| AuthenticatedExactOwnedCancel::new(authenticated, timestamp))
-                .map_err(Into::into);
-            let _ = response.send(value);
-        }
         CommonAuthorityRequest::OpenOrders {
             timestamp,
             response,
@@ -1575,6 +1888,83 @@ impl Drop for AdmittedPlaceRequestGuard {
     }
 }
 
+async fn request_cancel(
+    sender: &mpsc::Sender<CancelAuthorityRequest>,
+    admission: CancelHmacAdmission,
+) -> Result<OpaqueAuthenticatedExactOwnedCancel, CancelAuthenticationPreSendFailure> {
+    let (response, receive) = oneshot::channel();
+    let request = CancelAuthorityRequest::Authenticate {
+        admission: Box::new(admission),
+        response,
+    };
+    if let Err(error) = sender.try_send(request) {
+        let (request, kind) = match error {
+            mpsc::error::TrySendError::Full(request) => (
+                request,
+                CancelAuthenticationPreSendFailureKind::AuthoritySaturated,
+            ),
+            mpsc::error::TrySendError::Closed(request) => (
+                request,
+                CancelAuthenticationPreSendFailureKind::AuthorityClosed,
+            ),
+        };
+        let admission = match request {
+            CancelAuthorityRequest::Authenticate { admission, .. } => admission,
+            #[cfg(test)]
+            CancelAuthorityRequest::PauseForCancellationTest { .. } => std::process::abort(),
+        };
+        let CancelHmacAdmission { owner, .. } = *admission;
+        return Err(CancelAuthenticationPreSendFailure::new(owner, kind));
+    }
+    let mut admitted = AdmittedCancelRequestGuard { armed: true };
+    let result = match receive.await {
+        Ok(result) => result,
+        // The task may have consumed the positive owner/proof and minted an
+        // HMAC. A lost terminal reply cannot unwind into a reusable session.
+        Err(_) => std::process::abort(),
+    };
+    admitted.disarm();
+    result
+}
+
+#[cfg(test)]
+async fn request_cancel_pause(
+    sender: &mpsc::Sender<CancelAuthorityRequest>,
+    pause: CancelRequestTestPause,
+) -> Result<(), CredentialAuthorityError> {
+    let (response, receive) = oneshot::channel();
+    sender
+        .try_send(CancelAuthorityRequest::PauseForCancellationTest { pause, response })
+        .map_err(classify_cancel_pause_send)?;
+    let mut admitted = AdmittedCancelRequestGuard { armed: true };
+    match receive.await {
+        Ok(()) => admitted.disarm(),
+        Err(_) => std::process::abort(),
+    }
+    Ok(())
+}
+
+struct AdmittedCancelRequestGuard {
+    armed: bool,
+}
+
+impl AdmittedCancelRequestGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AdmittedCancelRequestGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // An admitted cancel owns the sole positive A3 token. Future
+            // cancellation must never detach the credential task or lose the
+            // typed pre-send/send-status outcome.
+            std::process::abort();
+        }
+    }
+}
+
 async fn request_common<T>(
     sender: &mpsc::Sender<CommonAuthorityRequest>,
     make: impl FnOnce(oneshot::Sender<Result<T, CredentialAuthorityError>>) -> CommonAuthorityRequest,
@@ -1618,6 +2008,22 @@ fn classify_common_send(
     }
 }
 
+#[cfg(test)]
+fn classify_cancel_pause_send(
+    error: mpsc::error::TrySendError<CancelAuthorityRequest>,
+) -> CredentialAuthorityError {
+    match error {
+        mpsc::error::TrySendError::Full(request) => {
+            drop(request);
+            CredentialAuthorityError::AuthoritySaturated
+        }
+        mpsc::error::TrySendError::Closed(request) => {
+            drop(request);
+            CredentialAuthorityError::AuthorityClosed
+        }
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::{
@@ -1634,12 +2040,12 @@ mod tests {
         PmTick, PmTokenId, U256,
     };
     use reap_polymarket_auth::{
-        AuthenticatedUserSubscriptionSink, EoaAddress, FixedOrderId, FixedOwnedCancelRequestSink,
-        FixedPlaceRequestSink, L2HeaderSink,
+        AuthenticatedUserSubscriptionSink, EoaAddress, FixedOrderId, FixedPlaceRequestSink,
+        L2HeaderSink,
     };
     use reap_polymarket_live_adapter::{
-        PmPlaceServerTimeHttpRole, PmProductClockOwner, PmPublicConnectivityOwner,
-        PmPublicHttpConfig, PmPublicWsConfig,
+        PmCancelServerTimeHttpRole, PmPlaceServerTimeHttpRole, PmProductClockOwner,
+        PmPublicConnectivityOwner, PmPublicHttpConfig, PmPublicWsConfig,
     };
     use reap_polymarket_wire::{
         PmBookParserConfig, PmUnsignedClobV2Order, PmWireScope, parse_live_open_order_page,
@@ -1654,10 +2060,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        controlled_trial::{
-            AuthorizedL2Timestamp, SealedExactOwnedCancelAuthentication,
-            SealedExactOwnedOrderReadAuthentication,
-        },
+        controlled_trial::{AuthorizedL2Timestamp, SealedExactOwnedOrderReadAuthentication},
         credentials::{FreshPlaceCredentialFiles, RecoveryOnlyCredentialFiles},
     };
 
@@ -1733,7 +2136,12 @@ mod tests {
         )
     }
 
-    fn place_time_roles(origin: &str) -> (PmPlaceServerTimeHttpRole, PmPlaceMutationTimeFinalizer) {
+    fn mutation_time_roles(
+        origin: &str,
+    ) -> (
+        (PmPlaceServerTimeHttpRole, PmPlaceMutationTimeFinalizer),
+        (PmCancelServerTimeHttpRole, PmCancelMutationTimeFinalizer),
+    ) {
         let scope = test_wire_scope();
         let http = PmPublicHttpConfig::loopback_evidence(
             origin,
@@ -1781,17 +2189,28 @@ mod tests {
             book,
             read_time,
             private_read,
-            cancel_time,
             public_ws,
             user_clock,
             actor_clock,
             okx_clock,
         ));
-        place_time.into_roles()
+        (place_time.into_roles(), cancel_time.into_roles())
+    }
+
+    fn place_time_roles(origin: &str) -> (PmPlaceServerTimeHttpRole, PmPlaceMutationTimeFinalizer) {
+        let (place, cancel) = mutation_time_roles(origin);
+        drop(cancel);
+        place
     }
 
     fn unused_place_time_finalizer() -> PmPlaceMutationTimeFinalizer {
         place_time_roles("http://127.0.0.1:9").1
+    }
+
+    pub(super) fn unused_cancel_time_finalizer() -> PmCancelMutationTimeFinalizer {
+        let (place, cancel) = mutation_time_roles("http://127.0.0.1:9");
+        drop(place);
+        cancel.1
     }
 
     async fn start_time_server(request_count: usize) -> (String, JoinHandle<()>) {
@@ -1951,27 +2370,6 @@ mod tests {
         }
     }
 
-    impl FixedOwnedCancelRequestSink for MutationCapture {
-        type Output = ();
-        type Error = Infallible;
-
-        fn send_exact_owned_cancel(
-            &mut self,
-            poly_address: &str,
-            _poly_signature: &str,
-            poly_timestamp: &str,
-            poly_api_key: &str,
-            _poly_passphrase: &str,
-            exact_body: &[u8],
-        ) -> Result<Self::Output, Self::Error> {
-            self.address = poly_address.into();
-            self.timestamp = poly_timestamp.into();
-            self.api_key = poly_api_key.into();
-            self.body.extend_from_slice(exact_body);
-            Ok(())
-        }
-    }
-
     #[derive(Default)]
     struct FrameCapture(Vec<u8>);
 
@@ -2062,13 +2460,39 @@ mod tests {
                 let _ = supervisor.shutdown_bounded(normal_bounds()).await;
                 drop(directory);
             }
+            "cancel" => {
+                let directory = stage_four();
+                let roles = fresh_owner(directory.path())
+                    .spawn(unused_place_time_finalizer())
+                    .unwrap();
+                let (place, mut cancel, http, user_ws, supervisor) = roles.into_roles();
+                let (admitted, admitted_receive) = std::sync::mpsc::sync_channel(0);
+                let (release, release_receive) = std::sync::mpsc::channel();
+                let task = tokio::spawn(async move {
+                    cancel
+                        .admit_pause_for_cancellation_test(CancelRequestTestPause {
+                            admitted,
+                            release: release_receive,
+                        })
+                        .await
+                });
+                tokio::task::spawn_blocking(move || admitted_receive.recv().unwrap())
+                    .await
+                    .unwrap();
+                task.abort();
+                let _ = task.await;
+                drop(release);
+                drop((place, http, user_ws));
+                let _ = supervisor.shutdown_bounded(normal_bounds()).await;
+                drop(directory);
+            }
             _ => panic!("unknown cancellation child case"),
         }
-        panic!("dropping an admitted place future returned instead of aborting the process");
+        panic!("dropping an admitted mutation future returned instead of aborting the process");
     }
 
     #[test]
-    fn admitted_prepare_and_finalize_future_cancellation_abort_the_process() {
+    fn admitted_place_and_cancel_future_cancellation_abort_the_process() {
         if let Ok(case) = std::env::var(CANCELLATION_CHILD_CASE) {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(3)
@@ -2080,11 +2504,11 @@ mod tests {
         }
 
         let executable = std::env::current_exe().unwrap();
-        for case in ["prepare", "finalize"] {
+        for case in ["prepare", "finalize", "cancel"] {
             let status = Command::new(&executable)
                 .arg("--exact")
                 .arg(
-                    "controlled_trial::authority::tests::admitted_prepare_and_finalize_future_cancellation_abort_the_process",
+                    "controlled_trial::authority::tests::admitted_place_and_cancel_future_cancellation_abort_the_process",
                 )
                 .arg("--nocapture")
                 .env(CANCELLATION_CHILD_CASE, case)
@@ -2096,6 +2520,20 @@ mod tests {
                 "{case} cancellation must abort rather than unwind or detach",
             );
         }
+    }
+
+    #[test]
+    fn cancel_task_mode_accepts_only_its_exact_durable_dispatch_class() {
+        assert!(CancelAuthorityMode::FreshPrimary.accepts(PmCancelDispatchClassV1::Primary));
+        assert!(!CancelAuthorityMode::RecoveryOnly.accepts(PmCancelDispatchClassV1::Primary));
+        assert!(
+            CancelAuthorityMode::RecoveryOnly
+                .accepts(PmCancelDispatchClassV1::Recovery { ordinal: 1 })
+        );
+        assert!(
+            !CancelAuthorityMode::FreshPrimary
+                .accepts(PmCancelDispatchClassV1::Recovery { ordinal: 1 })
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2123,7 +2561,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn fresh_authority_places_once_then_reads_binds_and_cancels_with_the_same_l2() {
+    async fn fresh_authority_places_once_then_reads_and_binds_with_the_same_l2() {
         let public_identity = derive_place_public_request_identity(
             reap_polymarket_auth::PmClobDomain::Standard,
             proxy_order(),
@@ -2167,7 +2605,7 @@ mod tests {
         let roles = fresh_owner(directory.path())
             .spawn(place_time_finalizer)
             .unwrap();
-        let (place, mut cancel, mut http, mut user_ws, mut supervisor) = roles.into_roles();
+        let (place, cancel, mut http, mut user_ws, mut supervisor) = roles.into_roles();
         let duplicate_place = place.duplicate_for_task_gate();
 
         let prepared_result = place.prepare_place_once(sealed_place(proxy_order())).await;
@@ -2272,39 +2710,7 @@ mod tests {
             .map(|frame| frame.events().len());
         let foreign_user_result = user_ws.bind_user_frame(foreign_user_frame).await;
 
-        let first_cancel = cancel
-            .authenticate_exact_owned_cancel(SealedExactOwnedCancelAuthentication::new(
-                order_id,
-                timestamp(),
-            ))
-            .await
-            .map(|cancel| {
-                let (request, authorized_timestamp) = cancel.into_parts();
-                let mut capture = MutationCapture::default();
-                request.dispatch(&mut capture).unwrap();
-                (capture, authorized_timestamp)
-            });
-        let second_cancel = cancel
-            .authenticate_exact_owned_cancel(SealedExactOwnedCancelAuthentication::new(
-                order_id,
-                timestamp(),
-            ))
-            .await;
-        let third_cancel = cancel
-            .authenticate_exact_owned_cancel(SealedExactOwnedCancelAuthentication::new(
-                order_id,
-                timestamp(),
-            ))
-            .await;
-        let fourth_cancel = cancel
-            .authenticate_exact_owned_cancel(SealedExactOwnedCancelAuthentication::new(
-                order_id,
-                timestamp(),
-            ))
-            .await;
-        drop(second_cancel);
-        drop(third_cancel);
-
+        drop(cancel);
         let shutdown = supervisor.shutdown_bounded(normal_bounds()).await;
         let staged_absent = all_staged_absent(directory.path());
 
@@ -2380,19 +2786,6 @@ mod tests {
         let subscription = String::from_utf8(subscription.0).unwrap();
         assert!(subscription.contains(API_KEY));
         assert!(subscription.contains(CONDITION));
-
-        let (cancel_capture, cancel_timestamp) = first_cancel.unwrap();
-        assert_eq!(cancel_timestamp.unix_seconds(), AUTH_SECONDS);
-        assert_eq!(cancel_capture.address, SIGNER);
-        assert_eq!(cancel_capture.api_key, API_KEY);
-        assert_eq!(
-            cancel_capture.body,
-            format!(r#"{{"orderID":"{order_id}"}}"#).as_bytes(),
-        );
-        assert_eq!(
-            fourth_cancel.unwrap_err(),
-            CredentialAuthorityError::CancelAuthenticationBudgetExhausted
-        );
 
         let shutdown = shutdown.unwrap();
         assert!(shutdown.shutdown_requested());
@@ -2473,34 +2866,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn recovery_authority_has_l2_cancel_and_read_roles_but_leaves_unowned_key_untouched() {
-        let order_id = FixedOrderId::from(
-            derive_place_public_request_identity(
-                reap_polymarket_auth::PmClobDomain::Standard,
-                proxy_order(),
-            )
-            .expected_order_id(),
-        );
+    async fn recovery_authority_has_cancel_and_read_roles_but_no_signer_or_key_custody() {
         let condition = PmConditionId::parse(CONDITION).unwrap();
         let directory = stage_four();
         let roles = recovery_owner(directory.path()).spawn().unwrap();
-        let (mut cancel, mut http, mut user_ws, supervisor) = roles.into_roles();
-        let cancel_result = cancel
-            .authenticate_exact_owned_cancel(SealedExactOwnedCancelAuthentication::new(
-                order_id,
-                timestamp(),
-            ))
-            .await;
+        let (cancel, mut http, mut user_ws, supervisor) = roles.into_roles();
         let read_result = capture_headers(http.authenticate_closed_only(timestamp()).await);
         let subscription_result = user_ws.user_subscription(condition).await;
-        drop((
-            cancel_result,
-            read_result,
-            subscription_result,
-            cancel,
-            http,
-            user_ws,
-        ));
+        drop((read_result, subscription_result, cancel, http, user_ws));
         let shutdown = supervisor.shutdown_bounded(normal_bounds()).await;
         let private_key_exists = directory.path().join("private-key").exists();
         let l2_absent = ["api-key", "l2-secret", "passphrase"]

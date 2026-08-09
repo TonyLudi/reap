@@ -1,7 +1,8 @@
 //! Off-actor `/time` workers for independent place and exact-cancel grants.
 
 use reap_polymarket_live_adapter::{
-    PmLiveAdapterError, PmMutationServerTimeHttpRole, PmPendingMutationServerTime,
+    PmCancelMutationTimeProof, PmCancelServerTimeHttpRole, PmLiveAdapterError,
+    PmPlaceMutationTimeProof, PmPlaceServerTimeHttpRole,
 };
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
@@ -10,23 +11,51 @@ use super::supervision::PmAbortableTask;
 
 const MUTATION_TIME_COMMAND_CAPACITY: usize = 1;
 
-enum PmMutationTimeCommand {
+enum PmMutationTimeCommand<P> {
     Fetch {
-        completion: oneshot::Sender<Result<PmPendingMutationServerTime, PmLiveAdapterError>>,
+        completion: oneshot::Sender<Result<P, PmLiveAdapterError>>,
     },
     Shutdown {
         acknowledgement: oneshot::Sender<()>,
     },
 }
 
-async fn run_time_worker(
-    role: PmMutationServerTimeHttpRole,
-    mut commands: mpsc::Receiver<PmMutationTimeCommand>,
-) -> Result<(), PmMutationTimeTaskError> {
+#[async_trait::async_trait]
+trait PmMutationTimeSource: Send + 'static {
+    type Proof: Send + 'static;
+
+    async fn fresh_time(&self) -> Result<Self::Proof, PmLiveAdapterError>;
+}
+
+#[async_trait::async_trait]
+impl PmMutationTimeSource for PmPlaceServerTimeHttpRole {
+    type Proof = PmPlaceMutationTimeProof;
+
+    async fn fresh_time(&self) -> Result<Self::Proof, PmLiveAdapterError> {
+        self.fresh_place_time().await
+    }
+}
+
+#[async_trait::async_trait]
+impl PmMutationTimeSource for PmCancelServerTimeHttpRole {
+    type Proof = PmCancelMutationTimeProof;
+
+    async fn fresh_time(&self) -> Result<Self::Proof, PmLiveAdapterError> {
+        self.fresh_cancel_time().await
+    }
+}
+
+async fn run_time_worker<R>(
+    role: R,
+    mut commands: mpsc::Receiver<PmMutationTimeCommand<R::Proof>>,
+) -> Result<(), PmMutationTimeTaskError>
+where
+    R: PmMutationTimeSource,
+{
     while let Some(command) = commands.recv().await {
         match command {
             PmMutationTimeCommand::Fetch { completion } => {
-                let _ = completion.send(role.fresh_mutation_server_time().await);
+                let _ = completion.send(role.fresh_time().await);
             }
             PmMutationTimeCommand::Shutdown { acknowledgement } => {
                 let _ = acknowledgement.send(());
@@ -37,14 +66,17 @@ async fn run_time_worker(
     Err(PmMutationTimeTaskError::CommandChannelClosed)
 }
 
-struct PmMutationTimeEndpoint {
-    sender: mpsc::Sender<PmMutationTimeCommand>,
-    pending: Option<oneshot::Receiver<Result<PmPendingMutationServerTime, PmLiveAdapterError>>>,
+struct PmMutationTimeEndpoint<P> {
+    sender: mpsc::Sender<PmMutationTimeCommand<P>>,
+    pending: Option<oneshot::Receiver<Result<P, PmLiveAdapterError>>>,
     task: Option<PmAbortableTask<Result<(), PmMutationTimeTaskError>>>,
 }
 
-impl PmMutationTimeEndpoint {
-    fn start(role: PmMutationServerTimeHttpRole) -> Self {
+impl<P: Send + 'static> PmMutationTimeEndpoint<P> {
+    fn start<R>(role: R) -> Self
+    where
+        R: PmMutationTimeSource<Proof = P>,
+    {
         let (sender, receiver) = mpsc::channel(MUTATION_TIME_COMMAND_CAPACITY);
         Self {
             sender,
@@ -70,7 +102,7 @@ impl PmMutationTimeEndpoint {
         Ok(())
     }
 
-    fn poll(&mut self) -> Result<PmMutationTimePoll, PmMutationTimeError> {
+    fn poll(&mut self) -> Result<PmMutationTimePoll<P>, PmMutationTimeError> {
         let Some(response) = self.pending.as_mut() else {
             return Ok(PmMutationTimePoll::NotRequested);
         };
@@ -150,14 +182,14 @@ impl PmMutationTimeEndpoint {
 }
 
 pub(super) struct PmMutationTimeSupervisor {
-    place: PmMutationTimeEndpoint,
-    cancel: PmMutationTimeEndpoint,
+    place: PmMutationTimeEndpoint<PmPlaceMutationTimeProof>,
+    cancel: PmMutationTimeEndpoint<PmCancelMutationTimeProof>,
 }
 
 impl PmMutationTimeSupervisor {
     pub(super) fn start(
-        place: PmMutationServerTimeHttpRole,
-        cancel: PmMutationServerTimeHttpRole,
+        place: PmPlaceServerTimeHttpRole,
+        cancel: PmCancelServerTimeHttpRole,
     ) -> Self {
         Self {
             place: PmMutationTimeEndpoint::start(place),
@@ -173,11 +205,15 @@ impl PmMutationTimeSupervisor {
         self.cancel.request()
     }
 
-    pub(super) fn poll_place(&mut self) -> Result<PmMutationTimePoll, PmMutationTimeError> {
+    pub(super) fn poll_place(
+        &mut self,
+    ) -> Result<PmMutationTimePoll<PmPlaceMutationTimeProof>, PmMutationTimeError> {
         self.place.poll()
     }
 
-    pub(super) fn poll_cancel(&mut self) -> Result<PmMutationTimePoll, PmMutationTimeError> {
+    pub(super) fn poll_cancel(
+        &mut self,
+    ) -> Result<PmMutationTimePoll<PmCancelMutationTimeProof>, PmMutationTimeError> {
         self.cancel.poll()
     }
 
@@ -201,10 +237,10 @@ impl PmMutationTimeSupervisor {
     }
 }
 
-pub(super) enum PmMutationTimePoll {
+pub(super) enum PmMutationTimePoll<P> {
     NotRequested,
     Pending,
-    Ready(PmPendingMutationServerTime),
+    Ready(P),
 }
 
 #[derive(Debug, Error)]

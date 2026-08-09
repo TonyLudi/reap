@@ -31,6 +31,7 @@ fn crate_has_no_transport_auth_secret_or_mutation_dependency() {
         source("journal.rs"),
         source("live_dispatch.rs"),
         source("recovery.rs"),
+        source("recovery_continuation.rs"),
         source("schema.rs"),
         source("protected.rs"),
     ]
@@ -166,6 +167,68 @@ fn positive_result_and_cancel_custody_cannot_collapse_into_legacy_v1_types() {
 }
 
 #[test]
+fn production_cancel_authority_is_one_epoch_bound_nonserde_custody_chain() {
+    let journal = source("journal.rs");
+    let schema = source("schema.rs");
+    let lib = source("lib.rs");
+    for owner in [
+        "PmPhaseAPlaceLiveResultCustodyV1",
+        "PmPhaseAPlaceLiveOutcomeCustodyV1",
+        "PmPhaseALiveReconciliationCustodyV1",
+        "PmPhaseALiveCancelIntentCustodyV1",
+        "PmPhaseALiveCancelPreparedCustodyV1",
+        "PmPhaseALiveCancelDispatchOwnerV1",
+        "PmRevalidatedPhaseALiveCancelDispatchOwnerV1",
+        "PmPhaseALiveCancelNetworkDispatchOwnerV1",
+        "PmPhaseALiveCancelMayHaveBeenDispatchedV1",
+        "PmPhaseALiveCancelDefinitelyNotDispatchedV1",
+        "PmPhaseALiveCancelResultCustodyV1",
+        "PmPhaseALiveCancelOutcomeCustodyV1",
+    ] {
+        assert!(journal.contains(&format!("pub struct {owner}")));
+        assert!(lib.contains(owner));
+        assert!(!journal.contains(&format!("impl Clone for {owner}")));
+        assert!(!journal.contains(&format!("impl Serialize for {owner}")));
+        assert!(!journal.contains(&format!("impl Deserialize for {owner}")));
+    }
+    assert!(journal.contains("enum PmPhaseALiveCustodyEpochV1"));
+    assert!(journal.contains("phase_a_live_cancel_epoch"));
+    assert!(journal.contains("transition_phase_a_live_custody_to_cancel_epoch"));
+    assert!(journal.contains("revalidate_phase_a_live_cancel_for_runner"));
+    assert!(journal.contains("revalidate_phase_a_live_cancel_for_network_dispatch"));
+    assert!(journal.contains("journals: &'journal mut PmControlledTrialLiveJournals"));
+    assert!(journal.contains("record_phase_a_live_cancel_definitely_not_dispatched"));
+    assert!(schema.contains("DefinitelyNotDispatched"));
+    assert!(!journal.contains("fn into_parts"));
+    assert!(!journal.contains(
+        "revalidate_phase_a_live_cancel_for_runner(\n        &mut self,\n        owner: PmDurablePhaseALiveCancelDispatchAckV1"
+    ));
+}
+
+#[test]
+fn production_recovery_cancel_requires_distinct_current_runtime_bound_wrapper() {
+    let journal = source("journal.rs");
+    let lib = source("lib.rs");
+    assert!(journal.contains("pub struct PmControlledTrialLiveCancelRecoveryJournals"));
+    assert!(lib.contains("PmControlledTrialLiveCancelRecoveryJournals"));
+    assert!(journal.contains("pub fn open_phase_a_live_cancel("));
+    assert!(journal.contains("current_runtime: &AuthorizationRuntimeBinding"));
+    assert!(journal.contains("current_utc > cleanup_not_after_utc"));
+    assert!(journal.contains("current_runtime.host != authorization_value.host"));
+    assert!(journal.contains("reopen_consumed_authorization_consumption"));
+    assert!(journal.contains("barrier: Option<PmPhaseAPlaceDispatchBarrierWitnessV1>"));
+    let evidence_impl = journal
+        .split_once("impl PmControlledTrialLiveRecoveryJournals {")
+        .expect("evidence recovery impl")
+        .1
+        .split_once("impl PmControlledTrialLiveCancelRecoveryJournals {")
+        .expect("distinct live recovery impl")
+        .0;
+    assert!(!evidence_impl.contains("record_phase_a_live_reconciliation_with_custody"));
+    assert!(!evidence_impl.contains("revalidate_phase_a_live_cancel_for_runner"));
+}
+
+#[test]
 fn recovery_owner_has_no_place_retry_or_place_ack_reconstruction_surface() {
     let journal = source("journal.rs");
     let recovery = journal
@@ -216,4 +279,111 @@ fn only_journal_safe_semantic_commitments_can_be_persisted() {
     assert!(schema.contains("PREPARED_REQUEST_FINGERPRINT_DOMAIN"));
     assert!(!schema.contains("runtime_exact_body"));
     assert!(!schema.contains("body_commitment"));
+}
+
+#[test]
+fn recovery_continuation_is_closed_cancel_only_false_false_zero_evidence() {
+    let continuation = source("recovery_continuation.rs");
+    let recovery = source("recovery.rs");
+    let journal = source("journal.rs");
+    let lib = source("lib.rs");
+
+    let intent_records = continuation
+        .split_once("enum ContinuationIntentRecordV1")
+        .expect("continuation intent records")
+        .1
+        .split_once("enum ContinuationDispatchRecordV1")
+        .expect("continuation dispatch records")
+        .0;
+    let dispatch_records = continuation
+        .split_once("enum ContinuationDispatchRecordV1")
+        .expect("continuation dispatch records")
+        .1
+        .split_once("struct ContinuationIntentLineV1")
+        .expect("continuation lines")
+        .0;
+    assert!(!intent_records.contains("Place"));
+    assert!(!dispatch_records.contains("Place"));
+    assert!(!continuation.contains("pub(crate) fn record_place"));
+    assert!(continuation.contains("production_order_entry_authorized: false"));
+    assert!(continuation.contains("real_order_submission_authorized: false"));
+    assert!(continuation.contains("place_dispatch_allowance: 0"));
+    assert!(continuation.contains("placement_resumption_allowed: false"));
+    assert!(continuation.contains("self.intent.file.validate_exact_bytes"));
+    assert!(continuation.contains("validate_exact_bytes(&self.dispatch.bytes)"));
+    assert!(journal.contains("revalidate_held_consumption_evidence"));
+    assert!(journal.contains("validate_phase_a_live_journal_files"));
+    assert!(journal.contains("complete_pending_terminal"));
+    assert!(journal.contains("resume_phase_a_live_cancel_outcome_with_custody"));
+    assert!(continuation.contains("validate_consumption_registry"));
+    assert!(continuation.contains("validate_fully_anchored_against_consumption_registry"));
+    assert!(journal.contains("complete_consumption_registry"));
+    assert!(continuation.contains("record_cancel_prepared_ledger_first"));
+    assert!(continuation.contains("continuation_prepared_record_canonical_json"));
+    assert!(continuation.contains("complete_one_anchored_prepared"));
+    assert!(continuation.contains("complete_anchored_terminal_plan"));
+    assert!(continuation.contains("reconstruct_terminal_plan_lines"));
+    assert!(continuation.contains("ContinuationTerminalPlanPhysicalStateV1::MissingBoth"));
+    assert!(continuation.contains("ContinuationTerminalPlanPhysicalStateV1::DispatchOnly"));
+    assert!(continuation.contains("ContinuationTerminalPlanPhysicalStateV1::Complete"));
+    assert!(!continuation.contains("for prepared in self.prepared_anchor_evidence()?"));
+    let ledger_first = continuation
+        .split_once("pub(crate) fn record_cancel_prepared_ledger_first")
+        .expect("ledger-first recovery preparation writer")
+        .1
+        .split_once("pub(crate) fn record_cancel_dispatch_authorized")
+        .expect("bounded recovery preparation writer")
+        .0;
+    assert!(
+        ledger_first
+            .find(".anchor_recovery_cancel_prepared(")
+            .expect("monotonic ordinal anchor")
+            < ledger_first
+                .find(".complete_one_anchored_prepared(&registry)")
+                .expect("source-owned exact pair completion")
+    );
+    let terminal_ledger_first = continuation
+        .split_once("pub(crate) fn record_terminal(")
+        .expect("ledger-first recovery Terminal writer")
+        .1
+        .split_once("pub(crate) fn has_complete_anchored_terminal_plan")
+        .expect("bounded recovery Terminal writer")
+        .0;
+    assert!(
+        terminal_ledger_first
+            .find(".anchor_recovery_terminal_plan(")
+            .expect("monotonic Terminal plan anchor")
+            < terminal_ledger_first
+                .find(".complete_anchored_terminal_plan(&registry)")
+                .expect("source-owned exact Terminal completion")
+    );
+    assert!(journal.contains("continuation.complete_consumption_registry"));
+    assert!(recovery.contains("is_completed_recovery_continuation_terminal"));
+    assert!(journal.contains("allow_completed_recovery_continuation_terminal"));
+    assert!(journal.contains("Self::open_inner(config, authorization, projection, false)"));
+
+    for action in [
+        "ReconcileCurrentExposure",
+        "ResumeCancelOutcome",
+        "RecordTerminal",
+        "CompletePendingTerminal",
+        "TerminalEvidenceOnly",
+    ] {
+        assert!(recovery.contains(action));
+    }
+    assert!(lib.contains("PmPhaseALiveCancelRecoveryRequiredActionV1"));
+    assert!(recovery.contains("phase_a_live_cancel_recovery_required_action"));
+}
+
+#[test]
+fn prepared_supersession_requires_the_latest_exact_live_ownership_event() {
+    let journal = source("journal.rs");
+    let recovery = source("recovery.rs");
+    assert!(journal.contains("validate_cancel_prepared_supersession"));
+    assert!(journal.contains("ownership_source.sequence.checked_add(1)"));
+    assert!(journal.contains("reconciled_target.sequence != preserved_exposure.sequence"));
+    assert!(recovery.contains("latest_cancel_ownership_source.as_ref() != Some(ownership_source)"));
+    assert!(recovery.contains("ownership_source.sequence.checked_add(1)"));
+    assert!(recovery.contains("DispatchStage::CancelPrepared"));
+    assert!(recovery.contains("reconciled_target != preserved_exposure"));
 }

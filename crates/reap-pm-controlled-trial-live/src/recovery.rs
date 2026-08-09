@@ -2,8 +2,9 @@ use std::{collections::HashSet, fs, io, path::Path};
 
 use reap_pm_controlled_trial::{
     AuthorizationConsumptionEvidence, AuthorizationConsumptionState,
-    AuthorizationConsumptionVerification, AuthorizationRuntimeBinding, CanonicalAuthorization,
-    CanonicalTrialConfig, OfflineAuthorizationState, verify_authorization_consumption,
+    AuthorizationConsumptionVerification, AuthorizationRecoveryContinuationRegistryV1,
+    AuthorizationRuntimeBinding, CanonicalAuthorization, CanonicalTrialConfig,
+    OfflineAuthorizationState, verify_authorization_consumption,
 };
 
 use crate::{
@@ -15,13 +16,17 @@ use crate::{
         validate_recovered_phase_a_live_dispatch_barrier,
     },
     protected::read_protected,
+    recovery_continuation::{
+        PmRecoveryContinuationLoadV1, PmRecoveryContinuationProjectionV1,
+        any_file_present as continuation_file_present, load_optional as load_recovery_continuation,
+    },
     schema::{
         CounterpartLinkV1, DispatchLineV1, DispatchRecordV1, IntentLineV1, IntentRecordV1,
         MAX_JOURNAL_BYTES, MAX_JOURNAL_LINE_BYTES, MAX_JOURNAL_RECORDS,
         PM_TRIAL_LIVE_JOURNAL_VERSION, PmCancelDispatchClassV1, PmCancelResultKindV1,
-        PmPlaceResultKindV1, PmReconciliationOrderStateV1, PmTrialLiveJournalScopeV1,
-        PmTrialLivePreflightBindingV1, dispatch_fingerprint, intent_fingerprint, validate_order_id,
-        validate_utc,
+        PmPlaceResultKindV1, PmReconciliationOrderStateV1, PmTrialLiveConsumedFingerprintsV1,
+        PmTrialLiveJournalScopeV1, PmTrialLivePreflightBindingV1, dispatch_fingerprint,
+        intent_fingerprint, validate_order_id, validate_utc,
     },
 };
 
@@ -44,6 +49,20 @@ pub enum PmTrialLiveRecoveryClassificationV1 {
     TerminalEvidenceOnly,
 }
 
+/// Closed orchestration hint derived only by the recovery verifier for the
+/// separate recovery-continuation family. It is evidence, not authority, and
+/// no mutation API accepts a caller-constructed value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmPhaseALiveCancelRecoveryRequiredActionV1 {
+    ReconcileCurrentExposure,
+    ResumeCancelOutcome,
+    RecordTerminal,
+    /// The recovery constructor must source-complete the exact ledger-anchored
+    /// Terminal plan before it may expose any custody or later action.
+    CompletePendingTerminal,
+    TerminalEvidenceOnly,
+}
+
 /// Move-only, secret-free projection of two exact V1 journal snapshots, the
 /// optional separate positive Phase-A barrier, and the bound take-once
 /// consumption state. It is evidence, never a place retry permit.
@@ -58,12 +77,86 @@ pub struct PmTrialLiveRecoveryProjectionV1 {
     pub(crate) phase_a_live_dispatch_barrier_fingerprint: Option<String>,
     pub(crate) consumption: ConsumptionSnapshot,
     pub(crate) reconciliation_target: CounterpartLinkV1,
+    pub(crate) recovery_continuation_basis: Option<PmPhaseALiveRecoveryContinuationBasisV1>,
+    pub(crate) recovery_continuation: Option<PmRecoveryContinuationLoadV1>,
+    pub(crate) phase_a_live_cancel_recovery_required_action:
+        Option<PmPhaseALiveCancelRecoveryRequiredActionV1>,
+}
+
+/// Private verifier-minted basis for the separate recovery-continuation
+/// family. No caller can manufacture this from scalar terminal evidence.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct PmPhaseALiveRecoveryContinuationBasisV1 {
+    original_intent_tail: CounterpartLinkV1,
+    original_dispatch_terminal: CounterpartLinkV1,
+    original_terminal_state: PmPhaseALiveOriginalTerminalStateV1,
+    preserved_exposure: CounterpartLinkV1,
+    exact_venue_order_id: String,
+    minimum_cancel_l2_timestamp_seconds: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PmPhaseALiveOriginalTerminalStateV1 {
+    Paired,
+    DispatchTerminalOnly,
+}
+
+impl PmPhaseALiveRecoveryContinuationBasisV1 {
+    pub(crate) const fn original_intent_tail(&self) -> &CounterpartLinkV1 {
+        &self.original_intent_tail
+    }
+
+    pub(crate) const fn original_dispatch_terminal(&self) -> &CounterpartLinkV1 {
+        &self.original_dispatch_terminal
+    }
+
+    pub(crate) const fn original_terminal_state(&self) -> PmPhaseALiveOriginalTerminalStateV1 {
+        self.original_terminal_state
+    }
+
+    pub(crate) const fn preserved_exposure(&self) -> &CounterpartLinkV1 {
+        &self.preserved_exposure
+    }
+
+    pub(crate) fn exact_venue_order_id(&self) -> &str {
+        &self.exact_venue_order_id
+    }
+
+    pub(crate) const fn minimum_cancel_l2_timestamp_seconds(&self) -> u64 {
+        self.minimum_cancel_l2_timestamp_seconds
+    }
 }
 
 impl PmTrialLiveRecoveryProjectionV1 {
+    pub(crate) fn is_completed_recovery_continuation_terminal(&self) -> bool {
+        matches!(
+            self.classification,
+            PmTrialLiveRecoveryClassificationV1::TerminalEvidenceOnly
+        ) && self.recovery_continuation_basis.is_some()
+            && self.phase_a_live_dispatch_barrier_fingerprint.is_none()
+            && self.phase_a_live_cancel_recovery_required_action
+                == Some(PmPhaseALiveCancelRecoveryRequiredActionV1::TerminalEvidenceOnly)
+            && self
+                .recovery_continuation
+                .as_ref()
+                .and_then(PmRecoveryContinuationLoadV1::complete)
+                .is_some_and(|continuation| continuation.terminal)
+            && self
+                .consumption
+                .recovery_continuation_registry()
+                .is_some_and(|registry| registry.terminal_plan.is_some())
+    }
+
     #[must_use]
     pub const fn classification(&self) -> &PmTrialLiveRecoveryClassificationV1 {
         &self.classification
+    }
+
+    #[must_use]
+    pub const fn phase_a_live_cancel_recovery_required_action(
+        &self,
+    ) -> Option<&PmPhaseALiveCancelRecoveryRequiredActionV1> {
+        self.phase_a_live_cancel_recovery_required_action.as_ref()
     }
 
     #[must_use]
@@ -133,6 +226,10 @@ impl std::fmt::Debug for PmTrialLiveRecoveryProjectionV1 {
         formatter
             .debug_struct("PmTrialLiveRecoveryProjectionV1")
             .field("classification", &self.classification)
+            .field(
+                "phase_a_live_cancel_recovery_required_action",
+                &self.phase_a_live_cancel_recovery_required_action,
+            )
             .field("scope_fingerprint", &self.scope.scope_fingerprint)
             .field("intent_record_count", &self.intent_lines.len())
             .field("dispatch_record_count", &self.dispatch_lines.len())
@@ -162,14 +259,60 @@ pub(crate) enum ConsumptionSnapshot {
         consumed_record_fingerprint: Option<String>,
         ledger_record_count: u8,
         latest_record_fingerprint: String,
+        recovery_continuation_registry: Option<Box<AuthorizationRecoveryContinuationRegistryV1>>,
     },
+}
+
+impl ConsumptionSnapshot {
+    pub(crate) fn consumed_fingerprints(
+        &self,
+    ) -> Result<PmTrialLiveConsumedFingerprintsV1, PmTrialLiveJournalError> {
+        let Self::Burned {
+            binding_fingerprint,
+            prepared_record_fingerprint,
+            atomic_claim_fingerprint,
+            consumed_record_fingerprint: Some(consumed_record_fingerprint),
+            ledger_record_count,
+            ..
+        } = self
+        else {
+            return Err(PmTrialLiveJournalError::InvalidRecord);
+        };
+        if *ledger_record_count < 2 {
+            return Err(PmTrialLiveJournalError::InvalidRecord);
+        }
+        let value = PmTrialLiveConsumedFingerprintsV1 {
+            binding_fingerprint: binding_fingerprint.clone(),
+            prepared_record_fingerprint: prepared_record_fingerprint.clone(),
+            atomic_claim_fingerprint: atomic_claim_fingerprint.clone(),
+            consumed_record_fingerprint: consumed_record_fingerprint.clone(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub(crate) fn recovery_continuation_registry(
+        &self,
+    ) -> Option<&AuthorizationRecoveryContinuationRegistryV1> {
+        match self {
+            Self::Burned {
+                recovery_continuation_registry,
+                ..
+            } => recovery_continuation_registry.as_deref(),
+            Self::Absent | Self::Prepared { .. } => None,
+        }
+    }
 }
 
 pub fn verify_controlled_trial_live_recovery(
     config: &CanonicalTrialConfig,
     authorization: &CanonicalAuthorization,
 ) -> Result<PmTrialLiveRecoveryProjectionV1, PmTrialLiveJournalError> {
-    let live_dispatch_barrier = load_phase_a_live_dispatch_barrier(config)?;
+    // A missing, truncated, or otherwise unusable positive barrier revokes
+    // all positive-place/DND trust, but it must not suppress recovery-only
+    // exact cancellation rooted in the burned claim and ledger. Treat it as
+    // absent evidence and classify the durable V1 dispatch conservatively.
+    let live_dispatch_barrier = load_phase_a_live_dispatch_barrier(config).ok().flatten();
     let (intent_path, dispatch_path) = bound_paths(config);
     let intent_bytes = read_protected(&intent_path, MAX_JOURNAL_BYTES)?;
     let intent_lines = parse_intent(&intent_bytes)?;
@@ -209,45 +352,140 @@ pub fn verify_controlled_trial_live_recovery(
     let consumption = load_consumption(config, authorization)?;
     validate_consumption_scope(&scope, &consumption)?;
     let facts = validate_records(&scope, &intent_lines, &dispatch_lines, &consumption)?;
-    let phase_a_live_dispatch_barrier_fingerprint = live_dispatch_barrier
-        .as_ref()
-        .map(|record| {
+    let phase_a_live_dispatch_barrier_fingerprint =
+        live_dispatch_barrier.as_ref().and_then(|record| {
             validate_recovered_phase_a_live_dispatch_barrier(
                 record,
                 config,
                 authorization,
                 &scope,
+                facts.preflight.as_ref()?,
+                &dispatch_lines,
+            )
+            .is_ok()
+            .then(|| live_dispatch_barrier_fingerprint(record).to_owned())
+        });
+    let terminal_continuation_candidate = if facts.place_dispatch.is_some()
+        && facts.dispatch_terminal
+        && matches!(
+            facts.place_result,
+            Some((PmPlaceResultKindV1::DefinitelyNotDispatched, None))
+        )
+        && facts.latest_cancel_dispatch.is_none()
+    {
+        let exact_venue_order_id = format!("0x{}", scope.expected_order_id);
+        validate_order_id(&exact_venue_order_id)?;
+        Some(PmPhaseALiveRecoveryContinuationBasisV1 {
+            original_intent_tail: intent_link(
+                intent_lines
+                    .last()
+                    .ok_or(PmTrialLiveJournalError::InvalidRecord)?,
+            )?,
+            original_dispatch_terminal: dispatch_link(
+                dispatch_lines
+                    .last()
+                    .ok_or(PmTrialLiveJournalError::InvalidRecord)?,
+            )?,
+            original_terminal_state: if facts.terminal_paired {
+                PmPhaseALiveOriginalTerminalStateV1::Paired
+            } else {
+                PmPhaseALiveOriginalTerminalStateV1::DispatchTerminalOnly
+            },
+            preserved_exposure: facts
+                .place_dispatch
+                .clone()
+                .ok_or(PmTrialLiveJournalError::InvalidRecord)?,
+            exact_venue_order_id,
+            minimum_cancel_l2_timestamp_seconds: latest_preparation_l2(
+                &dispatch_lines,
+                dispatch_lines.len(),
+            )?,
+        })
+    } else {
+        None
+    };
+    if terminal_continuation_candidate.is_none()
+        && (continuation_file_present(config)?
+            || consumption.recovery_continuation_registry().is_some())
+    {
+        return Err(PmTrialLiveJournalError::InvalidRecord);
+    }
+    let recovery_continuation = terminal_continuation_candidate
+        .as_ref()
+        .map(|basis| {
+            load_recovery_continuation(
+                config,
+                authorization,
+                &scope,
+                basis,
+                &consumption.consumed_fingerprints()?,
                 facts
                     .preflight
                     .as_ref()
                     .ok_or(PmTrialLiveJournalError::InvalidRecord)?,
-                &dispatch_lines,
-            )?;
-            Ok(live_dispatch_barrier_fingerprint(record).to_owned())
+            )
         })
         .transpose()?;
-    if matches!(
-        facts.place_result,
-        Some((PmPlaceResultKindV1::DefinitelyNotDispatched, None))
-    ) && phase_a_live_dispatch_barrier_fingerprint.is_none()
-    {
-        return Err(PmTrialLiveJournalError::InvalidRecord);
+    match recovery_continuation.as_ref() {
+        Some(PmRecoveryContinuationLoadV1::Complete(continuation)) => continuation
+            .validate_against_consumption_registry(consumption.recovery_continuation_registry())?,
+        Some(_) if consumption.recovery_continuation_registry().is_some() => {
+            return Err(PmTrialLiveJournalError::InvalidRecord);
+        }
+        None if consumption.recovery_continuation_registry().is_some() => {
+            return Err(PmTrialLiveJournalError::InvalidRecord);
+        }
+        Some(_) | None => {}
     }
-    if facts.place_dispatch.is_some()
-        && facts.dispatch_terminal
-        && !phase_a_live_terminal_is_safe(&facts)
+    let continuation_attempt_durable = recovery_continuation
+        .as_ref()
+        .is_some_and(PmRecoveryContinuationLoadV1::is_durable_attempt);
+    let terminal_is_safe =
+        phase_a_live_terminal_is_safe(&facts, phase_a_live_dispatch_barrier_fingerprint.is_some());
+    let recovery_continuation_basis = if continuation_attempt_durable
+        || (facts.dispatch_terminal
+            && !terminal_is_safe
+            && phase_a_live_dispatch_barrier_fingerprint.is_none()
+            && terminal_continuation_candidate.is_some())
     {
-        // Barrier absence cannot distinguish legacy/pre-barrier evidence from
-        // unlink after a possible send. Old writers or hand-authored tails
-        // must never turn unresolved dispatch evidence into
-        // TerminalEvidenceOnly and suppress cleanup.
-        return Err(PmTrialLiveJournalError::InvalidRecord);
-    }
-    let classification = classify(
-        &facts,
-        &consumption,
-        phase_a_live_dispatch_barrier_fingerprint.is_some(),
-    );
+        terminal_continuation_candidate
+    } else {
+        if facts.place_dispatch.is_some() && facts.dispatch_terminal && !terminal_is_safe {
+            return Err(PmTrialLiveJournalError::InvalidRecord);
+        }
+        None
+    };
+    // Once the continuation pair exists, restoring a formerly unusable
+    // positive barrier cannot revive the immutable V1 DND terminal.
+    let phase_a_live_dispatch_barrier_fingerprint = (!continuation_attempt_durable)
+        .then_some(phase_a_live_dispatch_barrier_fingerprint)
+        .flatten();
+    let classification = if let Some(continuation) = recovery_continuation
+        .as_ref()
+        .and_then(PmRecoveryContinuationLoadV1::complete)
+    {
+        classify_recovery_continuation(continuation)
+    } else if let Some(basis) = &recovery_continuation_basis {
+        PmTrialLiveRecoveryClassificationV1::ReconcileBeforeRecoveryCancel {
+            exact_venue_order_id: Some(basis.exact_venue_order_id.clone()),
+        }
+    } else {
+        classify(
+            &facts,
+            &consumption,
+            phase_a_live_dispatch_barrier_fingerprint.is_some(),
+        )
+    };
+    let reconciliation_target = recovery_continuation_basis
+        .as_ref()
+        .map(|basis| basis.preserved_exposure.clone())
+        .unwrap_or(facts.reconciliation_target);
+    let phase_a_live_cancel_recovery_required_action = recovery_continuation_basis
+        .as_ref()
+        .and(recovery_continuation.as_ref())
+        .map(|continuation| {
+            required_continuation_action(continuation, consumption.recovery_continuation_registry())
+        });
     Ok(PmTrialLiveRecoveryProjectionV1 {
         classification,
         scope,
@@ -258,7 +496,10 @@ pub fn verify_controlled_trial_live_recovery(
         dispatch_lines,
         phase_a_live_dispatch_barrier_fingerprint,
         consumption,
-        reconciliation_target: facts.reconciliation_target,
+        reconciliation_target,
+        recovery_continuation_basis,
+        recovery_continuation,
+        phase_a_live_cancel_recovery_required_action,
     })
 }
 
@@ -322,6 +563,9 @@ fn verify_intent_header_without_dispatch_records(
             sequence: 0,
             record_fingerprint: ZERO_FINGERPRINT.to_owned(),
         },
+        recovery_continuation_basis: None,
+        recovery_continuation: None,
+        phase_a_live_cancel_recovery_required_action: None,
     })
 }
 
@@ -439,7 +683,7 @@ pub(crate) fn load_consumption(
     let records: Vec<AuthorizationConsumptionEvidence> = parse_lines(&bytes, |line| {
         serde_json::from_slice(line).map_err(|_| PmTrialLiveJournalError::InvalidRecord)
     })?;
-    if records.is_empty() || records.len() > 3 {
+    if records.is_empty() {
         return Err(PmTrialLiveJournalError::InvalidRecord);
     }
     let prepared = &records[0];
@@ -498,6 +742,7 @@ pub(crate) fn load_consumption(
         consumed_record_fingerprint,
         ledger_record_count: verification.ledger_record_count,
         latest_record_fingerprint: verification.latest_record_fingerprint,
+        recovery_continuation_registry: verification.recovery_continuation_registry.map(Box::new),
     })
 }
 
@@ -518,6 +763,10 @@ pub(crate) fn revalidate_projection(
             != expected.phase_a_live_dispatch_barrier_fingerprint
         || current.consumption != expected.consumption
         || current.reconciliation_target != expected.reconciliation_target
+        || current.recovery_continuation_basis != expected.recovery_continuation_basis
+        || current.recovery_continuation != expected.recovery_continuation
+        || current.phase_a_live_cancel_recovery_required_action
+            != expected.phase_a_live_cancel_recovery_required_action
     {
         return Err(PmTrialLiveJournalError::AmbiguousTail);
     }
@@ -537,7 +786,6 @@ fn validate_consumption_verification(
 ) -> Result<(), PmTrialLiveJournalError> {
     if verification.schema_version != 1
         || verification.ledger_record_count == 0
-        || verification.ledger_record_count > 3
         || verification.ambiguous_tail
         || !verification.exact_bindings_structurally_valid
         || verification.authorization != OfflineAuthorizationState::DENIED
@@ -586,6 +834,7 @@ struct JournalFacts {
     latest_cancel_result: Option<PmCancelResultKindV1>,
     latest_reconciliation: Option<(PmReconciliationOrderStateV1, Option<String>, u8)>,
     dispatch_terminal: bool,
+    terminal_paired: bool,
     reconciliation_target: CounterpartLinkV1,
 }
 
@@ -603,6 +852,7 @@ fn validate_records(
     let mut cancel_ownership_sources = HashSet::new();
     let mut latest_cross_dispatch_sequence = 0_u8;
     let mut latest_reconciliation = None;
+    let mut latest_cancel_ownership_source = None;
     let mut intent_terminal = None;
 
     for (index, line) in intent.iter().enumerate().skip(1) {
@@ -647,6 +897,9 @@ fn validate_records(
                 {
                     return Err(PmTrialLiveJournalError::InvalidRecord);
                 }
+                if *outcome == PmPlaceResultKindV1::Accepted {
+                    latest_cancel_ownership_source = Some(intent_link(line)?);
+                }
             }
             IntentRecordV1::CancelIntent {
                 created_at_utc,
@@ -656,6 +909,11 @@ fn validate_records(
             } => {
                 validate_utc(created_at_utc)?;
                 validate_order_id(exact_venue_order_id)?;
+                if latest_cancel_ownership_source.as_ref() != Some(ownership_source)
+                    || ownership_source.sequence.checked_add(1) != Some(line.sequence)
+                {
+                    return Err(PmTrialLiveJournalError::InvalidRecord);
+                }
                 let source = intent_body_before(ownership_source, intent, line.sequence)?;
                 let source_order_id = match source {
                     IntentRecordV1::PlaceOutcomeBridge {
@@ -729,6 +987,7 @@ fn validate_records(
                 }
                 latest_reconciliation =
                     Some((*state, exact_venue_order_id.clone(), target.sequence));
+                latest_cancel_ownership_source = Some(intent_link(line)?);
             }
             IntentRecordV1::Terminal {
                 terminal_at_utc,
@@ -889,12 +1148,14 @@ fn validate_records(
                     stage,
                     DispatchStage::PlaceDispatch
                         | DispatchStage::PlaceResult
+                        | DispatchStage::CancelPrepared
                         | DispatchStage::CancelDispatch
                         | DispatchStage::CancelResult
                 ) {
                     return Err(PmTrialLiveJournalError::InvalidRecord);
                 }
                 let IntentRecordV1::CancelIntent {
+                    ownership_source,
                     exact_venue_order_id,
                     dispatch_class: intent_class,
                     ..
@@ -906,6 +1167,38 @@ fn validate_records(
                     || exact_venue_order_id != preparation.exact_venue_order_id()
                 {
                     return Err(PmTrialLiveJournalError::InvalidRecord);
+                }
+                if stage == DispatchStage::CancelPrepared {
+                    let previous = dispatch
+                        .get(index.saturating_sub(1))
+                        .ok_or(PmTrialLiveJournalError::InvalidRecord)?;
+                    let DispatchRecordV1::CancelPrepared {
+                        intent: previous_intent,
+                        preparation: previous_preparation,
+                        ..
+                    } = &previous.body
+                    else {
+                        return Err(PmTrialLiveJournalError::InvalidRecord);
+                    };
+                    let IntentRecordV1::Reconciliation {
+                        state: PmReconciliationOrderStateV1::ExactLive,
+                        exact_venue_order_id: Some(reconciled_id),
+                        dispatch: reconciled_target,
+                        ..
+                    } = intent_body(ownership_source, intent)?
+                    else {
+                        return Err(PmTrialLiveJournalError::InvalidRecord);
+                    };
+                    let preserved_exposure = reconciliation_target
+                        .as_ref()
+                        .ok_or(PmTrialLiveJournalError::InvalidRecord)?;
+                    if ownership_source.sequence <= previous_intent.sequence
+                        || reconciled_target != preserved_exposure
+                        || reconciled_id != exact_venue_order_id
+                        || previous_preparation.exact_venue_order_id() != exact_venue_order_id
+                    {
+                        return Err(PmTrialLiveJournalError::InvalidRecord);
+                    }
                 }
                 validate_cancel_ordinal(
                     scope,
@@ -1031,6 +1324,7 @@ fn validate_records(
             .map(dispatch_link)
             .transpose()?;
     }
+    let terminal_paired = intent_terminal.is_some();
     if let Some(intent_terminal_link) = intent_terminal {
         if !dispatch_terminal
             || dispatch.last().map(|line| line.sequence) != Some(intent_terminal_link.sequence)
@@ -1066,6 +1360,7 @@ fn validate_records(
         latest_cancel_result,
         latest_reconciliation,
         dispatch_terminal,
+        terminal_paired,
         reconciliation_target,
     })
 }
@@ -1172,6 +1467,12 @@ fn classify(
         facts.place_result,
         Some((PmPlaceResultKindV1::DefinitelyNotDispatched, None))
     ) {
+        if !phase_a_live_dispatch_barrier_durable {
+            // Barrier loss makes the privileged DND result indistinguishable
+            // from untrusted legacy/hand-authored evidence. Never suppress
+            // reconciliation or cleanup on that basis.
+            return PmTrialLiveRecoveryClassificationV1::PlaceMayHaveBeenSentNoResend;
+        }
         // The positive grant was consumed by the terminal pre-send path. The
         // authorization stays burned and placement can never resume.
         return PmTrialLiveRecoveryClassificationV1::AuthorizationBurnedNoPlace;
@@ -1209,11 +1510,78 @@ fn classify(
     PmTrialLiveRecoveryClassificationV1::PlaceMayHaveBeenSentNoResend
 }
 
-fn phase_a_live_terminal_is_safe(facts: &JournalFacts) -> bool {
-    if matches!(
-        facts.place_result,
-        Some((PmPlaceResultKindV1::DefinitelyNotDispatched, None))
-    ) {
+fn classify_recovery_continuation(
+    continuation: &PmRecoveryContinuationProjectionV1,
+) -> PmTrialLiveRecoveryClassificationV1 {
+    if continuation.terminal {
+        return PmTrialLiveRecoveryClassificationV1::TerminalEvidenceOnly;
+    }
+    if let Some((state, order_id)) = &continuation.latest_reconciliation {
+        return match (state, order_id) {
+            (PmReconciliationOrderStateV1::ExactLive, Some(exact_venue_order_id)) => {
+                PmTrialLiveRecoveryClassificationV1::RecoveryCancelOnly {
+                    exact_venue_order_id: exact_venue_order_id.clone(),
+                }
+            }
+            (PmReconciliationOrderStateV1::Ambiguous, _) => {
+                PmTrialLiveRecoveryClassificationV1::ReconcileBeforeRecoveryCancel {
+                    exact_venue_order_id: Some(continuation.exact_venue_order_id().to_owned()),
+                }
+            }
+            _ => PmTrialLiveRecoveryClassificationV1::PlaceMayHaveBeenSentNoResend,
+        };
+    }
+    PmTrialLiveRecoveryClassificationV1::ReconcileBeforeRecoveryCancel {
+        exact_venue_order_id: Some(continuation.exact_venue_order_id().to_owned()),
+    }
+}
+
+fn required_continuation_action(
+    continuation: &PmRecoveryContinuationLoadV1,
+    registry: Option<&AuthorizationRecoveryContinuationRegistryV1>,
+) -> PmPhaseALiveCancelRecoveryRequiredActionV1 {
+    let Some(continuation) = continuation.complete() else {
+        return PmPhaseALiveCancelRecoveryRequiredActionV1::ReconcileCurrentExposure;
+    };
+    if continuation.terminal {
+        return PmPhaseALiveCancelRecoveryRequiredActionV1::TerminalEvidenceOnly;
+    }
+    if registry.is_some_and(|registry| registry.terminal_plan.is_some()) {
+        return PmPhaseALiveCancelRecoveryRequiredActionV1::CompletePendingTerminal;
+    }
+    if continuation.terminal_prefix {
+        return PmPhaseALiveCancelRecoveryRequiredActionV1::CompletePendingTerminal;
+    }
+    if continuation.latest_cancel_result.is_some() && continuation.latest_reconciliation.is_none() {
+        return PmPhaseALiveCancelRecoveryRequiredActionV1::ResumeCancelOutcome;
+    }
+    if continuation
+        .latest_reconciliation
+        .as_ref()
+        .is_some_and(|(state, _)| {
+            matches!(
+                state,
+                PmReconciliationOrderStateV1::Absent
+                    | PmReconciliationOrderStateV1::ExactCanceled
+                    | PmReconciliationOrderStateV1::ExactFilled
+            )
+        })
+    {
+        return PmPhaseALiveCancelRecoveryRequiredActionV1::RecordTerminal;
+    }
+    PmPhaseALiveCancelRecoveryRequiredActionV1::ReconcileCurrentExposure
+}
+
+fn phase_a_live_terminal_is_safe(
+    facts: &JournalFacts,
+    phase_a_live_dispatch_barrier_durable: bool,
+) -> bool {
+    if phase_a_live_dispatch_barrier_durable
+        && matches!(
+            facts.place_result,
+            Some((PmPlaceResultKindV1::DefinitelyNotDispatched, None))
+        )
+    {
         return true;
     }
     let Some((state, _, target_sequence)) = &facts.latest_reconciliation else {
@@ -1277,6 +1645,13 @@ fn dispatch_link(line: &DispatchLineV1) -> Result<CounterpartLinkV1, PmTrialLive
     Ok(CounterpartLinkV1 {
         sequence: line.sequence,
         record_fingerprint: dispatch_fingerprint(line)?,
+    })
+}
+
+fn intent_link(line: &IntentLineV1) -> Result<CounterpartLinkV1, PmTrialLiveJournalError> {
+    Ok(CounterpartLinkV1 {
+        sequence: line.sequence,
+        record_fingerprint: intent_fingerprint(line)?,
     })
 }
 

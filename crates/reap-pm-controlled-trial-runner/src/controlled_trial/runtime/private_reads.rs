@@ -82,7 +82,31 @@ struct SameCredentialAuthorityIdentity {
     scope: PmWireScope,
     signer: EoaAddress,
     proxy_funder: EvmAddress,
-    activity: PmUserWsActivityView,
+    activity: SameCredentialAuthorityActivity,
+}
+
+enum SameCredentialAuthorityActivity {
+    Live(PmUserWsActivityView),
+    #[cfg(test)]
+    Test(Arc<std::sync::atomic::AtomicU64>),
+}
+
+impl SameCredentialAuthorityActivity {
+    fn generation(&self) -> u64 {
+        match self {
+            Self::Live(activity) => activity.generation(),
+            #[cfg(test)]
+            Self::Test(activity) => activity.load(std::sync::atomic::Ordering::Acquire),
+        }
+    }
+
+    fn live_view(&self) -> PmUserWsActivityView {
+        match self {
+            Self::Live(activity) => activity.clone(),
+            #[cfg(test)]
+            Self::Test(_) => panic!("test-only preflight marker has no live user-WS role"),
+        }
+    }
 }
 
 /// Opaque, move-only same-credential marker shared by the user runtime and
@@ -104,9 +128,31 @@ impl PmSameCredentialAuthorityMarker {
                 scope,
                 signer,
                 proxy_funder,
-                activity,
+                activity: SameCredentialAuthorityActivity::Live(activity),
             }),
         }
+    }
+
+    /// Unit-test fixture for the sibling user-stream state machine. Production
+    /// composition can construct a marker only from the live role above.
+    #[cfg(test)]
+    pub(super) fn test_support_online_preflight_seal(
+        scope: PmWireScope,
+        signer: EoaAddress,
+        proxy_funder: EvmAddress,
+        activity: Arc<std::sync::atomic::AtomicU64>,
+    ) -> (Self, Arc<PmRestCutIdentity>) {
+        (
+            Self {
+                identity: Arc::new(SameCredentialAuthorityIdentity {
+                    scope,
+                    signer,
+                    proxy_funder,
+                    activity: SameCredentialAuthorityActivity::Test(activity),
+                }),
+            },
+            Arc::new(PmRestCutIdentity { _private: () }),
+        )
     }
 
     pub(super) fn same_instance(&self, other: &Self) -> bool {
@@ -148,7 +194,7 @@ impl PmSameCredentialAuthorityMarker {
     }
 
     fn activity_view(&self) -> PmUserWsActivityView {
-        self.identity.activity.clone()
+        self.identity.activity.live_view()
     }
 }
 

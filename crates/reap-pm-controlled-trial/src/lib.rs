@@ -8,6 +8,7 @@
 mod config;
 mod consumption;
 mod custody;
+mod online_policy_v2;
 mod preflight;
 mod protected_file;
 
@@ -24,13 +25,35 @@ pub use config::{
 pub use consumption::{
     AuthorizationConsumptionBindingEvidence, AuthorizationConsumptionEvidence,
     AuthorizationConsumptionState, AuthorizationConsumptionVerification,
+    AuthorizationRecoveryCancelPreparedAnchorV1, AuthorizationRecoveryContinuationRegistryV1,
+    AuthorizationRecoveryContinuationRootV1, AuthorizationRecoveryTerminalPlanV1,
     AuthorizationRuntimeBinding, ConsumedAuthorizationConsumption, PmAuthorizationConsumptionError,
     PreparedAuthorizationConsumption, TerminalAuthorizationConsumption, TerminalDisposition,
     claim_prepared_authorization_consumption, prepare_authorization_consumption,
-    verify_authorization_consumption,
+    reopen_consumed_authorization_consumption, verify_authorization_consumption,
 };
 pub use custody::{
     CustodyInspection, CustodyPaths, CustodySummary, PmTrialCustodyError, inspect_custody,
+};
+pub use online_policy_v2::{
+    CanonicalOnlineAuthorizationV2, CanonicalOnlinePolicyV2,
+    ClobLivenessHealthObservationRequirementV2, FreshStatusAnnouncementObservationRequirementV2,
+    MAX_ONLINE_OBSERVATION_AGE_MS_V2, MAX_STATUS_NOTICE_HISTORY_QUIET_INTERVAL_SECONDS_V2,
+    MIN_STATUS_NOTICE_HISTORY_QUIET_INTERVAL_SECONDS_V2, ONLINE_AUTHORIZATION_V2_SCHEMA_VERSION,
+    ONLINE_POLICY_V2_SCHEMA_VERSION, OnlineAttemptScopeApprovalV2, OnlineAuthorizationApprovalV2,
+    OnlineAuthorizationBuildBindingV2, OnlineAuthorizationHostBindingV2,
+    OnlineAuthorizationPurposeV2, OnlineAuthorizationV2, OnlineAuthorizationVerificationV2,
+    OnlineCleanupApprovalV2, OnlineFillRiskApprovalV2, OnlinePhaseScopeApprovalV2,
+    OnlinePolicyPinsV2, OnlinePolicyV2, OnlinePolicyVerificationV2,
+    OnlinePostOnlySemanticsApprovalV2, OnlineProxyConcurrencyApprovalV2,
+    OnlineSourceSeparationApprovalV2, OperationalObservationProfileV2, PmOnlinePolicyV2Error,
+    ReviewedMarketClassificationV2, ReviewedMarketEvidenceV2,
+    ReviewedMarketObservationRequirementV2, ReviewedRepositoryStateV2,
+    ReviewedStatusClobComponentV2, ReviewedStatusHistoryObservationRequirementV2,
+    ReviewedStatusNoticeHistoryCutV2, ReviewedStatusNoticeHistoryFindingV2,
+    ReviewedStatusNoticeHistorySourceV2, SameAccountClosedOnlyObservationRequirementV2,
+    V1ConfigPinsV2, load_canonical_online_authorization_v2, load_canonical_online_policy_v2,
+    verify_online_authorization_v2, verify_online_policy_v2,
 };
 pub use preflight::{
     CanonicalTrialPreflight, PmTrialPreflightError, TRIAL_PREFLIGHT_SCHEMA_VERSION,

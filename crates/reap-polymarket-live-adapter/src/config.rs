@@ -10,6 +10,7 @@ use crate::PmLiveAdapterError;
 
 pub const PM_CLOB_PRODUCTION_ORIGIN: &str = "https://clob.polymarket.com";
 pub const PM_GEOBLOCK_PRODUCTION_ORIGIN: &str = "https://polymarket.com";
+pub const PM_STATUS_PRODUCTION_ORIGIN: &str = "https://status.polymarket.com";
 const MAX_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +36,64 @@ pub struct PmGeoblockHttpConfig {
     connect_timeout: Duration,
     request_timeout: Duration,
     mode: OriginMode,
+}
+
+/// Crate-private configuration for the fixed Polymarket status-page source.
+/// Production construction has no caller-selected origin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PmStatusHttpConfig {
+    origin: Url,
+    connect_timeout: Duration,
+    request_timeout: Duration,
+    mode: OriginMode,
+}
+
+impl PmStatusHttpConfig {
+    pub(crate) fn production(
+        connect_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Result<Self, PmLiveAdapterError> {
+        validate_timeouts(connect_timeout, request_timeout)?;
+        let origin =
+            validate_exact_production_origin(PM_STATUS_PRODUCTION_ORIGIN, "status.polymarket.com")?;
+        Ok(Self {
+            origin,
+            connect_timeout,
+            request_timeout,
+            mode: OriginMode::Production,
+        })
+    }
+
+    #[cfg(any(test, feature = "read-only-evidence"))]
+    pub(crate) fn local_evidence(
+        origin: &str,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Result<Self, PmLiveAdapterError> {
+        validate_timeouts(connect_timeout, request_timeout)?;
+        Ok(Self {
+            origin: validate_local_evidence_origin(origin)?,
+            connect_timeout,
+            request_timeout,
+            mode: OriginMode::LocalEvidence,
+        })
+    }
+
+    pub(crate) fn origin(&self) -> &Url {
+        &self.origin
+    }
+
+    pub(crate) const fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    pub(crate) const fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
+    pub(crate) const fn mode(&self) -> OriginMode {
+        self.mode
+    }
 }
 
 impl PmGeoblockHttpConfig {
@@ -421,6 +480,14 @@ mod tests {
     }
 
     #[test]
+    fn status_production_origin_is_fixed_and_not_caller_selectable() {
+        let config =
+            PmStatusHttpConfig::production(CONNECT, REQUEST).expect("official status origin");
+        assert_eq!(config.origin().as_str(), "https://status.polymarket.com/");
+        assert_eq!(config.mode(), OriginMode::Production);
+    }
+
+    #[test]
     fn local_evidence_is_a_separate_literal_loopback_only_mode() {
         assert!(
             PmPublicHttpConfig::local_evidence("http://127.0.0.1:18080", CONNECT, REQUEST).is_ok()
@@ -442,6 +509,9 @@ mod tests {
             PmGeoblockHttpConfig::read_only_evidence("http://127.0.0.1:18080", CONNECT, REQUEST,)
                 .is_ok()
         );
+        assert!(
+            PmStatusHttpConfig::local_evidence("http://127.0.0.1:18080", CONNECT, REQUEST,).is_ok()
+        );
         for invalid in [
             "http://localhost:18080",
             "http://192.0.2.1:18080",
@@ -449,6 +519,7 @@ mod tests {
             "http://127.0.0.1",
         ] {
             assert!(PmGeoblockHttpConfig::read_only_evidence(invalid, CONNECT, REQUEST).is_err());
+            assert!(PmStatusHttpConfig::local_evidence(invalid, CONNECT, REQUEST).is_err());
         }
     }
 

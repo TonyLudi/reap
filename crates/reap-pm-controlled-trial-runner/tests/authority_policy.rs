@@ -53,6 +53,10 @@ fn recovery_surface_and_task_cannot_acquire_fresh_place_or_signer_authority() {
             );
         }
     }
+    assert!(role.contains("ExactOwnedCancelAuthenticationRole"));
+    assert!(task.contains("mut cancel_time_finalizer: PmCancelMutationTimeFinalizer"));
+    assert!(task.contains("CancelAuthorityMode::RecoveryOnly"));
+    assert!(task.contains("mut cancel: mpsc::Receiver<CancelAuthorityRequest>"));
 }
 
 #[test]
@@ -102,21 +106,27 @@ fn place_is_two_stage_consume_once_cancel_is_bounded_and_supervision_is_fail_sto
         .join("\n");
     assert_eq!(code.matches("signer: Option<FixedEoaSigner>,").count(), 1);
     assert!(AUTHORITY_SOURCE.contains("const PLACE_AUTHORITY_CAPACITY: usize = 1;"));
+    assert!(AUTHORITY_SOURCE.contains("const CANCEL_AUTHORITY_CAPACITY: usize = 1;"));
     assert!(
         AUTHORITY_SOURCE.contains("const MAX_EXACT_CANCEL_AUTHENTICATIONS_PER_AUTHORITY: u8 = 3;")
     );
     assert!(AUTHORITY_SOURCE.contains("PlaceAlreadyConsumed"));
     assert!(AUTHORITY_SOURCE.contains("PlaceDispatchBindingMismatch"));
-    assert!(AUTHORITY_SOURCE.contains("CancelAuthenticationBudgetExhausted"));
+    assert!(AUTHORITY_SOURCE.contains("CancelAuthenticationPreSendFailureKind::BudgetExhausted"));
     assert!(AUTHORITY_SOURCE.contains("impl Drop for TaskSignerCustody"));
     assert!(AUTHORITY_SOURCE.contains("drop(signer_value);"));
     assert!(AUTHORITY_SOURCE.contains("struct RetainedPreparedPlace"));
     assert!(AUTHORITY_SOURCE.contains("serialized: SerializedPlaceRequest,"));
     assert!(AUTHORITY_SOURCE.contains("place_time_finalizer: PmPlaceMutationTimeFinalizer,"));
-    assert!(AUTHORITY_SOURCE.contains("mut place_time_finalizer: PmPlaceMutationTimeFinalizer,"));
+    assert!(
+        AUTHORITY_SOURCE
+            .contains("let FreshAuthorityTaskInputs {\n        mut place_time_finalizer,")
+    );
     assert!(AUTHORITY_SOURCE.contains("&mut place_time_finalizer,"));
     assert!(AUTHORITY_SOURCE.contains("struct AdmittedPlaceRequestGuard"));
     assert!(AUTHORITY_SOURCE.contains("impl Drop for AdmittedPlaceRequestGuard"));
+    assert!(AUTHORITY_SOURCE.contains("struct AdmittedCancelRequestGuard"));
+    assert!(AUTHORITY_SOURCE.contains("impl Drop for AdmittedCancelRequestGuard"));
     assert_eq!(AUTHORITY_SOURCE.matches("request_place(&").count(), 2);
     assert!(
         AUTHORITY_SOURCE.contains("let mut admitted = AdmittedPlaceRequestGuard { armed: true };")
@@ -131,10 +141,12 @@ fn place_is_two_stage_consume_once_cancel_is_bounded_and_supervision_is_fail_sto
     assert!(AUTHORITY_SOURCE.contains("task.abort();"));
     assert!(AUTHORITY_SOURCE.contains("tokio::time::timeout(bounds.abort_join"));
     for required in [
-        "admitted_prepare_and_finalize_future_cancellation_abort_the_process",
+        "admitted_place_and_cancel_future_cancellation_abort_the_process",
         "status.signal(),\n                Some(libc::SIGABRT)",
         "dropping_an_unpolled_prepare_future_preserves_the_sole_task_authority",
         "PlaceRequestTestPause",
+        "CancelRequestTestPause",
+        "for case in [\"prepare\", \"finalize\", \"cancel\"]",
     ] {
         assert!(
             AUTHORITY_SOURCE.contains(required),
@@ -248,6 +260,117 @@ fn place_preparation_returns_only_public_identity_and_final_hmac_needs_private_p
 }
 
 #[test]
+fn cancel_requires_positive_a3_owner_source_time_and_a_dedicated_fail_stop_channel() {
+    let production = AUTHORITY_SOURCE
+        .split_once("#[cfg(all(test, target_os = \"linux\"))]")
+        .map(|(production, _)| production)
+        .expect("unit tests must remain after the production authority");
+    for required in [
+        "PmRevalidatedPhaseALiveCancelDispatchOwnerV1",
+        "PmCancelMutationTimeProof",
+        "PmCancelMutationTimeFinalizer",
+        "const CANCEL_AUTHORITY_CAPACITY: usize = 1;",
+        "mpsc::Sender<CancelAuthorityRequest>",
+        "mut cancel: mpsc::Receiver<CancelAuthorityRequest>",
+        "CancelAuthorityMode::FreshPrimary",
+        "CancelAuthorityMode::RecoveryOnly",
+        "struct CancelAuthenticationPreSendFailure",
+        "owner: Box<PmRevalidatedPhaseALiveCancelDispatchOwnerV1>",
+        "pub(super) fn into_owner(self) -> PmRevalidatedPhaseALiveCancelDispatchOwnerV1",
+        "struct CancelHmacAdmission",
+        "struct OpaqueAuthenticatedExactOwnedCancel",
+        "request: AuthenticatedOwnedCancelRequest",
+        "owner: PmRevalidatedPhaseALiveCancelDispatchOwnerV1",
+        "credentials.serialize_owned_cancel(order_id)",
+        "cancel_time_finalizer.authenticate_exact_owned_cancel(",
+        "expected_l2_timestamp_seconds",
+        "struct AdmittedCancelRequestGuard",
+        "if response.send(value).is_err()",
+    ] {
+        assert!(
+            production.contains(required),
+            "positive cancel authority is missing `{required}`",
+        );
+    }
+    assert_eq!(
+        production
+            .matches("credentials.serialize_owned_cancel(")
+            .count(),
+        1,
+        "the sole L2 task must serialize the exact cancel exactly once",
+    );
+    assert_eq!(
+        production
+            .matches("cancel_time_finalizer.authenticate_exact_owned_cancel(")
+            .count(),
+        1,
+        "the adapter-owned finalizer must be the sole cancel HMAC edge",
+    );
+    assert!(!production.contains("credentials.authenticate_owned_cancel("));
+    assert!(!PARENT_SOURCE.contains("SealedExactOwnedCancelAuthentication"));
+    assert!(!PARENT_SOURCE.contains("AuthenticatedExactOwnedCancel"));
+
+    let role = between(
+        production,
+        "impl ExactOwnedCancelAuthenticationRole {",
+        "impl fmt::Debug for ExactOwnedCancelAuthenticationRole",
+    );
+    assert!(role.contains("owner: PmRevalidatedPhaseALiveCancelDispatchOwnerV1,"));
+    assert!(role.contains("proof: PmCancelMutationTimeProof,"));
+    assert!(!role.contains("AuthorizedL2Timestamp"));
+    assert!(!role.contains("L2Timestamp"));
+    assert!(!role.contains("CommonAuthorityRequest"));
+
+    let handler = between(
+        production,
+        "fn authenticate_cancel_admission(",
+        "fn handle_common_request(",
+    );
+    for exact_check in [
+        "mode.accepts(owner.dispatch_class())",
+        "owner.exact_venue_order_id()",
+        "owner.semantic_request_commitment()",
+        "owner.l2_timestamp_seconds()",
+        "preparation.exact_venue_order_id() != order_id",
+        "serialized.semantic_request_commitment() != semantic_request_commitment",
+        "authenticated.semantic_request_commitment() != semantic_request_commitment",
+        "owner.dispatch_class() != preparation.dispatch_class()",
+    ] {
+        assert!(
+            handler.contains(exact_check),
+            "cancel handler is missing exact check `{exact_check}`",
+        );
+    }
+
+    let opaque = between(
+        production,
+        "pub(super) struct OpaqueAuthenticatedExactOwnedCancel {",
+        "impl fmt::Debug for OpaqueAuthenticatedExactOwnedCancel",
+    );
+    assert!(opaque.contains("request: AuthenticatedOwnedCancelRequest,"));
+    assert!(opaque.contains("owner: PmRevalidatedPhaseALiveCancelDispatchOwnerV1,"));
+    assert!(
+        opaque
+            .lines()
+            .all(|line| !line.trim_start().starts_with("pub")),
+        "opaque cancel fields became visible",
+    );
+    for forbidden in [
+        "impl OpaqueAuthenticatedExactOwnedCancel",
+        "pub(super) fn request(",
+        "pub(super) fn owner(",
+        "pub(super) fn into_parts(",
+        "pub(super) fn dispatch(",
+        "FixedOwnedCancelRequestSink",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "opaque cancel gained forbidden escape `{forbidden}`",
+        );
+    }
+}
+
+#[test]
 fn sole_task_routes_every_fixed_http_user_ws_binding_and_exact_cancel_operation() {
     assert_eq!(
         AUTHORITY_SOURCE
@@ -263,7 +386,7 @@ fn sole_task_routes_every_fixed_http_user_ws_binding_and_exact_cancel_operation(
         "authenticate_closed_only",
         "authenticate_order_detail",
         "serialize_owned_cancel",
-        "authenticate_owned_cancel",
+        "authenticate_exact_owned_cancel",
         "bind_open_orders",
         "bind_trades",
         "bind_exact_order",

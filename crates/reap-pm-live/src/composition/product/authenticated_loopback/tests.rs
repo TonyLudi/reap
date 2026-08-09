@@ -365,7 +365,7 @@ fn authenticated_mutation_run_orders_capacity_admission_and_both_barriers() {
             .expect("bounded purpose start body");
         let poll_time = body.find("poll_").unwrap();
         let request_time = body.find("request_").unwrap();
-        let validate_time = body.find(".authorize(pending)").unwrap();
+        let validate_time = body.find(".authorize_loopback_").unwrap();
         let worker_take = body.find("prepare_").unwrap();
         let spawn = body.find("tokio::spawn(task.run())").unwrap();
         assert!(poll_time < request_time);

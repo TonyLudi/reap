@@ -14,7 +14,8 @@ use reap_pm_controlled_trial::{
     TrialJournalBinding, TrialMarket, TrialOrder, TrialOrderType, TrialPhase, TrialSide,
     TrialTimeLimits, claim_prepared_authorization_consumption, inspect_custody,
     load_canonical_authorization, load_canonical_trial_config, prepare_authorization_consumption,
-    verify_authorization, verify_authorization_consumption, verify_plan,
+    reopen_consumed_authorization_consumption, verify_authorization,
+    verify_authorization_consumption, verify_plan,
 };
 use tempfile::TempDir;
 
@@ -606,6 +607,283 @@ fn consume_rechecks_binary_host_and_window_before_atomic_burn() {
             &fixture.runtime("2026-08-09T12:07:00Z"),
         )
         .is_err()
+    );
+}
+
+#[test]
+fn complete_consumed_ledger_and_claim_can_be_reopened_as_exact_recovery_custody() {
+    let fixture = consumption_fixture();
+    let prepared = prepare_authorization_consumption(
+        &fixture.config,
+        &fixture.authorization,
+        &fixture.runtime("2026-08-09T12:05:00Z"),
+    )
+    .unwrap();
+    let consumed = prepared
+        .consume(
+            &fixture.config,
+            &fixture.authorization,
+            &fixture.runtime("2026-08-09T12:06:00Z"),
+        )
+        .unwrap();
+    drop(consumed);
+    let mut reopened =
+        reopen_consumed_authorization_consumption(&fixture.config, &fixture.authorization)
+            .expect("pin exact burned recovery evidence");
+    reopened
+        .revalidate_held_consumption_evidence()
+        .expect("exact ledger and claim remain pinned");
+    fs::remove_file(fixture.claim_path()).expect("remove pinned claim path");
+    assert!(reopened.revalidate_held_consumption_evidence().is_err());
+}
+
+#[test]
+fn recovery_continuation_registry_is_monotonic_consumed_evidence() {
+    let fixture = consumption_fixture();
+    let prepared = prepare_authorization_consumption(
+        &fixture.config,
+        &fixture.authorization,
+        &fixture.runtime("2026-08-09T12:05:00Z"),
+    )
+    .unwrap();
+    let mut consumed = prepared
+        .consume(
+            &fixture.config,
+            &fixture.authorization,
+            &fixture.runtime("2026-08-09T12:06:00Z"),
+        )
+        .unwrap();
+    let scope = "aa".repeat(32);
+    let intent_header = "bb".repeat(32);
+    let dispatch_header = "cc".repeat(32);
+    consumed
+        .anchor_recovery_continuation_root(&scope, &intent_header, &dispatch_header)
+        .expect("fsynced recovery-continuation root");
+    consumed
+        .anchor_recovery_continuation_root(&scope, &intent_header, &dispatch_header)
+        .expect("root completion is idempotent");
+    let verified =
+        verify_authorization_consumption(&fixture.config, &fixture.authorization).unwrap();
+    assert_eq!(verified.ledger_record_count, 3);
+    assert!(matches!(
+        verified.state,
+        AuthorizationConsumptionState::Consumed { .. }
+    ));
+    let registry = verified
+        .recovery_continuation_registry
+        .as_ref()
+        .expect("root registry");
+    assert_eq!(registry.root.continuation_scope_fingerprint, scope);
+    assert!(registry.prepared.is_empty());
+    let first_dispatch_previous = "0a".repeat(32);
+    let first_canonical_prepared = r#"{"record":"first"}"#;
+
+    assert!(
+        consumed
+            .anchor_recovery_cancel_prepared(
+                &scope,
+                1,
+                2,
+                &"dd".repeat(32),
+                1,
+                &first_dispatch_previous,
+                &"ee".repeat(32),
+                first_canonical_prepared,
+                &format!("0x{}", "AB".repeat(32)),
+                &"ff".repeat(32),
+                1_786_277_133,
+            )
+            .is_err(),
+        "uppercase order IDs are not canonical registry evidence"
+    );
+    let exact_id = format!("0x{}", "ab".repeat(32));
+    consumed
+        .anchor_recovery_cancel_prepared(
+            &scope,
+            1,
+            2,
+            &"dd".repeat(32),
+            1,
+            &first_dispatch_previous,
+            &"ee".repeat(32),
+            first_canonical_prepared,
+            &exact_id,
+            &"ff".repeat(32),
+            1_786_277_133,
+        )
+        .expect("first recovery preparation is burned");
+    consumed
+        .anchor_recovery_cancel_prepared(
+            &scope,
+            1,
+            2,
+            &"dd".repeat(32),
+            1,
+            &first_dispatch_previous,
+            &"ee".repeat(32),
+            first_canonical_prepared,
+            &exact_id,
+            &"ff".repeat(32),
+            1_786_277_133,
+        )
+        .expect("exact preparation completion is idempotent");
+    let second_id = exact_id.clone();
+    let second_dispatch_previous = "0b".repeat(32);
+    let second_canonical_prepared = r#"{"record":"second"}"#;
+    consumed
+        .anchor_recovery_cancel_prepared(
+            &scope,
+            2,
+            4,
+            &"12".repeat(32),
+            2,
+            &second_dispatch_previous,
+            &"34".repeat(32),
+            second_canonical_prepared,
+            &second_id,
+            &"ff".repeat(32),
+            1_786_277_134,
+        )
+        .expect("second recovery preparation is burned");
+    let verified =
+        verify_authorization_consumption(&fixture.config, &fixture.authorization).unwrap();
+    assert_eq!(verified.ledger_record_count, 5);
+    assert!(matches!(
+        verified.state,
+        AuthorizationConsumptionState::Consumed { .. }
+    ));
+    assert_eq!(
+        verified
+            .recovery_continuation_registry
+            .as_ref()
+            .expect("prepared registry")
+            .prepared
+            .len(),
+        2
+    );
+    drop(consumed);
+    let mut reopened =
+        reopen_consumed_authorization_consumption(&fixture.config, &fixture.authorization)
+            .expect("registry remains exact recovery custody");
+    reopened
+        .anchor_recovery_continuation_root(&scope, &intent_header, &dispatch_header)
+        .expect("reopened root is idempotent");
+    reopened
+        .anchor_recovery_cancel_prepared(
+            &scope,
+            1,
+            2,
+            &"dd".repeat(32),
+            1,
+            &first_dispatch_previous,
+            &"ee".repeat(32),
+            first_canonical_prepared,
+            &exact_id,
+            &"ff".repeat(32),
+            1_786_277_133,
+        )
+        .expect("reopened first preparation is idempotent");
+    reopened
+        .anchor_recovery_cancel_prepared(
+            &scope,
+            2,
+            4,
+            &"12".repeat(32),
+            2,
+            &second_dispatch_previous,
+            &"34".repeat(32),
+            second_canonical_prepared,
+            &second_id,
+            &"ff".repeat(32),
+            1_786_277_134,
+        )
+        .expect("reopened second preparation is idempotent");
+    assert_eq!(
+        verify_authorization_consumption(&fixture.config, &fixture.authorization)
+            .unwrap()
+            .ledger_record_count,
+        5
+    );
+    let terminal_at = "2026-08-09T12:20:00Z";
+    let intent_predecessor = "56".repeat(32);
+    let dispatch_predecessor = "78".repeat(32);
+    let dispatch_terminal = "9a".repeat(32);
+    let intent_terminal = "bc".repeat(32);
+    reopened
+        .anchor_recovery_terminal_plan(
+            &scope,
+            6,
+            &intent_predecessor,
+            4,
+            &dispatch_predecessor,
+            terminal_at,
+            TerminalDisposition::Completed,
+            5,
+            &dispatch_predecessor,
+            &dispatch_terminal,
+            r#"{"record":"dispatch_terminal"}"#,
+            7,
+            &intent_predecessor,
+            &intent_terminal,
+            r#"{"record":"intent_terminal"}"#,
+        )
+        .expect("Terminal plan is ledger-first");
+    reopened
+        .anchor_recovery_terminal_plan(
+            &scope,
+            6,
+            &intent_predecessor,
+            4,
+            &dispatch_predecessor,
+            terminal_at,
+            TerminalDisposition::Completed,
+            5,
+            &dispatch_predecessor,
+            &dispatch_terminal,
+            r#"{"record":"dispatch_terminal"}"#,
+            7,
+            &intent_predecessor,
+            &intent_terminal,
+            r#"{"record":"intent_terminal"}"#,
+        )
+        .expect("exact Terminal plan completion is idempotent");
+    assert!(
+        reopened
+            .anchor_recovery_terminal_plan(
+                &scope,
+                6,
+                &intent_predecessor,
+                4,
+                &dispatch_predecessor,
+                "2026-08-09T12:20:01Z",
+                TerminalDisposition::Stopped,
+                5,
+                &dispatch_predecessor,
+                &dispatch_terminal,
+                r#"{"record":"dispatch_terminal"}"#,
+                7,
+                &intent_predecessor,
+                &intent_terminal,
+                r#"{"record":"intent_terminal"}"#,
+            )
+            .is_err(),
+        "a competing Terminal plan cannot replace source-owned facts"
+    );
+    let verified =
+        verify_authorization_consumption(&fixture.config, &fixture.authorization).unwrap();
+    assert_eq!(verified.ledger_record_count, 6);
+    assert!(
+        verified
+            .recovery_continuation_registry
+            .as_ref()
+            .and_then(|registry| registry.terminal_plan.as_ref())
+            .is_some()
+    );
+    assert!(
+        reopened
+            .terminal("2026-08-09T12:20:00Z".into(), TerminalDisposition::Stopped)
+            .is_err(),
+        "base Terminal cannot bypass continuation cleanup"
     );
 }
 

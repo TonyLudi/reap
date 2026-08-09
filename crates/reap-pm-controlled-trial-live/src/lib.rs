@@ -17,29 +17,41 @@ mod journal;
 mod live_dispatch;
 mod protected;
 mod recovery;
+mod recovery_continuation;
 mod schema;
 
 pub use error::PmTrialLiveJournalError;
 pub use journal::{
-    PmControlledTrialLiveJournals, PmControlledTrialLiveRecoveryJournals,
-    PmDurableCancelDispatchAckV1, PmDurableCancelIntentAckV1, PmDurableCancelOutcomeBridgeAckV1,
-    PmDurableCancelPreparedAckV1, PmDurableCancelResultAckV1, PmDurableIntentTerminalAckV1,
+    PmControlledTrialLiveCancelRecoveryJournals, PmControlledTrialLiveJournals,
+    PmControlledTrialLiveRecoveryJournals, PmDurableCancelDispatchAckV1,
+    PmDurableCancelIntentAckV1, PmDurableCancelOutcomeBridgeAckV1, PmDurableCancelPreparedAckV1,
+    PmDurableCancelResultAckV1, PmDurableIntentTerminalAckV1,
     PmDurablePhaseALiveCancelDispatchAckV1, PmDurablePhaseALiveCancelIntentAckV1,
     PmDurablePhaseALiveCancelPreparedAckV1, PmDurablePhaseAPlaceLiveResultAckV1,
     PmDurablePlaceDispatchAckV1, PmDurablePlaceIntentAckV1, PmDurablePlaceOutcomeBridgeAckV1,
     PmDurablePlacePreparedAckV1, PmDurablePlaceResultAckV1, PmDurableReconciliationAckV1,
     PmJournalOwnedVenueOrderV1, PmPendingTrialLiveJournalsV1,
-    PmPhaseAPlaceDefinitelyNotDispatchedV1, PmPhaseAPlaceLiveDispatchOwnerV1,
-    PmPhaseAPlaceLiveOutcomeBridgeAckV1, PmPhaseAPlaceLiveOwnedVenueOrderV1,
-    PmPhaseAPlaceMayHaveBeenDispatchedV1, PmPhaseAPlaceNetworkDispatchOwnerV1,
-    PmPreparedConsumedAuthorizationProofV1, PmRevalidatedPhaseAPlaceLiveDispatchOwnerV1,
+    PmPhaseALiveCancelDefinitelyNotDispatchedV1, PmPhaseALiveCancelDispatchOwnerV1,
+    PmPhaseALiveCancelIntentCustodyV1, PmPhaseALiveCancelMayHaveBeenDispatchedV1,
+    PmPhaseALiveCancelNetworkDispatchOwnerV1, PmPhaseALiveCancelOutcomeCustodyV1,
+    PmPhaseALiveCancelPreparedCustodyV1, PmPhaseALiveCancelResultCustodyV1,
+    PmPhaseALiveReconciliationCustodyV1, PmPhaseAPlaceDefinitelyNotDispatchedV1,
+    PmPhaseAPlaceLiveDispatchOwnerV1, PmPhaseAPlaceLiveOutcomeBridgeAckV1,
+    PmPhaseAPlaceLiveOutcomeCustodyV1, PmPhaseAPlaceLiveOwnedVenueOrderV1,
+    PmPhaseAPlaceLiveResultCustodyV1, PmPhaseAPlaceMayHaveBeenDispatchedV1,
+    PmPhaseAPlaceNetworkDispatchOwnerV1, PmPreparedConsumedAuthorizationProofV1,
+    PmRevalidatedPhaseALiveCancelDispatchOwnerV1, PmRevalidatedPhaseAPlaceLiveDispatchOwnerV1,
 };
 pub use live_dispatch::{
     PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1, PmPhaseAPlaceLiveDispatchProfileV1,
 };
 pub use recovery::{
-    PmTrialLiveRecoveryClassificationV1, PmTrialLiveRecoveryProjectionV1,
-    verify_controlled_trial_live_recovery,
+    PmPhaseALiveCancelRecoveryRequiredActionV1, PmTrialLiveRecoveryClassificationV1,
+    PmTrialLiveRecoveryProjectionV1, verify_controlled_trial_live_recovery,
+};
+pub use recovery_continuation::{
+    PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_DISPATCH_FILE_V1,
+    PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_INTENT_FILE_V1,
 };
 pub use schema::{
     PM_TRIAL_LIVE_DISPATCH_FILE_V1, PM_TRIAL_LIVE_INTENT_FILE_V1, PmCancelDispatchClassV1,

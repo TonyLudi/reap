@@ -11,11 +11,15 @@ use reap_pm_controlled_trial::{
     FixedOrderId, PreparedAuthorizationConsumption, verify_authorization_consumption,
 };
 use reap_pm_controlled_trial_live::{
+    PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_DISPATCH_FILE_V1,
+    PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_INTENT_FILE_V1,
     PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1, PM_TRIAL_LIVE_DISPATCH_FILE_V1,
     PM_TRIAL_LIVE_INTENT_FILE_V1, PmCancelDispatchClassV1, PmCancelPreparationV1,
-    PmCancelResultKindV1, PmControlledTrialLiveJournals, PmControlledTrialLiveRecoveryJournals,
-    PmIntentTerminalDispositionV1, PmPlacePreparationV1, PmPlaceResultKindV1,
-    PmReconciliationOrderStateV1, PmTrialLiveJournalError, PmTrialLiveRecoveryClassificationV1,
+    PmCancelResultKindV1, PmControlledTrialLiveCancelRecoveryJournals,
+    PmControlledTrialLiveJournals, PmControlledTrialLiveRecoveryJournals,
+    PmIntentTerminalDispositionV1, PmPhaseALiveCancelRecoveryRequiredActionV1,
+    PmPlacePreparationV1, PmPlaceResultKindV1, PmReconciliationOrderStateV1,
+    PmTrialLiveJournalError, PmTrialLiveRecoveryClassificationV1,
     verify_controlled_trial_live_recovery,
 };
 use serde::Serialize;
@@ -144,6 +148,67 @@ fn record_phase_a_live_dispatch(
     journals
         .record_phase_a_place_live_dispatch_authorized(proof)
         .expect("durable positive live dispatch barrier")
+}
+
+fn record_accepted_place_custody(
+    fixture: &Fixture,
+    prepared_consumption: PreparedAuthorizationConsumption,
+    journals: &mut PmControlledTrialLiveJournals,
+) -> reap_pm_controlled_trial_live::PmPhaseAPlaceLiveOutcomeCustodyV1 {
+    let expected = fixture
+        .config
+        .exact_place_public_request_identity()
+        .expected_order_id()
+        .to_string();
+    let owner = record_phase_a_live_dispatch(fixture, prepared_consumption, journals)
+        .revalidate_for_runner()
+        .expect("runner place owner");
+    let observation = journals
+        .revalidate_phase_a_place_for_network_dispatch(owner)
+        .expect("final place owner")
+        .into_may_have_been_dispatched()
+        .expect("place may-have-sent observation");
+    let result = journals
+        .record_phase_a_place_live_result_with_custody(
+            observation,
+            PmPlaceResultKindV1::Accepted,
+            Some(expected),
+        )
+        .expect("accepted positive place result custody");
+    journals
+        .record_phase_a_place_live_outcome_bridge_with_custody(result)
+        .expect("positive place bridge custody")
+}
+
+fn record_primary_cancel_owner(
+    fixture: &Fixture,
+    prepared_consumption: PreparedAuthorizationConsumption,
+    journals: &mut PmControlledTrialLiveJournals,
+) -> reap_pm_controlled_trial_live::PmPhaseALiveCancelDispatchOwnerV1 {
+    let place = record_accepted_place_custody(fixture, prepared_consumption, journals);
+    let cancel_identity = place
+        .exact_live_order_id()
+        .expect("valid exact order ID")
+        .expect("Accepted order custody");
+    let intent = journals
+        .record_phase_a_live_primary_cancel_intent_with_custody(
+            place,
+            "2026-08-09T12:05:10Z".into(),
+        )
+        .expect("primary cancel intent custody");
+    let cancellation = PmCancelPreparationV1::for_scoped_plan(
+        &fixture.config,
+        journals.preflight_binding(),
+        cancel_identity,
+        l2_time("2026-08-09T12:05:11Z"),
+    )
+    .expect("exact primary cancellation");
+    let prepared = journals
+        .record_phase_a_live_cancel_prepared_with_custody(intent, cancellation)
+        .expect("primary cancel prepared custody");
+    journals
+        .record_phase_a_live_cancel_dispatch_authorized_with_custody(prepared)
+        .expect("primary positive cancel owner")
 }
 
 fn retain_complete_lines(path: &Path, count: usize) {
@@ -306,6 +371,37 @@ fn assert_transport_conversion_rejects_drift(drift: impl FnOnce(&Fixture)) {
     ));
 }
 
+fn assert_final_cancel_revalidation_rejects_drift(drift: impl FnOnce(&Fixture)) {
+    let (fixture, prepared_consumption) = Fixture::new();
+    let mut journals = bind_preflight(&fixture);
+    let owner = record_primary_cancel_owner(&fixture, prepared_consumption, &mut journals);
+    let owner = journals
+        .revalidate_phase_a_live_cancel_for_runner(owner)
+        .expect("runner-side cancel revalidation");
+    drift(&fixture);
+    assert!(matches!(
+        journals.revalidate_phase_a_live_cancel_for_network_dispatch(owner),
+        Err(PmTrialLiveJournalError::Protection)
+    ));
+}
+
+fn assert_cancel_transport_conversion_rejects_drift(drift: impl FnOnce(&Fixture)) {
+    let (fixture, prepared_consumption) = Fixture::new();
+    let mut journals = bind_preflight(&fixture);
+    let owner = record_primary_cancel_owner(&fixture, prepared_consumption, &mut journals);
+    let owner = journals
+        .revalidate_phase_a_live_cancel_for_runner(owner)
+        .expect("runner-side cancel revalidation");
+    let final_owner = journals
+        .revalidate_phase_a_live_cancel_for_network_dispatch(owner)
+        .expect("final journal-bound cancel owner");
+    drift(&fixture);
+    assert!(matches!(
+        final_owner.into_may_have_been_dispatched(),
+        Err(PmTrialLiveJournalError::Protection)
+    ));
+}
+
 fn assert_classification(fixture: &Fixture, expected: PmTrialLiveRecoveryClassificationV1) {
     let projection = verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
         .expect("recovery projection");
@@ -314,6 +410,188 @@ fn assert_classification(fixture: &Fixture, expected: PmTrialLiveRecoveryClassif
     assert!(!projection.real_order_submission_authorized());
     assert_eq!(projection.place_dispatch_allowance(), 0);
     assert!(!projection.placement_resumption_allowed());
+}
+
+fn terminal_dnd_fixture() -> (Fixture, String) {
+    let (fixture, prepared_consumption) = Fixture::new();
+    let expected = fixture
+        .config
+        .exact_place_public_request_identity()
+        .expected_order_id()
+        .to_string();
+    let mut journals = bind_preflight(&fixture);
+    let no_send = record_phase_a_live_dispatch(&fixture, prepared_consumption, &mut journals)
+        .revalidate_for_runner()
+        .expect("runner owner")
+        .into_definitely_not_dispatched();
+    let (_result, consumed) = journals
+        .record_phase_a_place_definitely_not_dispatched(no_send)
+        .expect("durable DND result");
+    journals
+        .record_terminal(
+            "2026-08-09T12:05:10Z".into(),
+            PmIntentTerminalDispositionV1::Stopped,
+        )
+        .expect("terminal while positive barrier is intact");
+    drop(consumed);
+    drop(journals);
+    (fixture, expected)
+}
+
+fn continuation_terminal_plan_fixture() -> (Fixture, usize, usize) {
+    let (fixture, _) = terminal_dnd_fixture();
+    fs::remove_file(fixture.path(PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1))
+        .expect("remove barrier");
+    let projection = verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+        .expect("continuation basis");
+    let mut recovery = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+        &fixture.config,
+        &fixture.authorization,
+        &fixture.runtime("2026-08-09T12:05:30Z"),
+        projection,
+    )
+    .expect("continuation owner");
+    recovery
+        .record_phase_a_live_reconciliation_with_custody(
+            "2026-08-09T12:05:31Z".into(),
+            PmReconciliationOrderStateV1::Absent,
+            None,
+        )
+        .expect("safe reconciliation");
+    let intent = fixture.path(PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_INTENT_FILE_V1);
+    let dispatch = fixture.path(PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_DISPATCH_FILE_V1);
+    let intent_predecessor_count = fs::read(&intent)
+        .expect("intent predecessor")
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count();
+    let dispatch_predecessor_count = fs::read(&dispatch)
+        .expect("dispatch predecessor")
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count();
+    recovery
+        .record_terminal(
+            "2026-08-09T12:05:32Z".into(),
+            PmIntentTerminalDispositionV1::Completed,
+        )
+        .expect("ledger-first Terminal plan and pair");
+    drop(recovery);
+    (
+        fixture,
+        intent_predecessor_count,
+        dispatch_predecessor_count,
+    )
+}
+
+fn recovery_continuation_prepared_fixture() -> (Fixture, String) {
+    let (fixture, expected) = terminal_dnd_fixture();
+    fs::remove_file(fixture.path(PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1))
+        .expect("remove barrier");
+    let projection = verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+        .expect("continuation basis");
+    let mut recovery = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+        &fixture.config,
+        &fixture.authorization,
+        &fixture.runtime("2026-08-09T12:05:30Z"),
+        projection,
+    )
+    .expect("continuation owner");
+    let reconciliation = recovery
+        .record_phase_a_live_reconciliation_with_custody(
+            "2026-08-09T12:05:31Z".into(),
+            PmReconciliationOrderStateV1::ExactLive,
+            Some(expected.clone()),
+        )
+        .expect("exact live");
+    let intent = recovery
+        .record_phase_a_live_recovery_cancel_intent_with_custody(
+            reconciliation,
+            "2026-08-09T12:05:32Z".into(),
+        )
+        .expect("recovery intent");
+    let preparation = PmCancelPreparationV1::for_scoped_plan(
+        &fixture.config,
+        recovery.preflight_binding(),
+        FixedOrderId::parse(&expected).expect("fixed order ID"),
+        l2_time("2026-08-09T12:05:33Z"),
+    )
+    .expect("recovery preparation");
+    let prepared = recovery
+        .record_phase_a_live_cancel_prepared_with_custody(intent, preparation)
+        .expect("prepared and independently anchored");
+    drop(prepared);
+    drop(recovery);
+    (fixture, expected)
+}
+
+fn recovery_continuation_two_prepared_fixture() -> (Fixture, String) {
+    let (fixture, expected) = recovery_continuation_prepared_fixture();
+    let projection = verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+        .expect("first prepared projection");
+    let mut recovery = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+        &fixture.config,
+        &fixture.authorization,
+        &fixture.runtime("2026-08-09T12:05:40Z"),
+        projection,
+    )
+    .expect("second cycle owner");
+    let reconciliation = recovery
+        .record_phase_a_live_reconciliation_with_custody(
+            "2026-08-09T12:05:41Z".into(),
+            PmReconciliationOrderStateV1::ExactLive,
+            Some(expected.clone()),
+        )
+        .expect("second exact live");
+    let intent = recovery
+        .record_phase_a_live_recovery_cancel_intent_with_custody(
+            reconciliation,
+            "2026-08-09T12:05:42Z".into(),
+        )
+        .expect("second recovery intent");
+    let preparation = PmCancelPreparationV1::for_scoped_plan(
+        &fixture.config,
+        recovery.preflight_binding(),
+        FixedOrderId::parse(&expected).expect("fixed order ID"),
+        l2_time("2026-08-09T12:05:43Z"),
+    )
+    .expect("second recovery preparation");
+    let prepared = recovery
+        .record_phase_a_live_cancel_prepared_with_custody(intent, preparation)
+        .expect("second prepared and independently anchored");
+    drop(prepared);
+    drop(recovery);
+    (fixture, expected)
+}
+
+fn barrier_corruptions() -> [fn(&Fixture); 5] {
+    [
+        |fixture| {
+            fs::remove_file(fixture.path(PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1))
+                .expect("unlink barrier");
+        },
+        |fixture| {
+            fs::write(fixture.path(PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1), [])
+                .expect("zero barrier");
+        },
+        |fixture| {
+            let path = fixture.path(PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1);
+            let bytes = fs::read(&path).expect("barrier bytes");
+            fs::write(path, &bytes[..bytes.len() / 2]).expect("torn barrier");
+        },
+        |fixture| {
+            rewrite_same_inode_same_length(&fixture.path(PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1));
+        },
+        |fixture| {
+            let path = fixture.path(PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1);
+            let mut bytes = fs::read(&path).expect("barrier bytes");
+            bytes[0] = b'[';
+            fs::remove_file(&path).expect("remove barrier inode");
+            fs::write(&path, bytes).expect("replacement barrier inode");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .expect("protect replacement barrier");
+        },
+    ]
 }
 
 #[test]
@@ -705,10 +983,14 @@ fn incomplete_positive_barriers_fail_closed_without_a_place_resume() {
         fs::write(&path, []).expect("zero-byte barrier");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
             .expect("protect zero-byte barrier");
-        assert!(matches!(
-            verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization),
-            Err(PmTrialLiveJournalError::AmbiguousTail)
-        ));
+        let projection =
+            verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+                .expect("unusable barrier is revoked, not trusted");
+        assert_eq!(
+            projection.classification(),
+            &PmTrialLiveRecoveryClassificationV1::PlaceMayHaveBeenSentNoResend
+        );
+        assert!(!projection.phase_a_live_dispatch_barrier_durable());
     }
 
     // A torn record is never accepted as the full fsynced linearization point.
@@ -721,10 +1003,14 @@ fn incomplete_positive_barriers_fail_closed_without_a_place_resume() {
         let path = fixture.path(PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1);
         let bytes = fs::read(&path).expect("complete barrier");
         fs::write(&path, &bytes[..bytes.len() / 2]).expect("torn barrier");
-        assert!(matches!(
-            verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization),
-            Err(PmTrialLiveJournalError::AmbiguousTail)
-        ));
+        let projection =
+            verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+                .expect("torn barrier cannot suppress cleanup");
+        assert_eq!(
+            projection.classification(),
+            &PmTrialLiveRecoveryClassificationV1::PlaceMayHaveBeenSentNoResend
+        );
+        assert!(!projection.phase_a_live_dispatch_barrier_durable());
     }
 }
 
@@ -894,6 +1180,43 @@ fn final_network_boundary_rechecks_every_held_durable_artifact() {
     });
     assert_transport_conversion_rejects_drift(|fixture| {
         fs::remove_file(fixture.path(&claim_name(fixture))).expect("unlink atomic claim");
+    });
+}
+
+#[test]
+fn cancel_network_boundaries_recheck_journals_barrier_ledger_and_claim() {
+    assert_final_cancel_revalidation_rejects_drift(|fixture| {
+        rewrite_same_inode_same_length(&fixture.path(PM_TRIAL_LIVE_INTENT_FILE_V1));
+    });
+    assert_final_cancel_revalidation_rejects_drift(|fixture| {
+        append_and_sync(&fixture.path(PM_TRIAL_LIVE_DISPATCH_FILE_V1), b"x");
+    });
+    assert_final_cancel_revalidation_rejects_drift(|fixture| {
+        fs::remove_file(fixture.path(PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1))
+            .expect("unlink held positive barrier");
+    });
+    assert_final_cancel_revalidation_rejects_drift(|fixture| {
+        let ledger = fixture.path(
+            &fixture
+                .config
+                .value()
+                .journal
+                .authorization_consumption_ledger_file,
+        );
+        rewrite_same_inode_same_length(&ledger);
+    });
+    assert_final_cancel_revalidation_rejects_drift(|fixture| {
+        let claim = fixture.path(
+            &fixture
+                .config
+                .value()
+                .journal
+                .authorization_consumption_claim_file,
+        );
+        fs::remove_file(claim).expect("unlink held claim");
+    });
+    assert_cancel_transport_conversion_rejects_drift(|fixture| {
+        append_and_sync(&fixture.path(PM_TRIAL_LIVE_INTENT_FILE_V1), b"x");
     });
 }
 
@@ -1270,6 +1593,1522 @@ fn positive_transport_result_preserves_live_cancel_lineage_and_blocks_early_term
             exact_venue_order_id: Some(expected_text),
         },
     );
+}
+
+#[test]
+fn positive_cancel_custody_is_linear_through_dnd_reconciliation_and_recovery_cancel() {
+    let (fixture, prepared_consumption) = Fixture::new();
+    let expected = fixture
+        .config
+        .exact_place_public_request_identity()
+        .expected_order_id();
+    let expected_text = expected.to_string();
+    let mut journals = bind_preflight(&fixture);
+    let owner = record_primary_cancel_owner(&fixture, prepared_consumption, &mut journals);
+    assert_eq!(owner.dispatch_class(), PmCancelDispatchClassV1::Primary);
+    assert_eq!(owner.exact_venue_order_id(), FixedOrderId::from(expected));
+    assert_eq!(
+        owner.semantic_request_commitment(),
+        owner.preparation().semantic_request_commitment()
+    );
+    assert_eq!(
+        owner.l2_timestamp_seconds(),
+        l2_time("2026-08-09T12:05:11Z")
+    );
+    assert!(matches!(
+        journals.record_terminal(
+            "2026-08-09T12:05:12Z".into(),
+            PmIntentTerminalDispositionV1::OperatorActionRequired,
+        ),
+        Err(PmTrialLiveJournalError::InvalidTransition)
+    ));
+
+    let revalidated = journals
+        .revalidate_phase_a_live_cancel_for_runner(owner)
+        .expect("runner cancel owner");
+    let no_send = journals
+        .revalidate_phase_a_live_cancel_for_network_dispatch(revalidated)
+        .expect("final cancel owner")
+        .into_definitely_not_dispatched()
+        .expect("proven no-send cancel token");
+    let result = journals
+        .record_phase_a_live_cancel_definitely_not_dispatched(no_send)
+        .expect("durable cancel DND result");
+    assert_eq!(
+        result.outcome(),
+        PmCancelResultKindV1::DefinitelyNotDispatched
+    );
+    assert!(matches!(
+        journals.record_terminal(
+            "2026-08-09T12:05:13Z".into(),
+            PmIntentTerminalDispositionV1::OperatorActionRequired,
+        ),
+        Err(PmTrialLiveJournalError::InvalidTransition)
+    ));
+    let bridge = journals
+        .record_phase_a_live_cancel_outcome_bridge_with_custody(result)
+        .expect("positive cancel bridge");
+    let reconciliation = journals
+        .record_phase_a_live_cancel_reconciliation_with_custody(
+            bridge,
+            "2026-08-09T12:05:14Z".into(),
+            PmReconciliationOrderStateV1::ExactLive,
+            Some(expected_text.clone()),
+        )
+        .expect("exact live after proven no-send cancel");
+    let intent = journals
+        .record_phase_a_live_recovery_cancel_intent_with_custody(
+            reconciliation,
+            "2026-08-09T12:05:15Z".into(),
+        )
+        .expect("next exact recovery cancel intent");
+    let cancellation = PmCancelPreparationV1::for_scoped_plan(
+        &fixture.config,
+        journals.preflight_binding(),
+        FixedOrderId::from(expected),
+        l2_time("2026-08-09T12:05:16Z"),
+    )
+    .expect("recovery cancellation");
+    let prepared = journals
+        .record_phase_a_live_cancel_prepared_with_custody(intent, cancellation)
+        .expect("recovery cancel prepared");
+    let owner = journals
+        .record_phase_a_live_cancel_dispatch_authorized_with_custody(prepared)
+        .expect("recovery cancel owner");
+    assert_eq!(
+        owner.dispatch_class(),
+        PmCancelDispatchClassV1::Recovery { ordinal: 1 }
+    );
+    let revalidated = journals
+        .revalidate_phase_a_live_cancel_for_runner(owner)
+        .expect("runner recovery cancel owner");
+    let observation = journals
+        .revalidate_phase_a_live_cancel_for_network_dispatch(revalidated)
+        .expect("final recovery cancel owner")
+        .into_may_have_been_dispatched()
+        .expect("cancel may-have-sent observation");
+    let result = journals
+        .record_phase_a_live_cancel_result(observation, PmCancelResultKindV1::Canceled)
+        .expect("positive canceled result");
+    let bridge = journals
+        .record_phase_a_live_cancel_outcome_bridge_with_custody(result)
+        .expect("canceled bridge");
+    let resolved = journals
+        .record_phase_a_live_cancel_reconciliation_with_custody(
+            bridge,
+            "2026-08-09T12:05:17Z".into(),
+            PmReconciliationOrderStateV1::ExactCanceled,
+            Some(expected_text),
+        )
+        .expect("exact canceled reconciliation");
+    assert_eq!(
+        resolved.state(),
+        PmReconciliationOrderStateV1::ExactCanceled
+    );
+    let _terminal = journals
+        .record_terminal(
+            "2026-08-09T12:05:18Z".into(),
+            PmIntentTerminalDispositionV1::Completed,
+        )
+        .expect("terminal after exact canceled reconciliation");
+}
+
+#[test]
+fn dropping_positive_cancel_owner_keeps_terminal_blocked_and_recovery_never_resends() {
+    let (fixture, prepared_consumption) = Fixture::new();
+    let expected = fixture
+        .config
+        .exact_place_public_request_identity()
+        .expected_order_id()
+        .to_string();
+    let mut journals = bind_preflight(&fixture);
+    let owner = record_primary_cancel_owner(&fixture, prepared_consumption, &mut journals);
+    drop(owner);
+    assert!(matches!(
+        journals.record_terminal(
+            "2026-08-09T12:05:12Z".into(),
+            PmIntentTerminalDispositionV1::OperatorActionRequired,
+        ),
+        Err(PmTrialLiveJournalError::InvalidTransition)
+    ));
+    drop(journals);
+    assert_classification(
+        &fixture,
+        PmTrialLiveRecoveryClassificationV1::ReconcileBeforeRecoveryCancel {
+            exact_venue_order_id: Some(expected),
+        },
+    );
+}
+
+#[test]
+fn live_recovery_cancel_custody_survives_every_unusable_barrier_state() {
+    let corruptions: [fn(&Fixture); 5] = [
+        |fixture| {
+            fs::remove_file(fixture.path(PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1))
+                .expect("unlink barrier");
+        },
+        |fixture| {
+            fs::write(fixture.path(PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1), [])
+                .expect("zero barrier");
+        },
+        |fixture| {
+            let path = fixture.path(PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1);
+            let mut bytes = fs::read(&path).expect("barrier bytes");
+            let index = bytes
+                .iter()
+                .position(|byte| *byte == b'{')
+                .expect("JSON prefix");
+            bytes[index] = b'[';
+            fs::write(path, &bytes[..bytes.len() / 2]).expect("torn barrier");
+        },
+        |fixture| {
+            rewrite_same_inode_same_length(&fixture.path(PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1));
+        },
+        |fixture| {
+            let path = fixture.path(PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1);
+            let mut bytes = fs::read(&path).expect("barrier bytes");
+            let index = bytes
+                .iter()
+                .position(|byte| *byte == b'{')
+                .expect("JSON prefix");
+            bytes[index] = b'[';
+            fs::remove_file(&path).expect("remove barrier inode");
+            fs::write(&path, bytes).expect("replacement barrier inode");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .expect("protect replacement barrier");
+        },
+    ];
+    for corrupt in corruptions {
+        let (fixture, prepared_consumption) = Fixture::new();
+        let expected = fixture
+            .config
+            .exact_place_public_request_identity()
+            .expected_order_id();
+        let expected_text = expected.to_string();
+        let mut journals = bind_preflight(&fixture);
+        let owner = record_phase_a_live_dispatch(&fixture, prepared_consumption, &mut journals);
+        drop(owner);
+        drop(journals);
+        corrupt(&fixture);
+
+        let projection =
+            verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+                .expect("unusable barrier remains conservative recovery evidence");
+        assert_eq!(
+            projection.classification(),
+            &PmTrialLiveRecoveryClassificationV1::PlaceMayHaveBeenSentNoResend
+        );
+        assert!(!projection.phase_a_live_dispatch_barrier_durable());
+        let mut recovery = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+            &fixture.config,
+            &fixture.authorization,
+            &fixture.runtime("2026-08-09T12:05:30Z"),
+            projection,
+        )
+        .expect("live recovery-only cancel custody");
+        assert!(!recovery.production_order_entry_authorized());
+        assert!(!recovery.real_order_submission_authorized());
+        assert_eq!(recovery.place_dispatch_allowance(), 0);
+        let reconciliation = recovery
+            .record_phase_a_live_reconciliation_with_custody(
+                "2026-08-09T12:05:31Z".into(),
+                PmReconciliationOrderStateV1::ExactLive,
+                Some(expected_text),
+            )
+            .expect("exact expected order is live");
+        let intent = recovery
+            .record_phase_a_live_recovery_cancel_intent_with_custody(
+                reconciliation,
+                "2026-08-09T12:05:32Z".into(),
+            )
+            .expect("recovery cancel intent from burned custody");
+        let cancellation = PmCancelPreparationV1::for_scoped_plan(
+            &fixture.config,
+            recovery.preflight_binding(),
+            FixedOrderId::from(expected),
+            l2_time(CANCEL_TIME),
+        )
+        .expect("recovery cancel preparation");
+        let prepared = recovery
+            .record_phase_a_live_cancel_prepared_with_custody(intent, cancellation)
+            .expect("recovery cancel prepared custody");
+        let owner = recovery
+            .record_phase_a_live_cancel_dispatch_authorized_with_custody(prepared)
+            .expect("recovery cancel owner despite unusable barrier");
+        assert_eq!(
+            owner.dispatch_class(),
+            PmCancelDispatchClassV1::Recovery { ordinal: 1 }
+        );
+        drop(owner);
+    }
+}
+
+#[test]
+fn live_recovery_cancel_constructor_rejects_foreign_runtime_and_late_cleanup_time() {
+    for mutate in [
+        |runtime: &mut reap_pm_controlled_trial::AuthorizationRuntimeBinding| {
+            runtime.host.boot_identity = "foreign-boot".into();
+        },
+        |runtime: &mut reap_pm_controlled_trial::AuthorizationRuntimeBinding| {
+            runtime.observed_at_utc = "2026-08-09T12:20:01Z".into();
+        },
+    ] {
+        let (fixture, prepared_consumption) = Fixture::new();
+        let mut journals = bind_preflight(&fixture);
+        let owner = record_phase_a_live_dispatch(&fixture, prepared_consumption, &mut journals);
+        drop(owner);
+        drop(journals);
+        let projection =
+            verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+                .expect("recovery projection");
+        let mut runtime = fixture.runtime("2026-08-09T12:05:30Z");
+        mutate(&mut runtime);
+        assert!(matches!(
+            PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+                &fixture.config,
+                &fixture.authorization,
+                &runtime,
+                projection,
+            ),
+            Err(PmTrialLiveJournalError::InvalidBinding)
+        ));
+    }
+}
+
+#[test]
+fn unusable_barrier_revokes_place_dnd_and_terminal_trust() {
+    // DND without its positive barrier is conservatively treated as a
+    // possible send that requires reconciliation.
+    {
+        let (fixture, prepared_consumption) = Fixture::new();
+        let mut journals = bind_preflight(&fixture);
+        let no_send = record_phase_a_live_dispatch(&fixture, prepared_consumption, &mut journals)
+            .revalidate_for_runner()
+            .expect("runner owner")
+            .into_definitely_not_dispatched();
+        let (_result, consumed) = journals
+            .record_phase_a_place_definitely_not_dispatched(no_send)
+            .expect("durable DND result");
+        drop(consumed);
+        drop(journals);
+        fs::remove_file(fixture.path(PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1))
+            .expect("unlink DND barrier");
+        assert_classification(
+            &fixture,
+            PmTrialLiveRecoveryClassificationV1::PlaceMayHaveBeenSentNoResend,
+        );
+    }
+
+    // A terminal tail written while the barrier was intact becomes a distinct
+    // recovery-only continuation root if that prerequisite later disappears;
+    // it cannot suppress exact cleanup or revive placement.
+    {
+        let (fixture, prepared_consumption) = Fixture::new();
+        let mut journals = bind_preflight(&fixture);
+        let no_send = record_phase_a_live_dispatch(&fixture, prepared_consumption, &mut journals)
+            .revalidate_for_runner()
+            .expect("runner owner")
+            .into_definitely_not_dispatched();
+        let (_result, consumed) = journals
+            .record_phase_a_place_definitely_not_dispatched(no_send)
+            .expect("durable DND result");
+        let _terminal = journals
+            .record_terminal(
+                "2026-08-09T12:05:10Z".into(),
+                PmIntentTerminalDispositionV1::Stopped,
+            )
+            .expect("terminal while DND barrier is intact");
+        drop(consumed);
+        drop(journals);
+        fs::remove_file(fixture.path(PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1))
+            .expect("unlink terminal prerequisite barrier");
+        let projection =
+            verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+                .expect("recovery-only continuation projection");
+        assert_eq!(
+            projection.classification(),
+            &PmTrialLiveRecoveryClassificationV1::ReconcileBeforeRecoveryCancel {
+                exact_venue_order_id: Some(
+                    fixture
+                        .config
+                        .exact_place_public_request_identity()
+                        .expected_order_id()
+                        .to_string(),
+                ),
+            }
+        );
+        assert_eq!(
+            projection.phase_a_live_cancel_recovery_required_action(),
+            Some(&PmPhaseALiveCancelRecoveryRequiredActionV1::ReconcileCurrentExposure)
+        );
+    }
+}
+
+#[test]
+fn dnd_terminal_barrier_loss_enters_closed_recovery_continuation() {
+    let (intact, _) = terminal_dnd_fixture();
+    let intact_projection =
+        verify_controlled_trial_live_recovery(&intact.config, &intact.authorization)
+            .expect("intact terminal projection");
+    assert_eq!(
+        intact_projection.classification(),
+        &PmTrialLiveRecoveryClassificationV1::TerminalEvidenceOnly
+    );
+    assert_eq!(
+        intact_projection.phase_a_live_cancel_recovery_required_action(),
+        None
+    );
+    assert!(
+        !intact
+            .path(PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_INTENT_FILE_V1)
+            .exists()
+    );
+
+    for (index, corrupt) in barrier_corruptions().into_iter().enumerate() {
+        let (fixture, expected) = terminal_dnd_fixture();
+        corrupt(&fixture);
+        let projection =
+            verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+                .expect("unusable barrier continuation projection");
+        assert_eq!(
+            projection.classification(),
+            &PmTrialLiveRecoveryClassificationV1::ReconcileBeforeRecoveryCancel {
+                exact_venue_order_id: Some(expected.clone()),
+            }
+        );
+        assert_eq!(
+            projection.phase_a_live_cancel_recovery_required_action(),
+            Some(&PmPhaseALiveCancelRecoveryRequiredActionV1::ReconcileCurrentExposure)
+        );
+        assert!(!projection.placement_resumption_allowed());
+        let mut recovery = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+            &fixture.config,
+            &fixture.authorization,
+            &fixture.runtime("2026-08-09T12:05:30Z"),
+            projection,
+        )
+        .expect("recovery continuation owner");
+        assert_eq!(
+            recovery.required_action(),
+            Some(&PmPhaseALiveCancelRecoveryRequiredActionV1::ReconcileCurrentExposure)
+        );
+        if index == 0 {
+            let _absent = recovery
+                .record_phase_a_live_reconciliation_with_custody(
+                    "2026-08-09T12:05:31Z".into(),
+                    PmReconciliationOrderStateV1::Absent,
+                    None,
+                )
+                .expect("exact absence");
+            recovery
+                .record_terminal(
+                    "2026-08-09T12:05:32Z".into(),
+                    PmIntentTerminalDispositionV1::Completed,
+                )
+                .expect("continuation terminal");
+            drop(recovery);
+            let terminal =
+                verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+                    .expect("completed continuation");
+            assert_eq!(
+                terminal.phase_a_live_cancel_recovery_required_action(),
+                Some(&PmPhaseALiveCancelRecoveryRequiredActionV1::TerminalEvidenceOnly)
+            );
+        } else {
+            let _live = recovery
+                .record_phase_a_live_reconciliation_with_custody(
+                    "2026-08-09T12:05:31Z".into(),
+                    PmReconciliationOrderStateV1::ExactLive,
+                    Some(expected),
+                )
+                .expect("exact live cleanup custody");
+        }
+    }
+}
+
+#[test]
+fn surviving_root_anchor_rejects_continuation_pair_rollback() {
+    let prefixes: [fn(&Path, &Path); 4] = [
+        |intent, dispatch| {
+            fs::remove_file(intent).expect("remove intent");
+            fs::remove_file(dispatch).expect("remove dispatch");
+        },
+        |intent, dispatch| {
+            fs::write(intent, []).expect("zero intent");
+            fs::remove_file(dispatch).expect("remove dispatch");
+        },
+        |_intent, dispatch| {
+            fs::remove_file(dispatch).expect("remove dispatch");
+        },
+        |_intent, dispatch| {
+            fs::write(dispatch, []).expect("zero dispatch");
+        },
+    ];
+    for mutate in prefixes {
+        let (fixture, _) = terminal_dnd_fixture();
+        fs::remove_file(fixture.path(PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1))
+            .expect("remove barrier");
+        let projection =
+            verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+                .expect("continuation basis");
+        let recovery = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+            &fixture.config,
+            &fixture.authorization,
+            &fixture.runtime("2026-08-09T12:05:30Z"),
+            projection,
+        )
+        .expect("create complete continuation headers");
+        drop(recovery);
+        let intent = fixture.path(PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_INTENT_FILE_V1);
+        let dispatch = fixture.path(PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_DISPATCH_FILE_V1);
+        mutate(&intent, &dispatch);
+
+        assert!(
+            verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization).is_err(),
+            "a surviving monotonic root anchor makes pair loss/reset fail closed"
+        );
+    }
+}
+
+#[test]
+fn surviving_prepared_anchor_rejects_pair_loss_and_header_reset() {
+    for reset in [0_u8, 1] {
+        let (fixture, _) = recovery_continuation_prepared_fixture();
+        let intent = fixture.path(PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_INTENT_FILE_V1);
+        let dispatch = fixture.path(PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_DISPATCH_FILE_V1);
+        match reset {
+            0 => {
+                fs::remove_file(intent).expect("remove anchored intent journal");
+                fs::remove_file(dispatch).expect("remove anchored dispatch journal");
+            }
+            1 => {
+                retain_complete_lines(&intent, 1);
+                retain_complete_lines(&dispatch, 1);
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization).is_err(),
+            "surviving prepared registry evidence forbids pair rollback"
+        );
+    }
+}
+
+#[test]
+fn anchor_ahead_by_one_reconstructs_the_exact_prepared_record() {
+    let (fixture, _) = recovery_continuation_prepared_fixture();
+    let dispatch = fixture.path(PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_DISPATCH_FILE_V1);
+    retain_complete_lines(&dispatch, 1);
+    let projection = verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+        .expect("ledger-first Prepared prefix is source-completable");
+    let recovery = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+        &fixture.config,
+        &fixture.authorization,
+        &fixture.runtime("2026-08-09T12:05:40Z"),
+        projection,
+    )
+    .expect("append exact canonical Prepared from its surviving anchor");
+    drop(recovery);
+    assert_eq!(
+        fs::read(&dispatch)
+            .expect("reconstructed dispatch journal")
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count(),
+        2
+    );
+    let projection = verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+        .expect("reconstructed pair verifies idempotently");
+    let reopened = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+        &fixture.config,
+        &fixture.authorization,
+        &fixture.runtime("2026-08-09T12:05:41Z"),
+        projection,
+    )
+    .expect("reconstructed pair reopens without another append");
+    drop(reopened);
+    assert_eq!(
+        fs::read(dispatch)
+            .expect("idempotently reopened dispatch journal")
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn anchor_ahead_requires_its_exact_latest_cancel_intent() {
+    let (fixture, _) = recovery_continuation_prepared_fixture();
+    let intent = fixture.path(PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_INTENT_FILE_V1);
+    let dispatch = fixture.path(PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_DISPATCH_FILE_V1);
+    retain_complete_lines(&intent, 2);
+    retain_complete_lines(&dispatch, 1);
+    assert!(
+        verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization).is_err(),
+        "the registry cannot reconstruct Prepared onto a missing or foreign intent predecessor"
+    );
+}
+
+#[test]
+fn prepared_pair_ahead_of_the_monotonic_registry_is_rejected() {
+    let (fixture, _) = recovery_continuation_prepared_fixture();
+    let ledger = fixture.path(
+        &fixture
+            .config
+            .value()
+            .journal
+            .authorization_consumption_ledger_file,
+    );
+    retain_complete_lines(&ledger, 3);
+    assert!(
+        verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization).is_err(),
+        "a durable Prepared without its ledger-first ordinal anchor is never resumable"
+    );
+}
+
+#[test]
+fn registry_rejects_pair_ahead_by_two_and_anchor_tamper_or_reorder() {
+    for mutation in [0_u8, 1, 2] {
+        let (fixture, _) = recovery_continuation_two_prepared_fixture();
+        let ledger = fixture.path(
+            &fixture
+                .config
+                .value()
+                .journal
+                .authorization_consumption_ledger_file,
+        );
+        match mutation {
+            0 => retain_complete_lines(&ledger, 3),
+            1 => rewrite_same_inode_same_length(&ledger),
+            2 => {
+                let bytes = fs::read(&ledger).expect("anchored consumption ledger");
+                let mut lines: Vec<Vec<u8>> = bytes
+                    .split_inclusive(|byte| *byte == b'\n')
+                    .map(<[u8]>::to_vec)
+                    .collect();
+                assert_eq!(lines.len(), 5);
+                lines.swap(3, 4);
+                fs::write(&ledger, lines.concat()).expect("reorder prepared anchors");
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization).is_err(),
+            "registry/pair mismatch or registry chain drift fails closed"
+        );
+    }
+}
+
+#[test]
+fn sent_attempt_pair_loss_cannot_reset_recovery_ordinal() {
+    let (fixture, expected) = recovery_continuation_prepared_fixture();
+    let projection = verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+        .expect("prepared projection");
+    let mut recovery = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+        &fixture.config,
+        &fixture.authorization,
+        &fixture.runtime("2026-08-09T12:05:40Z"),
+        projection,
+    )
+    .expect("prepared recovery owner");
+    let reconciliation = recovery
+        .record_phase_a_live_reconciliation_with_custody(
+            "2026-08-09T12:05:41Z".into(),
+            PmReconciliationOrderStateV1::ExactLive,
+            Some(expected.clone()),
+        )
+        .expect("fresh exact live");
+    let intent = recovery
+        .record_phase_a_live_recovery_cancel_intent_with_custody(
+            reconciliation,
+            "2026-08-09T12:05:42Z".into(),
+        )
+        .expect("second recovery intent");
+    let preparation = PmCancelPreparationV1::for_scoped_plan(
+        &fixture.config,
+        recovery.preflight_binding(),
+        FixedOrderId::parse(&expected).expect("fixed order ID"),
+        l2_time("2026-08-09T12:05:43Z"),
+    )
+    .expect("second recovery preparation");
+    let prepared = recovery
+        .record_phase_a_live_cancel_prepared_with_custody(intent, preparation)
+        .expect("second prepared anchor");
+    let owner = recovery
+        .record_phase_a_live_cancel_dispatch_authorized_with_custody(prepared)
+        .expect("second dispatch owner");
+    let owner = recovery
+        .revalidate_phase_a_live_cancel_for_runner(owner)
+        .expect("runner revalidation");
+    let may_have_sent = recovery
+        .revalidate_phase_a_live_cancel_for_network_dispatch(owner)
+        .expect("network owner")
+        .into_may_have_been_dispatched()
+        .expect("may-have-sent transition");
+    drop(may_have_sent);
+    drop(recovery);
+    fs::remove_file(fixture.path(PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_INTENT_FILE_V1))
+        .expect("remove continuation intent");
+    fs::remove_file(fixture.path(PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_DISPATCH_FILE_V1))
+        .expect("remove continuation dispatch");
+    assert!(
+        verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization).is_err(),
+        "the surviving two-ordinal ledger registry forbids a fresh ordinal-one pair"
+    );
+}
+
+#[test]
+fn anchored_prepared_prefix_survives_loss_of_later_dispatch_records_conservatively() {
+    let (fixture, expected) = recovery_continuation_prepared_fixture();
+    let projection = verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+        .expect("prepared projection");
+    let mut recovery = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+        &fixture.config,
+        &fixture.authorization,
+        &fixture.runtime("2026-08-09T12:05:40Z"),
+        projection,
+    )
+    .expect("prepared recovery owner");
+    let reconciliation = recovery
+        .record_phase_a_live_reconciliation_with_custody(
+            "2026-08-09T12:05:41Z".into(),
+            PmReconciliationOrderStateV1::ExactLive,
+            Some(expected.clone()),
+        )
+        .expect("fresh exact live");
+    let intent = recovery
+        .record_phase_a_live_recovery_cancel_intent_with_custody(
+            reconciliation,
+            "2026-08-09T12:05:42Z".into(),
+        )
+        .expect("second intent");
+    let preparation = PmCancelPreparationV1::for_scoped_plan(
+        &fixture.config,
+        recovery.preflight_binding(),
+        FixedOrderId::parse(&expected).expect("fixed order ID"),
+        l2_time("2026-08-09T12:05:43Z"),
+    )
+    .expect("second preparation");
+    let prepared = recovery
+        .record_phase_a_live_cancel_prepared_with_custody(intent, preparation)
+        .expect("second prepared anchor");
+    let owner = recovery
+        .record_phase_a_live_cancel_dispatch_authorized_with_custody(prepared)
+        .expect("later dispatch record");
+    drop(owner);
+    drop(recovery);
+
+    let intent = fixture.path(PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_INTENT_FILE_V1);
+    let dispatch = fixture.path(PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_DISPATCH_FILE_V1);
+    retain_complete_lines(&intent, 5);
+    retain_complete_lines(&dispatch, 3);
+    let projection = verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+        .expect("anchored Prepared remains a conservative burned prefix");
+    assert!(matches!(
+        projection.classification(),
+        PmTrialLiveRecoveryClassificationV1::RecoveryCancelOnly { .. }
+    ));
+}
+
+#[test]
+fn restoring_a_barrier_after_continuation_creation_cannot_restore_place_trust() {
+    let (fixture, _) = terminal_dnd_fixture();
+    let barrier_path = fixture.path(PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1);
+    let barrier_bytes = fs::read(&barrier_path).expect("intact barrier bytes");
+    fs::remove_file(&barrier_path).expect("remove barrier");
+    let projection = verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+        .expect("continuation basis");
+    let recovery = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+        &fixture.config,
+        &fixture.authorization,
+        &fixture.runtime("2026-08-09T12:05:30Z"),
+        projection,
+    )
+    .expect("create continuation pair");
+    drop(recovery);
+    fs::write(&barrier_path, barrier_bytes).expect("restore exact barrier bytes");
+    fs::set_permissions(&barrier_path, fs::Permissions::from_mode(0o600))
+        .expect("protect restored barrier");
+
+    let projection = verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+        .expect("continuation remains authoritative recovery evidence");
+    assert!(!projection.phase_a_live_dispatch_barrier_durable());
+    assert!(!projection.placement_resumption_allowed());
+    assert_eq!(
+        projection.phase_a_live_cancel_recovery_required_action(),
+        Some(&PmPhaseALiveCancelRecoveryRequiredActionV1::ReconcileCurrentExposure)
+    );
+}
+
+#[test]
+fn original_dispatch_terminal_only_root_is_preserved_read_only() {
+    let (fixture, _) = terminal_dnd_fixture();
+    let intent_path = fixture.path(PM_TRIAL_LIVE_INTENT_FILE_V1);
+    let intent_count = fs::read(&intent_path)
+        .expect("main intent journal")
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count();
+    retain_complete_lines(&intent_path, intent_count - 1);
+    let original_prefix = fs::read(&intent_path).expect("dispatch-terminal predecessor");
+    fs::remove_file(fixture.path(PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1))
+        .expect("remove barrier");
+    let projection = verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+        .expect("distinct dispatch-terminal-only continuation basis");
+    assert_eq!(
+        projection.phase_a_live_cancel_recovery_required_action(),
+        Some(&PmPhaseALiveCancelRecoveryRequiredActionV1::ReconcileCurrentExposure)
+    );
+    let mut recovery = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+        &fixture.config,
+        &fixture.authorization,
+        &fixture.runtime("2026-08-09T12:05:30Z"),
+        projection,
+    )
+    .expect("recovery-only continuation owner");
+    recovery
+        .record_phase_a_live_reconciliation_with_custody(
+            "2026-08-09T12:05:31Z".into(),
+            PmReconciliationOrderStateV1::Absent,
+            None,
+        )
+        .expect("exact absence");
+    recovery
+        .record_terminal(
+            "2026-08-09T12:05:32Z".into(),
+            PmIntentTerminalDispositionV1::Completed,
+        )
+        .expect("continuation terminal");
+    drop(recovery);
+    assert_eq!(
+        fs::read(intent_path).expect("original intent remains exact"),
+        original_prefix
+    );
+}
+
+#[test]
+fn continuation_terminal_revalidates_every_held_root_after_safe_reconciliation() {
+    let drifts: [fn(&Fixture); 5] = [
+        |fixture| rewrite_same_inode_same_length(&fixture.path(PM_TRIAL_LIVE_INTENT_FILE_V1)),
+        |fixture| rewrite_same_inode_same_length(&fixture.path(PM_TRIAL_LIVE_DISPATCH_FILE_V1)),
+        |fixture| {
+            rewrite_same_inode_same_length(
+                &fixture.path(
+                    &fixture
+                        .config
+                        .value()
+                        .journal
+                        .authorization_consumption_ledger_file,
+                ),
+            );
+        },
+        |fixture| {
+            fs::remove_file(
+                fixture.path(
+                    &fixture
+                        .config
+                        .value()
+                        .journal
+                        .authorization_consumption_claim_file,
+                ),
+            )
+            .expect("remove atomic claim");
+        },
+        |fixture| {
+            fs::write(
+                fixture.path("unexpected-after-safe-reconciliation"),
+                b"drift",
+            )
+            .expect("change artifact directory");
+        },
+    ];
+    for drift in drifts {
+        let (fixture, _) = terminal_dnd_fixture();
+        fs::remove_file(fixture.path(PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1))
+            .expect("remove barrier");
+        let projection =
+            verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+                .expect("continuation basis");
+        let mut recovery = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+            &fixture.config,
+            &fixture.authorization,
+            &fixture.runtime("2026-08-09T12:05:30Z"),
+            projection,
+        )
+        .expect("continuation owner");
+        recovery
+            .record_phase_a_live_reconciliation_with_custody(
+                "2026-08-09T12:05:31Z".into(),
+                PmReconciliationOrderStateV1::Absent,
+                None,
+            )
+            .expect("safe reconciliation");
+        drift(&fixture);
+        assert!(matches!(
+            recovery.record_terminal(
+                "2026-08-09T12:05:32Z".into(),
+                PmIntentTerminalDispositionV1::Completed,
+            ),
+            Err(PmTrialLiveJournalError::Protection) | Err(PmTrialLiveJournalError::AmbiguousTail)
+        ));
+    }
+}
+
+#[test]
+fn impossible_continuation_creation_pairs_are_rejected() {
+    for mutate in [
+        0_u8, // dispatch without intent
+        1_u8, // both zero (not reachable in create order)
+        2_u8, // torn intent header
+    ] {
+        let (fixture, _) = terminal_dnd_fixture();
+        fs::remove_file(fixture.path(PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1))
+            .expect("remove barrier");
+        let projection =
+            verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+                .expect("continuation basis");
+        let recovery = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+            &fixture.config,
+            &fixture.authorization,
+            &fixture.runtime("2026-08-09T12:05:30Z"),
+            projection,
+        )
+        .expect("create headers");
+        drop(recovery);
+        let intent = fixture.path(PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_INTENT_FILE_V1);
+        let dispatch = fixture.path(PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_DISPATCH_FILE_V1);
+        match mutate {
+            0 => fs::remove_file(intent).expect("remove intent"),
+            1 => {
+                fs::write(intent, []).expect("zero intent");
+                fs::write(dispatch, []).expect("zero dispatch");
+            }
+            2 => {
+                let bytes = fs::read(&intent).expect("intent header");
+                fs::write(&intent, &bytes[..bytes.len() / 2]).expect("torn intent");
+                fs::remove_file(dispatch).expect("remove dispatch");
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization).is_err()
+        );
+    }
+}
+
+#[test]
+fn terminal_plan_anchor_source_completes_zero_one_or_two_halves() {
+    for retained_halves in [0_u8, 1, 2] {
+        let (fixture, _) = terminal_dnd_fixture();
+        fs::remove_file(fixture.path(PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1))
+            .expect("remove barrier");
+        let projection =
+            verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+                .expect("continuation basis");
+        let mut recovery = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+            &fixture.config,
+            &fixture.authorization,
+            &fixture.runtime("2026-08-09T12:05:30Z"),
+            projection,
+        )
+        .expect("continuation owner");
+        recovery
+            .record_phase_a_live_reconciliation_with_custody(
+                "2026-08-09T12:05:31Z".into(),
+                PmReconciliationOrderStateV1::Absent,
+                None,
+            )
+            .expect("safe reconciliation");
+        let intent = fixture.path(PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_INTENT_FILE_V1);
+        let dispatch = fixture.path(PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_DISPATCH_FILE_V1);
+        let intent_predecessor_count = fs::read(&intent)
+            .expect("intent predecessor")
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count();
+        let dispatch_predecessor_count = fs::read(&dispatch)
+            .expect("dispatch predecessor")
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count();
+        recovery
+            .record_terminal(
+                "2026-08-09T12:05:32Z".into(),
+                PmIntentTerminalDispositionV1::Completed,
+            )
+            .expect("ledger-first paired continuation Terminal");
+        drop(recovery);
+        let registry = verify_authorization_consumption(&fixture.config, &fixture.authorization)
+            .expect("monotonic Terminal plan")
+            .recovery_continuation_registry
+            .expect("continuation registry");
+        assert!(registry.terminal_plan.is_some());
+
+        if retained_halves < 2 {
+            retain_complete_lines(&intent, intent_predecessor_count);
+        }
+        if retained_halves == 0 {
+            retain_complete_lines(&dispatch, dispatch_predecessor_count);
+        }
+        let prefix = verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+            .expect("Terminal plan prefix is closed");
+        let expected_action = if retained_halves == 2 {
+            PmPhaseALiveCancelRecoveryRequiredActionV1::TerminalEvidenceOnly
+        } else {
+            PmPhaseALiveCancelRecoveryRequiredActionV1::CompletePendingTerminal
+        };
+        assert_eq!(
+            prefix.phase_a_live_cancel_recovery_required_action(),
+            Some(&expected_action)
+        );
+        let mut reopened = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+            &fixture.config,
+            &fixture.authorization,
+            &fixture.runtime("2026-08-09T12:05:40Z"),
+            prefix,
+        )
+        .expect("open source-completes the anchored Terminal plan");
+        assert_eq!(
+            reopened.required_action(),
+            Some(&PmPhaseALiveCancelRecoveryRequiredActionV1::TerminalEvidenceOnly)
+        );
+        assert!(matches!(
+            reopened.record_phase_a_live_reconciliation_with_custody(
+                "2026-08-09T12:05:41Z".into(),
+                PmReconciliationOrderStateV1::Absent,
+                None,
+            ),
+            Err(PmTrialLiveJournalError::RecoveryOperationForbidden)
+        ));
+        assert!(matches!(
+            reopened.record_terminal(
+                "2026-08-09T12:05:42Z".into(),
+                PmIntentTerminalDispositionV1::Stopped,
+            ),
+            Err(PmTrialLiveJournalError::RecoveryOperationForbidden)
+        ));
+        assert!(matches!(
+            reopened.complete_pending_terminal(),
+            Err(PmTrialLiveJournalError::RecoveryOperationForbidden)
+        ));
+        drop(reopened);
+        let complete =
+            verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+                .expect("completed Terminal pair");
+        assert_eq!(
+            complete.phase_a_live_cancel_recovery_required_action(),
+            Some(&PmPhaseALiveCancelRecoveryRequiredActionV1::TerminalEvidenceOnly)
+        );
+
+        if retained_halves == 0 {
+            // Repeating the exact pair rollback cannot change caller facts or
+            // advance the continuation; the same ledger plan completes again.
+            retain_complete_lines(&intent, intent_predecessor_count);
+            retain_complete_lines(&dispatch, dispatch_predecessor_count);
+            let replay =
+                verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+                    .expect("same anchor-only prefix");
+            let replayed = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+                &fixture.config,
+                &fixture.authorization,
+                &fixture.runtime("2026-08-09T12:05:50Z"),
+                replay,
+            )
+            .expect("idempotent source completion");
+            assert_eq!(
+                replayed.required_action(),
+                Some(&PmPhaseALiveCancelRecoveryRequiredActionV1::TerminalEvidenceOnly)
+            );
+        }
+    }
+}
+
+#[test]
+fn base_v1_terminal_cannot_use_the_completed_continuation_evidence_open() {
+    let (fixture, _) = terminal_dnd_fixture();
+    let projection = verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+        .expect("intact-barrier V1 Terminal evidence");
+    assert_eq!(
+        projection.classification(),
+        &PmTrialLiveRecoveryClassificationV1::TerminalEvidenceOnly
+    );
+    assert!(
+        PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+            &fixture.config,
+            &fixture.authorization,
+            &fixture.runtime("2026-08-09T12:05:30Z"),
+            projection,
+        )
+        .is_err(),
+        "only a verifier-bound completed continuation Terminal may use the narrow evidence reopen"
+    );
+}
+
+#[test]
+fn terminal_plan_rejects_pair_reset_tamper_and_pair_ahead() {
+    let (fixture, _, _) = continuation_terminal_plan_fixture();
+    retain_complete_lines(
+        &fixture.path(PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_INTENT_FILE_V1),
+        1,
+    );
+    retain_complete_lines(
+        &fixture.path(PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_DISPATCH_FILE_V1),
+        1,
+    );
+    assert!(
+        verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization).is_err(),
+        "the surviving plan rejects rollback before its exact causal predecessors"
+    );
+
+    let (fixture, _, _) = continuation_terminal_plan_fixture();
+    fs::remove_file(fixture.path(PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_INTENT_FILE_V1))
+        .expect("remove continuation intent");
+    fs::remove_file(fixture.path(PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_DISPATCH_FILE_V1))
+        .expect("remove continuation dispatch");
+    assert!(
+        verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization).is_err(),
+        "pair loss cannot erase a surviving Terminal plan"
+    );
+
+    let (fixture, _, _) = continuation_terminal_plan_fixture();
+    rewrite_same_inode_same_length(
+        &fixture.path(PM_PHASE_A_LIVE_CANCEL_RECOVERY_CONTINUATION_DISPATCH_FILE_V1),
+    );
+    assert!(
+        verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization).is_err(),
+        "Terminal bytes must match the exact canonical plan"
+    );
+
+    let (fixture, _, _) = continuation_terminal_plan_fixture();
+    let ledger = fixture.path(
+        &fixture
+            .config
+            .value()
+            .journal
+            .authorization_consumption_ledger_file,
+    );
+    let ledger_count = fs::read(&ledger)
+        .expect("consumption ledger")
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count();
+    retain_complete_lines(&ledger, ledger_count - 1);
+    assert!(
+        verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization).is_err(),
+        "a physical Terminal pair may never lead the monotonic ledger"
+    );
+}
+
+#[test]
+fn continuation_result_and_bridge_crash_prefixes_resume_exact_cancel_custody() {
+    for bridge_before_crash in [false, true] {
+        let (fixture, expected) = terminal_dnd_fixture();
+        fs::remove_file(fixture.path(PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1))
+            .expect("remove barrier");
+        let projection =
+            verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+                .expect("continuation basis");
+        let mut recovery = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+            &fixture.config,
+            &fixture.authorization,
+            &fixture.runtime("2026-08-09T12:05:30Z"),
+            projection,
+        )
+        .expect("continuation owner");
+        let reconciliation = recovery
+            .record_phase_a_live_reconciliation_with_custody(
+                "2026-08-09T12:05:31Z".into(),
+                PmReconciliationOrderStateV1::ExactLive,
+                Some(expected.clone()),
+            )
+            .expect("exact live");
+        let intent = recovery
+            .record_phase_a_live_recovery_cancel_intent_with_custody(
+                reconciliation,
+                "2026-08-09T12:05:32Z".into(),
+            )
+            .expect("recovery intent");
+        let preparation = PmCancelPreparationV1::for_scoped_plan(
+            &fixture.config,
+            recovery.preflight_binding(),
+            FixedOrderId::parse(&expected).expect("fixed order ID"),
+            l2_time("2026-08-09T12:05:33Z"),
+        )
+        .expect("cancel preparation");
+        let prepared = recovery
+            .record_phase_a_live_cancel_prepared_with_custody(intent, preparation)
+            .expect("prepared");
+        let owner = recovery
+            .record_phase_a_live_cancel_dispatch_authorized_with_custody(prepared)
+            .expect("dispatch owner");
+        let owner = recovery
+            .revalidate_phase_a_live_cancel_for_runner(owner)
+            .expect("runner revalidation");
+        let observation = recovery
+            .revalidate_phase_a_live_cancel_for_network_dispatch(owner)
+            .expect("network owner")
+            .into_may_have_been_dispatched()
+            .expect("may-have-sent observation");
+        let result = recovery
+            .record_phase_a_live_cancel_result(observation, PmCancelResultKindV1::Canceled)
+            .expect("durable canceled result");
+        if bridge_before_crash {
+            let bridge = recovery
+                .record_phase_a_live_cancel_outcome_bridge_with_custody(result)
+                .expect("durable bridge");
+            drop(bridge);
+        } else {
+            drop(result);
+        }
+        drop(recovery);
+
+        let projection =
+            verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+                .expect("result prefix projection");
+        assert_eq!(
+            projection.phase_a_live_cancel_recovery_required_action(),
+            Some(&PmPhaseALiveCancelRecoveryRequiredActionV1::ResumeCancelOutcome)
+        );
+        let mut reopened = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+            &fixture.config,
+            &fixture.authorization,
+            &fixture.runtime("2026-08-09T12:05:40Z"),
+            projection,
+        )
+        .expect("result recovery owner");
+        let bridge = reopened
+            .resume_phase_a_live_cancel_outcome_with_custody()
+            .expect("source-owned result/bridge recovery");
+        let resolved = reopened
+            .record_phase_a_live_cancel_reconciliation_with_custody(
+                bridge,
+                "2026-08-09T12:05:41Z".into(),
+                PmReconciliationOrderStateV1::ExactCanceled,
+                Some(expected),
+            )
+            .expect("resumed cancel-epoch reconciliation");
+        assert_eq!(
+            resolved.state(),
+            PmReconciliationOrderStateV1::ExactCanceled
+        );
+    }
+}
+
+#[test]
+fn continuation_prepared_cycles_burn_ordinals_and_replay_across_restarts() {
+    let (fixture, expected) = terminal_dnd_fixture();
+    let fixed = FixedOrderId::parse(&expected).expect("fixed order ID");
+    fs::remove_file(fixture.path(PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1))
+        .expect("remove barrier");
+    let projection = verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+        .expect("continuation basis");
+    let mut recovery = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+        &fixture.config,
+        &fixture.authorization,
+        &fixture.runtime("2026-08-09T12:05:30Z"),
+        projection,
+    )
+    .expect("continuation owner");
+    let reconciliation = recovery
+        .record_phase_a_live_reconciliation_with_custody(
+            "2026-08-09T12:05:31Z".into(),
+            PmReconciliationOrderStateV1::ExactLive,
+            Some(expected.clone()),
+        )
+        .expect("cycle one reconciliation");
+    let intent = recovery
+        .record_phase_a_live_recovery_cancel_intent_with_custody(
+            reconciliation,
+            "2026-08-09T12:05:32Z".into(),
+        )
+        .expect("cycle one intent");
+    let preparation = PmCancelPreparationV1::for_scoped_plan(
+        &fixture.config,
+        recovery.preflight_binding(),
+        fixed,
+        l2_time("2026-08-09T12:05:33Z"),
+    )
+    .expect("cycle one preparation");
+    let prepared = recovery
+        .record_phase_a_live_cancel_prepared_with_custody(intent, preparation)
+        .expect("cycle one prepared");
+    assert_eq!(
+        prepared.preparation().dispatch_class(),
+        PmCancelDispatchClassV1::Recovery { ordinal: 1 }
+    );
+    drop(prepared);
+    drop(recovery);
+
+    let projection = verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+        .expect("prepared-prefix projection");
+    assert_eq!(
+        projection.classification(),
+        &PmTrialLiveRecoveryClassificationV1::RecoveryCancelOnly {
+            exact_venue_order_id: expected.clone(),
+        }
+    );
+    let mut recovery = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+        &fixture.config,
+        &fixture.authorization,
+        &fixture.runtime("2026-08-09T12:05:40Z"),
+        projection,
+    )
+    .expect("cycle two owner");
+    let reconciliation = recovery
+        .record_phase_a_live_reconciliation_with_custody(
+            "2026-08-09T12:05:41Z".into(),
+            PmReconciliationOrderStateV1::ExactLive,
+            Some(expected.clone()),
+        )
+        .expect("fresh exact-live observation");
+    let intent = recovery
+        .record_phase_a_live_recovery_cancel_intent_with_custody(
+            reconciliation,
+            "2026-08-09T12:05:42Z".into(),
+        )
+        .expect("cycle two intent");
+    let preparation = PmCancelPreparationV1::for_scoped_plan(
+        &fixture.config,
+        recovery.preflight_binding(),
+        fixed,
+        l2_time("2026-08-09T12:05:43Z"),
+    )
+    .expect("cycle two preparation");
+    let prepared = recovery
+        .record_phase_a_live_cancel_prepared_with_custody(intent, preparation)
+        .expect("cycle two prepared");
+    let owner = recovery
+        .record_phase_a_live_cancel_dispatch_authorized_with_custody(prepared)
+        .expect("cycle two dispatch");
+    assert_eq!(
+        owner.dispatch_class(),
+        PmCancelDispatchClassV1::Recovery { ordinal: 2 }
+    );
+    drop(owner);
+    drop(recovery);
+
+    let projection = verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+        .expect("two-cycle canonical replay");
+    let mut recovery = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+        &fixture.config,
+        &fixture.authorization,
+        &fixture.runtime("2026-08-09T12:05:50Z"),
+        projection,
+    )
+    .expect("post-cycle recovery owner");
+    let reconciliation = recovery
+        .record_phase_a_live_reconciliation_with_custody(
+            "2026-08-09T12:05:51Z".into(),
+            PmReconciliationOrderStateV1::ExactLive,
+            Some(expected),
+        )
+        .expect("latest exact-live exposure");
+    assert!(matches!(
+        recovery.record_phase_a_live_recovery_cancel_intent_with_custody(
+            reconciliation,
+            "2026-08-09T12:05:52Z".into(),
+        ),
+        Err(PmTrialLiveJournalError::BoundExceeded)
+    ));
+}
+
+#[test]
+fn continuation_recovery_cancel_only_accepts_a_fresh_safe_observation() {
+    let (fixture, expected) = terminal_dnd_fixture();
+    fs::remove_file(fixture.path(PM_PHASE_A_LIVE_DISPATCH_BARRIER_FILE_V1))
+        .expect("remove barrier");
+    let projection = verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+        .expect("continuation basis");
+    let mut recovery = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+        &fixture.config,
+        &fixture.authorization,
+        &fixture.runtime("2026-08-09T12:05:30Z"),
+        projection,
+    )
+    .expect("continuation owner");
+    let reconciliation = recovery
+        .record_phase_a_live_reconciliation_with_custody(
+            "2026-08-09T12:05:31Z".into(),
+            PmReconciliationOrderStateV1::ExactLive,
+            Some(expected),
+        )
+        .expect("initial exact live");
+    let intent = recovery
+        .record_phase_a_live_recovery_cancel_intent_with_custody(
+            reconciliation,
+            "2026-08-09T12:05:32Z".into(),
+        )
+        .expect("intent-only prefix");
+    drop(intent);
+    drop(recovery);
+
+    let projection = verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+        .expect("intent-prefix projection");
+    assert!(matches!(
+        projection.classification(),
+        PmTrialLiveRecoveryClassificationV1::RecoveryCancelOnly { .. }
+    ));
+    let mut recovery = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+        &fixture.config,
+        &fixture.authorization,
+        &fixture.runtime("2026-08-09T12:05:40Z"),
+        projection,
+    )
+    .expect("intent-prefix owner");
+    recovery
+        .record_phase_a_live_reconciliation_with_custody(
+            "2026-08-09T12:05:41Z".into(),
+            PmReconciliationOrderStateV1::Absent,
+            None,
+        )
+        .expect("fresh absence supersedes prior exact-live state");
+    recovery
+        .record_terminal(
+            "2026-08-09T12:05:42Z".into(),
+            PmIntentTerminalDispositionV1::Completed,
+        )
+        .expect("safe terminal");
+}
+
+#[test]
+fn main_v1_prepared_supersession_burns_primary_and_recovery_ordinals() {
+    let (fixture, prepared_consumption) = Fixture::new();
+    let expected = fixture
+        .config
+        .exact_place_public_request_identity()
+        .expected_order_id();
+    let expected_text = expected.to_string();
+    let fixed = FixedOrderId::from(expected);
+    let mut journals = bind_preflight(&fixture);
+    let place = record_accepted_place_custody(&fixture, prepared_consumption, &mut journals);
+    let intent = journals
+        .record_phase_a_live_primary_cancel_intent_with_custody(
+            place,
+            "2026-08-09T12:05:10Z".into(),
+        )
+        .expect("primary intent");
+    let preparation = PmCancelPreparationV1::for_scoped_plan(
+        &fixture.config,
+        journals.preflight_binding(),
+        fixed,
+        l2_time("2026-08-09T12:05:11Z"),
+    )
+    .expect("primary preparation");
+    let prepared = journals
+        .record_phase_a_live_cancel_prepared_with_custody(intent, preparation)
+        .expect("primary prepared tail");
+    assert_eq!(
+        prepared.preparation().dispatch_class(),
+        PmCancelDispatchClassV1::Primary
+    );
+    drop(prepared);
+    drop(journals);
+
+    let projection = verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+        .expect("primary prepared recovery");
+    let mut recovery = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+        &fixture.config,
+        &fixture.authorization,
+        &fixture.runtime("2026-08-09T12:05:40Z"),
+        projection,
+    )
+    .expect("recovery-one owner");
+    let reconciliation = recovery
+        .record_phase_a_live_reconciliation_with_custody(
+            "2026-08-09T12:05:41Z".into(),
+            PmReconciliationOrderStateV1::ExactLive,
+            Some(expected_text.clone()),
+        )
+        .expect("fresh exact-live after primary prepared crash");
+    let intent = recovery
+        .record_phase_a_live_recovery_cancel_intent_with_custody(
+            reconciliation,
+            "2026-08-09T12:05:42Z".into(),
+        )
+        .expect("recovery-one intent");
+    let preparation = PmCancelPreparationV1::for_scoped_plan(
+        &fixture.config,
+        recovery.preflight_binding(),
+        fixed,
+        l2_time("2026-08-09T12:05:43Z"),
+    )
+    .expect("recovery-one preparation");
+    let prepared = recovery
+        .record_phase_a_live_cancel_prepared_with_custody(intent, preparation)
+        .expect("superseding recovery-one prepared");
+    assert_eq!(
+        prepared.preparation().dispatch_class(),
+        PmCancelDispatchClassV1::Recovery { ordinal: 1 }
+    );
+    drop(prepared);
+    drop(recovery);
+
+    let projection = verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+        .expect("recovery-one prepared replay");
+    let mut recovery = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+        &fixture.config,
+        &fixture.authorization,
+        &fixture.runtime("2026-08-09T12:05:50Z"),
+        projection,
+    )
+    .expect("recovery-two owner");
+    let reconciliation = recovery
+        .record_phase_a_live_reconciliation_with_custody(
+            "2026-08-09T12:05:51Z".into(),
+            PmReconciliationOrderStateV1::ExactLive,
+            Some(expected_text.clone()),
+        )
+        .expect("fresh exact-live after recovery-one prepared crash");
+    let intent = recovery
+        .record_phase_a_live_recovery_cancel_intent_with_custody(
+            reconciliation,
+            "2026-08-09T12:05:52Z".into(),
+        )
+        .expect("recovery-two intent");
+    let preparation = PmCancelPreparationV1::for_scoped_plan(
+        &fixture.config,
+        recovery.preflight_binding(),
+        fixed,
+        l2_time("2026-08-09T12:05:53Z"),
+    )
+    .expect("recovery-two preparation");
+    let prepared = recovery
+        .record_phase_a_live_cancel_prepared_with_custody(intent, preparation)
+        .expect("superseding recovery-two prepared");
+    let owner = recovery
+        .record_phase_a_live_cancel_dispatch_authorized_with_custody(prepared)
+        .expect("dispatch only newest prepared attempt");
+    assert_eq!(
+        owner.dispatch_class(),
+        PmCancelDispatchClassV1::Recovery { ordinal: 2 }
+    );
+    drop(owner);
+    drop(recovery);
+
+    let projection = verify_controlled_trial_live_recovery(&fixture.config, &fixture.authorization)
+        .expect("reopen after superseding prepared and dispatch");
+    let mut recovery = PmControlledTrialLiveCancelRecoveryJournals::open_phase_a_live_cancel(
+        &fixture.config,
+        &fixture.authorization,
+        &fixture.runtime("2026-08-09T12:06:00Z"),
+        projection,
+    )
+    .expect("budget-exhaustion owner");
+    let reconciliation = recovery
+        .record_phase_a_live_reconciliation_with_custody(
+            "2026-08-09T12:06:01Z".into(),
+            PmReconciliationOrderStateV1::ExactLive,
+            Some(expected_text),
+        )
+        .expect("latest exact-live observation");
+    assert!(matches!(
+        recovery.record_phase_a_live_recovery_cancel_intent_with_custody(
+            reconciliation,
+            "2026-08-09T12:06:02Z".into(),
+        ),
+        Err(PmTrialLiveJournalError::BoundExceeded)
+    ));
 }
 
 #[test]

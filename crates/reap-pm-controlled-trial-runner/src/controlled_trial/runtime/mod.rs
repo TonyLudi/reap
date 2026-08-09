@@ -4,6 +4,7 @@
 //! boundary. They expose move-only evidence and leases to this parent only;
 //! none of them can construct a production mutation request or transport.
 
+mod current_runtime;
 mod private_reads;
 mod public_book;
 mod user_stream;

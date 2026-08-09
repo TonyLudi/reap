@@ -809,6 +809,19 @@ impl PmPlaceMutationTimeFinalizer {
         provider.consume_final_place_time(PmFinalPlaceMutationTime { core: &proof.core })?;
         Ok(())
     }
+
+    /// Adapt a purpose-bound place proof to the legacy authenticated-loopback
+    /// worker token. This compatibility edge is compiled only with literal
+    /// loopback mutation support; production compositions cannot name it.
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub fn authorize_loopback_place(
+        &mut self,
+        proof: PmPlaceMutationTimeProof,
+    ) -> Result<PmAuthorizedMutationServerTime, PmProductClockError> {
+        validate_final_mutation_time(&self.authority, &proof.core, MutationTimePurpose::Place)?;
+        let timestamp = PmFinalPlaceMutationTime { core: &proof.core }.consume_l2_timestamp()?;
+        Ok(PmAuthorizedMutationServerTime { timestamp })
+    }
 }
 
 impl fmt::Debug for PmPlaceMutationTimeFinalizer {
@@ -855,6 +868,19 @@ impl PmCancelMutationTimeFinalizer {
         validate_final_mutation_time(&self.authority, &proof.core, MutationTimePurpose::Cancel)?;
         provider.consume_final_cancel_time(PmFinalCancelMutationTime { core: &proof.core })?;
         Ok(())
+    }
+
+    /// Adapt a purpose-bound cancel proof to the legacy authenticated-loopback
+    /// worker token. It is unavailable unless literal loopback mutation
+    /// support is explicitly compiled.
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub fn authorize_loopback_cancel(
+        &mut self,
+        proof: PmCancelMutationTimeProof,
+    ) -> Result<PmAuthorizedMutationServerTime, PmProductClockError> {
+        validate_final_mutation_time(&self.authority, &proof.core, MutationTimePurpose::Cancel)?;
+        let timestamp = PmFinalCancelMutationTime { core: &proof.core }.consume_l2_timestamp()?;
+        Ok(PmAuthorizedMutationServerTime { timestamp })
     }
 }
 

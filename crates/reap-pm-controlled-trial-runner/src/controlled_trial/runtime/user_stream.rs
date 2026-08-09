@@ -9,6 +9,7 @@
 use std::{
     fmt,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -18,14 +19,14 @@ use reap_pm_core::{
 };
 use reap_polymarket_live_adapter::{
     PmAuthenticatedUserWsRole, PmUserWsActivityView, PmUserWsConnection, PmUserWsDisconnectReason,
-    PmUserWsEvent, PmUserWsEventSink, PmUserWsRunError, PmUserWsShutdownSignal,
+    PmUserWsEdgeClock, PmUserWsEvent, PmUserWsEventSink, PmUserWsRunError, PmUserWsShutdownSignal,
 };
 use reap_polymarket_wire::{PmLiveUserEvent, PmWireScope};
 use thiserror::Error;
 
 use super::private_reads::{
-    PmRestCutIdentity, PmSameAuthorityRestJoin, PmSameCredentialAuthorityMarker,
-    PmSameCredentialUserWsInput, PmUserRestCollectionStart,
+    PmFreshAuthenticatedRestCut, PmRestCutIdentity, PmSameAuthorityRestJoin,
+    PmSameCredentialAuthorityMarker, PmSameCredentialUserWsInput, PmUserRestCollectionStart,
 };
 
 /// A controlled trial fails closed instead of retaining an unbounded user
@@ -100,6 +101,41 @@ impl fmt::Debug for PmUserStreamRuntime {
 struct PmUserStreamShared {
     state: Mutex<PmUserStreamState>,
     activity: RuntimeUserActivityView,
+}
+
+impl PmUserStreamShared {
+    /// Recheck one immutable online-preflight core against both the admitted
+    /// state and the source-owned activity high-water. Sampling on both sides
+    /// of each state validation rejects activity already queued at the socket
+    /// edge as well as activity admitted while this command is in progress.
+    fn recheck_online_preflight_core(
+        &self,
+        core: &FinalCutCore,
+    ) -> Result<(), PmUserStreamRuntimeError> {
+        let before = self.activity.generation();
+        {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| PmUserStreamRuntimeError::StatePoisoned)?;
+            state.validate_final_core(core, before)?;
+        }
+        let after = self.activity.generation();
+        if before != core.activity_generation || after != core.activity_generation {
+            return Err(PmUserStreamRuntimeError::ConcurrentActivity);
+        }
+        {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| PmUserStreamRuntimeError::StatePoisoned)?;
+            state.validate_final_core(core, after)?;
+        }
+        if self.activity.generation() != core.activity_generation {
+            return Err(PmUserStreamRuntimeError::ConcurrentActivity);
+        }
+        Ok(())
+    }
 }
 
 enum RuntimeUserActivityView {
@@ -306,54 +342,39 @@ impl PmUserStreamHandle {
         &mut self,
         ticket: FinalCutTicket,
     ) -> Result<FinalCutJoinFields, PmUserStreamRuntimeError> {
+        self.consume_online_preflight_lease(ticket.into_online_preflight_lease())
+    }
+
+    /// Consume and reissue the same move-only online-preflight lease only while
+    /// its complete source core, authority marker, reconnect history, clocks
+    /// and activity high-water still exactly match the live runtime.
+    pub(super) fn recheck_online_preflight_lease(
+        &mut self,
+        lease: PmUserOnlinePreflightLease,
+    ) -> Result<PmUserOnlinePreflightLease, PmUserStreamRuntimeError> {
+        self.recheck_online_preflight_ticket(&lease.ticket)?;
+        Ok(lease)
+    }
+
+    /// Final consuming lease recheck. No ticket or lease survives this call;
+    /// on success it releases the already-existing typed join fields, while a
+    /// failure drops the sole stale lease.
+    pub(super) fn consume_online_preflight_lease(
+        &mut self,
+        lease: PmUserOnlinePreflightLease,
+    ) -> Result<FinalCutJoinFields, PmUserStreamRuntimeError> {
+        let lease = self.recheck_online_preflight_lease(lease)?;
+        Ok(lease.ticket.into_join_fields())
+    }
+
+    fn recheck_online_preflight_ticket(
+        &self,
+        ticket: &FinalCutTicket,
+    ) -> Result<(), PmUserStreamRuntimeError> {
         if !ticket.marker.same_instance(&self.marker) {
             return Err(PmUserStreamRuntimeError::SameAuthorityMismatch);
         }
-        let before = self.shared.activity.generation();
-        {
-            let state = self
-                .shared
-                .state
-                .lock()
-                .map_err(|_| PmUserStreamRuntimeError::StatePoisoned)?;
-            state.validate_final_core(&ticket.core, before)?;
-        }
-        let after = self.shared.activity.generation();
-        if before != ticket.core.activity_generation || after != ticket.core.activity_generation {
-            return Err(PmUserStreamRuntimeError::ConcurrentActivity);
-        }
-        {
-            let state = self
-                .shared
-                .state
-                .lock()
-                .map_err(|_| PmUserStreamRuntimeError::StatePoisoned)?;
-            state.validate_final_core(&ticket.core, after)?;
-        }
-        if self.shared.activity.generation() != ticket.core.activity_generation {
-            return Err(PmUserStreamRuntimeError::ConcurrentActivity);
-        }
-
-        let FinalCutTicket {
-            core,
-            marker,
-            rest_cut_identity,
-        } = ticket;
-        Ok(FinalCutJoinFields {
-            scope: core.scope,
-            proxy_maker: core.proxy_maker,
-            stream_revision: core.state_generation,
-            connection_epoch: core.connection_epoch,
-            connection_open_generation: core.connection_open_generation,
-            subscription_generation: core.subscription_generation,
-            ping_generation: core.ping_generation,
-            correlated_pong_generation: core.correlated_pong_generation,
-            admitted_activity_generation: core.activity_generation,
-            business_basis: core.business_basis,
-            business_events: core.business_events,
-            _same_authority: marker,
-            rest_cut_identity,
-        })
+        self.shared.recheck_online_preflight_core(&ticket.core)
     }
 }
 
@@ -371,6 +392,44 @@ pub(super) struct FinalCutTicket {
     rest_cut_identity: Arc<PmRestCutIdentity>,
 }
 
+impl FinalCutTicket {
+    /// Convert the sole final ticket into the sole online-preflight lease. The
+    /// conversion consumes every field, so a ticket and lease cannot coexist.
+    pub(super) fn into_online_preflight_lease(self) -> PmUserOnlinePreflightLease {
+        PmUserOnlinePreflightLease { ticket: self }
+    }
+
+    fn into_join_fields(self) -> FinalCutJoinFields {
+        let FinalCutTicket {
+            core,
+            marker,
+            rest_cut_identity,
+        } = self;
+        FinalCutJoinFields {
+            scope: core.scope,
+            proxy_maker: core.proxy_maker,
+            stream_revision: core.state_generation,
+            initial_connection_epoch: core.initial_connection_epoch,
+            connection_epoch: core.connection_epoch,
+            connection_open_generation: core.connection_open_generation,
+            connection_open_clock: core.connection_open_clock,
+            subscription_generation: core.subscription_generation,
+            subscription_clock: core.subscription_clock,
+            ping_generation: core.ping_generation,
+            ping_clock: core.ping_clock,
+            correlated_pong_generation: core.correlated_pong_generation,
+            correlated_pong_clock: core.correlated_pong_clock,
+            admitted_activity_generation: core.activity_generation,
+            reconnect_count: core.reconnect_count,
+            reconnect_history: core.reconnect_history,
+            business_basis: core.business_basis,
+            business_events: core.business_events,
+            _same_authority: marker,
+            rest_cut_identity,
+        }
+    }
+}
+
 impl fmt::Debug for FinalCutTicket {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -379,6 +438,147 @@ impl fmt::Debug for FinalCutTicket {
             .field("stream_revision", &self.core.state_generation)
             .field("activity_generation", &self.core.activity_generation)
             .field("rest", &"<same-authority complete cut>")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Move-only online preflight lease retaining the complete same-authority
+/// user/REST ticket. Inspection is borrowed only; no caller can supply a
+/// clock, generation, hash, authority marker, event, or REST identity.
+#[must_use = "the online preflight lease must be rechecked and consumed"]
+pub(super) struct PmUserOnlinePreflightLease {
+    ticket: FinalCutTicket,
+}
+
+impl PmUserOnlinePreflightLease {
+    #[must_use]
+    pub(super) const fn scope(&self) -> PmWireScope {
+        self.ticket.core.scope
+    }
+
+    #[must_use]
+    pub(super) const fn proxy_maker(&self) -> EvmAddress {
+        self.ticket.core.proxy_maker
+    }
+
+    #[must_use]
+    pub(super) const fn stream_revision(&self) -> u64 {
+        self.ticket.core.state_generation
+    }
+
+    #[must_use]
+    pub(super) const fn initial_connection_epoch(&self) -> ConnectionEpoch {
+        self.ticket.core.initial_connection_epoch
+    }
+
+    #[must_use]
+    pub(super) const fn current_connection_epoch(&self) -> ConnectionEpoch {
+        self.ticket.core.connection_epoch
+    }
+
+    #[must_use]
+    pub(super) const fn connection_open_generation(&self) -> u64 {
+        self.ticket.core.connection_open_generation
+    }
+
+    #[must_use]
+    pub(super) const fn connection_open_clock(&self) -> PmUserWsEdgeClock {
+        self.ticket.core.connection_open_clock
+    }
+
+    #[must_use]
+    pub(super) const fn subscription_generation(&self) -> u64 {
+        self.ticket.core.subscription_generation
+    }
+
+    #[must_use]
+    pub(super) const fn subscription_clock(&self) -> PmUserWsEdgeClock {
+        self.ticket.core.subscription_clock
+    }
+
+    #[must_use]
+    pub(super) const fn ping_generation(&self) -> u64 {
+        self.ticket.core.ping_generation
+    }
+
+    #[must_use]
+    pub(super) const fn ping_clock(&self) -> PmUserWsEdgeClock {
+        self.ticket.core.ping_clock
+    }
+
+    #[must_use]
+    pub(super) const fn correlated_pong_generation(&self) -> u64 {
+        self.ticket.core.correlated_pong_generation
+    }
+
+    #[must_use]
+    pub(super) const fn correlated_pong_clock(&self) -> PmUserWsEdgeClock {
+        self.ticket.core.correlated_pong_clock
+    }
+
+    #[must_use]
+    pub(super) const fn admitted_activity_generation(&self) -> u64 {
+        self.ticket.core.activity_generation
+    }
+
+    #[must_use]
+    pub(super) const fn reconnect_count(&self) -> u8 {
+        self.ticket.core.reconnect_count
+    }
+
+    #[must_use]
+    pub(super) fn reconnect_history(&self) -> &[PmUserStreamReconnectEvidence] {
+        &self.ticket.core.reconnect_history
+    }
+
+    #[must_use]
+    pub(super) const fn business_basis(&self) -> &FinalCutBusinessBasis {
+        &self.ticket.core.business_basis
+    }
+
+    #[must_use]
+    pub(super) fn business_events(&self) -> &[PmUserStreamBusinessEventProjection] {
+        &self.ticket.core.business_events
+    }
+
+    #[must_use]
+    pub(super) fn current_epoch_business_events(&self) -> &[PmUserStreamBusinessEventProjection] {
+        let (start, count) = self.ticket.core.business_basis.current_epoch_event_range();
+        &self.ticket.core.business_events[start..start + count]
+    }
+
+    /// Join the retained allocation to the exact fresh authenticated REST cut
+    /// without releasing either side's `Arc`.
+    #[must_use]
+    pub(super) fn matches_fresh_rest_cut(&self, cut: &PmFreshAuthenticatedRestCut) -> bool {
+        cut.matches_rest_cut_identity(&self.ticket.rest_cut_identity)
+    }
+
+    #[must_use]
+    pub(super) const fn open_order_rows(&self) -> usize {
+        self.ticket.core.business_basis.rest_row_counts().0
+    }
+
+    #[must_use]
+    pub(super) const fn trade_rows(&self) -> usize {
+        self.ticket.core.business_basis.rest_row_counts().1
+    }
+}
+
+impl fmt::Debug for PmUserOnlinePreflightLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PmUserOnlinePreflightLease")
+            .field("stream_revision", &self.stream_revision())
+            .field("initial_epoch", &self.initial_connection_epoch())
+            .field("current_epoch", &self.current_connection_epoch())
+            .field(
+                "admitted_activity_generation",
+                &self.admitted_activity_generation(),
+            )
+            .field("reconnect_count", &self.reconnect_count())
+            .field("business_basis", &self.business_basis())
+            .field("rest", &"<same-authority opaque allocation>")
             .finish_non_exhaustive()
     }
 }
@@ -852,12 +1052,19 @@ pub(super) struct FinalCutJoinFields {
     scope: PmWireScope,
     proxy_maker: EvmAddress,
     stream_revision: u64,
+    initial_connection_epoch: ConnectionEpoch,
     connection_epoch: ConnectionEpoch,
     connection_open_generation: u64,
+    connection_open_clock: PmUserWsEdgeClock,
     subscription_generation: u64,
+    subscription_clock: PmUserWsEdgeClock,
     ping_generation: u64,
+    ping_clock: PmUserWsEdgeClock,
     correlated_pong_generation: u64,
+    correlated_pong_clock: PmUserWsEdgeClock,
     admitted_activity_generation: u64,
+    reconnect_count: u8,
+    reconnect_history: Box<[PmUserStreamReconnectEvidence]>,
     business_basis: FinalCutBusinessBasis,
     business_events: Box<[PmUserStreamBusinessEventProjection]>,
     _same_authority: PmSameCredentialAuthorityMarker,
@@ -881,7 +1088,17 @@ impl FinalCutJoinFields {
     }
 
     #[must_use]
+    pub(super) const fn initial_connection_epoch(&self) -> ConnectionEpoch {
+        self.initial_connection_epoch
+    }
+
+    #[must_use]
     pub(super) const fn connection_epoch(&self) -> ConnectionEpoch {
+        self.connection_epoch
+    }
+
+    #[must_use]
+    pub(super) const fn current_connection_epoch(&self) -> ConnectionEpoch {
         self.connection_epoch
     }
 
@@ -891,8 +1108,18 @@ impl FinalCutJoinFields {
     }
 
     #[must_use]
+    pub(super) const fn connection_open_clock(&self) -> PmUserWsEdgeClock {
+        self.connection_open_clock
+    }
+
+    #[must_use]
     pub(super) const fn subscription_generation(&self) -> u64 {
         self.subscription_generation
+    }
+
+    #[must_use]
+    pub(super) const fn subscription_clock(&self) -> PmUserWsEdgeClock {
+        self.subscription_clock
     }
 
     #[must_use]
@@ -901,13 +1128,35 @@ impl FinalCutJoinFields {
     }
 
     #[must_use]
+    pub(super) const fn latest_ping_clock(&self) -> PmUserWsEdgeClock {
+        self.ping_clock
+    }
+
+    #[must_use]
     pub(super) const fn correlated_pong_generation(&self) -> u64 {
         self.correlated_pong_generation
+    }
+
+    /// Source-issued monotonic PONG edge retained for the later same-domain
+    /// public-book lease age comparison. This module does not claim freshness.
+    #[must_use]
+    pub(super) const fn correlated_pong_clock(&self) -> PmUserWsEdgeClock {
+        self.correlated_pong_clock
     }
 
     #[must_use]
     pub(super) const fn admitted_activity_generation(&self) -> u64 {
         self.admitted_activity_generation
+    }
+
+    #[must_use]
+    pub(super) const fn reconnect_count(&self) -> u8 {
+        self.reconnect_count
+    }
+
+    #[must_use]
+    pub(super) fn reconnect_history(&self) -> &[PmUserStreamReconnectEvidence] {
+        &self.reconnect_history
     }
 
     #[must_use]
@@ -941,9 +1190,11 @@ impl FinalCutJoinFields {
         &self.business_events[start..start + count]
     }
 
+    /// Join the retained allocation to the exact fresh authenticated REST cut
+    /// without releasing either side's `Arc`.
     #[must_use]
-    pub(super) const fn rest_cut_identity(&self) -> &Arc<PmRestCutIdentity> {
-        &self.rest_cut_identity
+    pub(super) fn matches_fresh_rest_cut(&self, cut: &PmFreshAuthenticatedRestCut) -> bool {
+        cut.matches_rest_cut_identity(&self.rest_cut_identity)
     }
 }
 
@@ -954,6 +1205,7 @@ impl fmt::Debug for FinalCutJoinFields {
             .field("scope", &"<fixed; redacted>")
             .field("proxy_maker", &"<redacted>")
             .field("stream_revision", &self.stream_revision)
+            .field("initial_epoch", &self.initial_connection_epoch)
             .field("epoch", &self.connection_epoch)
             .field("subscription_generation", &self.subscription_generation)
             .field("ping_generation", &self.ping_generation)
@@ -965,6 +1217,7 @@ impl fmt::Debug for FinalCutJoinFields {
                 "admitted_activity_generation",
                 &self.admitted_activity_generation,
             )
+            .field("reconnect_count", &self.reconnect_count)
             .field("business_basis", &self.business_basis)
             .field("business_event_count", &self.business_events.len())
             .field("rest_cut", &"<opaque allocation>")
@@ -996,6 +1249,12 @@ pub(super) enum PmUserStreamRuntimeError {
     ActivityDiscontinuity,
     #[error("user-stream source high-water preceded admitted evidence")]
     InvalidSourceHighWater,
+    #[error("user-stream source monotonic clock regressed")]
+    ClockRegression,
+    #[error("user-stream lifecycle generation and source-clock evidence disagreed")]
+    ClockEvidenceMismatch,
+    #[error("user-stream reconnect attempt or retained history was inconsistent")]
+    ReconnectHistoryMismatch,
     #[error("user-stream event carried a foreign condition or connection epoch")]
     ConnectionMismatch,
     #[error("user-stream lifecycle event was out of order")]
@@ -1036,7 +1295,175 @@ enum UserStreamPhase {
 struct RetiredConnection {
     epoch: ConnectionEpoch,
     activity_generation: u64,
+    clock: PmUserWsEdgeClock,
     reason: PmUserWsDisconnectReason,
+    connection_open: Option<UserStreamLifecycleEdge>,
+    subscription: Option<UserStreamLifecycleEdge>,
+    latest_ping: Option<UserStreamLifecycleEdge>,
+    correlated_pong: Option<UserStreamLifecycleEdge>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UserStreamLifecycleEdge {
+    activity_generation: u64,
+    clock: PmUserWsEdgeClock,
+}
+
+/// Closed, source-issued history for one retired connection and its scheduled
+/// replacement. No caller clock or inferred timestamp can enter this value.
+#[derive(PartialEq, Eq)]
+pub(super) struct PmUserStreamReconnectEvidence {
+    retired_epoch: ConnectionEpoch,
+    replacement_epoch: ConnectionEpoch,
+    reconnect_attempt: u8,
+    reason: PmUserWsDisconnectReason,
+    backoff: Duration,
+    connection_open: Option<UserStreamLifecycleEdge>,
+    subscription: Option<UserStreamLifecycleEdge>,
+    latest_ping: Option<UserStreamLifecycleEdge>,
+    correlated_pong: Option<UserStreamLifecycleEdge>,
+    retirement: UserStreamLifecycleEdge,
+    reconnect_scheduled: UserStreamLifecycleEdge,
+}
+
+impl PmUserStreamReconnectEvidence {
+    #[must_use]
+    pub(super) const fn retired_epoch(&self) -> ConnectionEpoch {
+        self.retired_epoch
+    }
+
+    #[must_use]
+    pub(super) const fn replacement_epoch(&self) -> ConnectionEpoch {
+        self.replacement_epoch
+    }
+
+    #[must_use]
+    pub(super) const fn reconnect_attempt(&self) -> u8 {
+        self.reconnect_attempt
+    }
+
+    #[must_use]
+    pub(super) const fn reason(&self) -> PmUserWsDisconnectReason {
+        self.reason
+    }
+
+    #[must_use]
+    pub(super) const fn backoff(&self) -> Duration {
+        self.backoff
+    }
+
+    #[must_use]
+    pub(super) const fn connection_open_generation(&self) -> Option<u64> {
+        match self.connection_open {
+            Some(edge) => Some(edge.activity_generation),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub(super) const fn connection_open_clock(&self) -> Option<PmUserWsEdgeClock> {
+        match self.connection_open {
+            Some(edge) => Some(edge.clock),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub(super) const fn subscription_generation(&self) -> Option<u64> {
+        match self.subscription {
+            Some(edge) => Some(edge.activity_generation),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub(super) const fn subscription_clock(&self) -> Option<PmUserWsEdgeClock> {
+        match self.subscription {
+            Some(edge) => Some(edge.clock),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub(super) const fn latest_ping_generation(&self) -> Option<u64> {
+        match self.latest_ping {
+            Some(edge) => Some(edge.activity_generation),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub(super) const fn latest_ping_clock(&self) -> Option<PmUserWsEdgeClock> {
+        match self.latest_ping {
+            Some(edge) => Some(edge.clock),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub(super) const fn correlated_pong_generation(&self) -> Option<u64> {
+        match self.correlated_pong {
+            Some(edge) => Some(edge.activity_generation),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub(super) const fn correlated_pong_clock(&self) -> Option<PmUserWsEdgeClock> {
+        match self.correlated_pong {
+            Some(edge) => Some(edge.clock),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub(super) const fn retirement_activity_generation(&self) -> u64 {
+        self.retirement.activity_generation
+    }
+
+    #[must_use]
+    pub(super) const fn retirement_clock(&self) -> PmUserWsEdgeClock {
+        self.retirement.clock
+    }
+
+    #[must_use]
+    pub(super) const fn reconnect_activity_generation(&self) -> u64 {
+        self.reconnect_scheduled.activity_generation
+    }
+
+    #[must_use]
+    pub(super) const fn reconnect_clock(&self) -> PmUserWsEdgeClock {
+        self.reconnect_scheduled.clock
+    }
+
+    fn duplicate_for_ticket(&self) -> Self {
+        Self {
+            retired_epoch: self.retired_epoch,
+            replacement_epoch: self.replacement_epoch,
+            reconnect_attempt: self.reconnect_attempt,
+            reason: self.reason,
+            backoff: self.backoff,
+            connection_open: self.connection_open,
+            subscription: self.subscription,
+            latest_ping: self.latest_ping,
+            correlated_pong: self.correlated_pong,
+            retirement: self.retirement,
+            reconnect_scheduled: self.reconnect_scheduled,
+        }
+    }
+}
+
+impl fmt::Debug for PmUserStreamReconnectEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PmUserStreamReconnectEvidence")
+            .field("retired_epoch", &self.retired_epoch)
+            .field("replacement_epoch", &self.replacement_epoch)
+            .field("reconnect_attempt", &self.reconnect_attempt)
+            .field("reason", &self.reason)
+            .field("source_clocks_retained", &true)
+            .finish_non_exhaustive()
+    }
 }
 
 struct PmUserStreamState {
@@ -1046,17 +1473,25 @@ struct PmUserStreamState {
     task_active: bool,
     state_generation: u64,
     admitted_activity_generation: u64,
+    last_admitted_clock: Option<PmUserWsEdgeClock>,
+    initial_connection_epoch: Option<ConnectionEpoch>,
     active_epoch: Option<ConnectionEpoch>,
     last_connection_epoch: Option<ConnectionEpoch>,
     connection_open_generation: Option<u64>,
+    connection_open_clock: Option<PmUserWsEdgeClock>,
     subscription_generation: Option<u64>,
+    subscription_clock: Option<PmUserWsEdgeClock>,
     pending_ping_generation: Option<u64>,
+    pending_ping_clock: Option<PmUserWsEdgeClock>,
     last_ping_generation: Option<u64>,
+    last_ping_clock: Option<PmUserWsEdgeClock>,
     correlated_pong_generation: Option<u64>,
+    correlated_pong_clock: Option<PmUserWsEdgeClock>,
     business_events: Vec<PmUserStreamBusinessEventProjection>,
     current_epoch_event_start: Option<usize>,
     last_current_epoch_business_activity_generation: Option<u64>,
     retired: Option<RetiredConnection>,
+    reconnect_history: Vec<PmUserStreamReconnectEvidence>,
 }
 
 impl PmUserStreamState {
@@ -1070,17 +1505,25 @@ impl PmUserStreamState {
             task_active: true,
             state_generation: 1,
             admitted_activity_generation: 0,
+            last_admitted_clock: None,
+            initial_connection_epoch: None,
             active_epoch: None,
             last_connection_epoch: None,
             connection_open_generation: None,
+            connection_open_clock: None,
             subscription_generation: None,
+            subscription_clock: None,
             pending_ping_generation: None,
+            pending_ping_clock: None,
             last_ping_generation: None,
+            last_ping_clock: None,
             correlated_pong_generation: None,
+            correlated_pong_clock: None,
             business_events: Vec::new(),
             current_epoch_event_start: None,
             last_current_epoch_business_activity_generation: None,
             retired: None,
+            reconnect_history: Vec::new(),
         }
     }
 
@@ -1095,24 +1538,28 @@ impl PmUserStreamState {
                 observation.connection(),
                 generation,
                 source_high_water,
+                observation.clock(),
                 UserStreamAdmission::ConnectionOpened,
             ),
             PmUserWsEvent::SubscriptionSent(observation) => self.admit_edge(
                 observation.connection(),
                 generation,
                 source_high_water,
+                observation.clock(),
                 UserStreamAdmission::SubscriptionSent,
             ),
             PmUserWsEvent::PingSent(observation) => self.admit_edge(
                 observation.connection(),
                 generation,
                 source_high_water,
+                observation.clock(),
                 UserStreamAdmission::PingSent,
             ),
             PmUserWsEvent::Pong(observation) => self.admit_edge(
                 observation.connection(),
                 generation,
                 source_high_water,
+                observation.clock(),
                 UserStreamAdmission::Pong,
             ),
             PmUserWsEvent::BoundFrame(frame) => {
@@ -1121,38 +1568,53 @@ impl PmUserStreamState {
                     observation.connection(),
                     generation,
                     source_high_water,
+                    observation.clock(),
                     UserStreamAdmission::Business(frame.events()),
                 )
             }
-            PmUserWsEvent::ConnectionRetired(retired) => self.admit_edge(
-                retired.observation().connection(),
-                generation,
-                source_high_water,
-                UserStreamAdmission::ConnectionRetired(retired.reason()),
-            ),
-            PmUserWsEvent::ReconnectScheduled(reconnect) => {
-                let retired = reconnect.retired();
+            PmUserWsEvent::ConnectionRetired(retired) => {
+                let observation = retired.observation();
                 self.admit_edge(
-                    retired.observation().connection(),
+                    observation.connection(),
                     generation,
                     source_high_water,
+                    observation.clock(),
+                    UserStreamAdmission::ConnectionRetired(retired.reason()),
+                )
+            }
+            PmUserWsEvent::ReconnectScheduled(reconnect) => {
+                let retired = reconnect.retired();
+                let retired_observation = retired.observation();
+                self.admit_edge(
+                    retired_observation.connection(),
+                    generation,
+                    source_high_water,
+                    reconnect.scheduled_clock(),
                     UserStreamAdmission::ReconnectScheduled {
                         replacement_epoch: reconnect.replacement_epoch(),
-                        retired_generation: retired.observation().activity_generation(),
+                        retired_generation: retired_observation.activity_generation(),
+                        retired_clock: retired_observation.clock(),
                         reason: retired.reason(),
+                        reconnect_attempt: reconnect.reconnect_attempt(),
+                        backoff: reconnect.backoff(),
                     },
                 )
             }
-            PmUserWsEvent::RetryExhausted(retired) => self.admit_edge(
-                retired.observation().connection(),
-                generation,
-                source_high_water,
-                UserStreamAdmission::RetryExhausted(retired.reason()),
-            ),
+            PmUserWsEvent::RetryExhausted(retired) => {
+                let observation = retired.observation();
+                self.admit_edge(
+                    observation.connection(),
+                    generation,
+                    source_high_water,
+                    observation.clock(),
+                    UserStreamAdmission::RetryExhausted(retired.reason()),
+                )
+            }
             PmUserWsEvent::Shutdown(observation) => self.admit_edge(
                 observation.connection(),
                 generation,
                 source_high_water,
+                observation.clock(),
                 UserStreamAdmission::Shutdown,
             ),
         };
@@ -1167,9 +1629,11 @@ impl PmUserStreamState {
         connection: PmUserWsConnection,
         generation: u64,
         source_high_water: u64,
+        clock: PmUserWsEdgeClock,
         admission: UserStreamAdmission<'_>,
     ) -> Result<(), PmUserStreamRuntimeError> {
         self.validate_next_activity(generation, source_high_water)?;
+        self.validate_next_clock(clock)?;
         if !self.task_active {
             return Err(PmUserStreamRuntimeError::TaskExited);
         }
@@ -1178,13 +1642,14 @@ impl PmUserStreamState {
         }
 
         match admission {
-            UserStreamAdmission::ConnectionOpened => self.open(connection, generation)?,
+            UserStreamAdmission::ConnectionOpened => self.open(connection, generation, clock)?,
             UserStreamAdmission::SubscriptionSent => {
                 self.require_active_connection(connection)?;
                 if self.phase != UserStreamPhase::Opened {
                     return Err(PmUserStreamRuntimeError::LifecycleMismatch);
                 }
                 self.subscription_generation = Some(generation);
+                self.subscription_clock = Some(clock);
                 self.phase = UserStreamPhase::Subscribed;
             }
             UserStreamAdmission::PingSent => {
@@ -1196,8 +1661,11 @@ impl PmUserStreamState {
                     return Err(PmUserStreamRuntimeError::LifecycleMismatch);
                 }
                 self.pending_ping_generation = Some(generation);
+                self.pending_ping_clock = Some(clock);
                 self.last_ping_generation = Some(generation);
+                self.last_ping_clock = Some(clock);
                 self.correlated_pong_generation = None;
+                self.correlated_pong_clock = None;
                 self.phase = UserStreamPhase::AwaitingPong;
             }
             UserStreamAdmission::Pong => {
@@ -1206,10 +1674,18 @@ impl PmUserStreamState {
                     .pending_ping_generation
                     .take()
                     .ok_or(PmUserStreamRuntimeError::LifecycleMismatch)?;
-                if self.phase != UserStreamPhase::AwaitingPong || generation <= ping {
+                let ping_clock = self
+                    .pending_ping_clock
+                    .take()
+                    .ok_or(PmUserStreamRuntimeError::ClockEvidenceMismatch)?;
+                if self.phase != UserStreamPhase::AwaitingPong
+                    || generation <= ping
+                    || clock.monotonic_receive_ns() < ping_clock.monotonic_receive_ns()
+                {
                     return Err(PmUserStreamRuntimeError::LifecycleMismatch);
                 }
                 self.correlated_pong_generation = Some(generation);
+                self.correlated_pong_clock = Some(clock);
                 self.phase = UserStreamPhase::Ready;
             }
             UserStreamAdmission::Business(events) => {
@@ -1235,6 +1711,7 @@ impl PmUserStreamState {
                             return Err(PmUserStreamRuntimeError::ConnectionMismatch);
                         }
                         self.last_connection_epoch = Some(epoch);
+                        self.initial_connection_epoch.get_or_insert(epoch);
                     }
                     UserStreamPhase::Opened
                     | UserStreamPhase::Subscribed
@@ -1245,7 +1722,24 @@ impl PmUserStreamState {
                 self.retired = Some(RetiredConnection {
                     epoch,
                     activity_generation: generation,
+                    clock,
                     reason,
+                    connection_open: Self::lifecycle_edge(
+                        self.connection_open_generation,
+                        self.connection_open_clock,
+                    )?,
+                    subscription: Self::lifecycle_edge(
+                        self.subscription_generation,
+                        self.subscription_clock,
+                    )?,
+                    latest_ping: Self::lifecycle_edge(
+                        self.last_ping_generation,
+                        self.last_ping_clock,
+                    )?,
+                    correlated_pong: Self::lifecycle_edge(
+                        self.correlated_pong_generation,
+                        self.correlated_pong_clock,
+                    )?,
                 });
                 self.active_epoch = None;
                 self.clear_readiness();
@@ -1254,7 +1748,10 @@ impl PmUserStreamState {
             UserStreamAdmission::ReconnectScheduled {
                 replacement_epoch,
                 retired_generation,
+                retired_clock,
                 reason,
+                reconnect_attempt,
+                backoff,
             } => {
                 let retired = self
                     .retired
@@ -1272,6 +1769,37 @@ impl PmUserStreamState {
                 {
                     return Err(PmUserStreamRuntimeError::LifecycleMismatch);
                 }
+                if retired_clock != retired.clock {
+                    return Err(PmUserStreamRuntimeError::ClockEvidenceMismatch);
+                }
+                let expected_attempt = self
+                    .reconnect_history
+                    .len()
+                    .checked_add(1)
+                    .and_then(|value| u8::try_from(value).ok())
+                    .ok_or(PmUserStreamRuntimeError::ReconnectHistoryMismatch)?;
+                if reconnect_attempt != expected_attempt {
+                    return Err(PmUserStreamRuntimeError::ReconnectHistoryMismatch);
+                }
+                self.reconnect_history.push(PmUserStreamReconnectEvidence {
+                    retired_epoch: retired.epoch,
+                    replacement_epoch,
+                    reconnect_attempt,
+                    reason,
+                    backoff,
+                    connection_open: retired.connection_open,
+                    subscription: retired.subscription,
+                    latest_ping: retired.latest_ping,
+                    correlated_pong: retired.correlated_pong,
+                    retirement: UserStreamLifecycleEdge {
+                        activity_generation: retired.activity_generation,
+                        clock: retired.clock,
+                    },
+                    reconnect_scheduled: UserStreamLifecycleEdge {
+                        activity_generation: generation,
+                        clock,
+                    },
+                });
                 self.phase = UserStreamPhase::AwaitingOpen {
                     replacement_epoch: Some(replacement_epoch),
                 };
@@ -1313,13 +1841,14 @@ impl PmUserStreamState {
             }
         }
 
-        self.finish_activity(generation)
+        self.finish_activity(generation, clock)
     }
 
     fn open(
         &mut self,
         connection: PmUserWsConnection,
         generation: u64,
+        clock: PmUserWsEdgeClock,
     ) -> Result<(), PmUserStreamRuntimeError> {
         let replacement_epoch = match self.phase {
             UserStreamPhase::AwaitingOpen { replacement_epoch } => replacement_epoch,
@@ -1332,13 +1861,19 @@ impl PmUserStreamState {
         {
             return Err(PmUserStreamRuntimeError::ConnectionMismatch);
         }
+        self.initial_connection_epoch.get_or_insert(epoch);
         self.active_epoch = Some(epoch);
         self.last_connection_epoch = Some(epoch);
         self.connection_open_generation = Some(generation);
+        self.connection_open_clock = Some(clock);
         self.subscription_generation = None;
+        self.subscription_clock = None;
         self.pending_ping_generation = None;
+        self.pending_ping_clock = None;
         self.last_ping_generation = None;
+        self.last_ping_clock = None;
         self.correlated_pong_generation = None;
+        self.correlated_pong_clock = None;
         self.current_epoch_event_start = Some(self.business_events.len());
         self.last_current_epoch_business_activity_generation = None;
         self.retired = None;
@@ -1362,6 +1897,33 @@ impl PmUserStreamState {
             return Err(PmUserStreamRuntimeError::InvalidSourceHighWater);
         }
         Ok(())
+    }
+
+    fn validate_next_clock(
+        &self,
+        clock: PmUserWsEdgeClock,
+    ) -> Result<(), PmUserStreamRuntimeError> {
+        if self
+            .last_admitted_clock
+            .is_some_and(|previous| clock.monotonic_receive_ns() < previous.monotonic_receive_ns())
+        {
+            return Err(PmUserStreamRuntimeError::ClockRegression);
+        }
+        Ok(())
+    }
+
+    fn lifecycle_edge(
+        generation: Option<u64>,
+        clock: Option<PmUserWsEdgeClock>,
+    ) -> Result<Option<UserStreamLifecycleEdge>, PmUserStreamRuntimeError> {
+        match (generation, clock) {
+            (Some(activity_generation), Some(clock)) => Ok(Some(UserStreamLifecycleEdge {
+                activity_generation,
+                clock,
+            })),
+            (None, None) => Ok(None),
+            _ => Err(PmUserStreamRuntimeError::ClockEvidenceMismatch),
+        }
     }
 
     fn require_active_connection(
@@ -1494,8 +2056,13 @@ impl PmUserStreamState {
         }
     }
 
-    fn finish_activity(&mut self, generation: u64) -> Result<(), PmUserStreamRuntimeError> {
+    fn finish_activity(
+        &mut self,
+        generation: u64,
+        clock: PmUserWsEdgeClock,
+    ) -> Result<(), PmUserStreamRuntimeError> {
         self.admitted_activity_generation = generation;
+        self.last_admitted_clock = Some(clock);
         self.bump_state_generation()
     }
 
@@ -1531,10 +2098,15 @@ impl PmUserStreamState {
 
     fn clear_readiness(&mut self) {
         self.connection_open_generation = None;
+        self.connection_open_clock = None;
         self.subscription_generation = None;
+        self.subscription_clock = None;
         self.pending_ping_generation = None;
+        self.pending_ping_clock = None;
         self.last_ping_generation = None;
+        self.last_ping_clock = None;
         self.correlated_pong_generation = None;
+        self.correlated_pong_clock = None;
     }
 
     fn collection_boundary(
@@ -1620,12 +2192,24 @@ impl PmUserStreamState {
             scope: self.scope,
             proxy_maker: self.proxy_maker,
             state_generation: self.state_generation,
+            initial_connection_epoch: evidence.initial_connection_epoch,
             connection_epoch: evidence.connection_epoch,
             connection_open_generation: evidence.connection_open_generation,
+            connection_open_clock: evidence.connection_open_clock,
             subscription_generation: evidence.subscription_generation,
+            subscription_clock: evidence.subscription_clock,
             ping_generation: evidence.ping_generation,
+            ping_clock: evidence.ping_clock,
             correlated_pong_generation: evidence.correlated_pong_generation,
+            correlated_pong_clock: evidence.correlated_pong_clock,
             activity_generation: self.admitted_activity_generation,
+            reconnect_count: u8::try_from(self.reconnect_history.len())
+                .map_err(|_| PmUserStreamRuntimeError::ReconnectHistoryMismatch)?,
+            reconnect_history: self
+                .reconnect_history
+                .iter()
+                .map(PmUserStreamReconnectEvidence::duplicate_for_ticket)
+                .collect(),
             business_basis,
             business_events: self
                 .business_events
@@ -1644,12 +2228,19 @@ impl PmUserStreamState {
         if core.scope != self.scope
             || core.proxy_maker != self.proxy_maker
             || core.state_generation != self.state_generation
+            || core.initial_connection_epoch != evidence.initial_connection_epoch
             || core.connection_epoch != evidence.connection_epoch
             || core.connection_open_generation != evidence.connection_open_generation
+            || core.connection_open_clock != evidence.connection_open_clock
             || core.subscription_generation != evidence.subscription_generation
+            || core.subscription_clock != evidence.subscription_clock
             || core.ping_generation != evidence.ping_generation
+            || core.ping_clock != evidence.ping_clock
             || core.correlated_pong_generation != evidence.correlated_pong_generation
+            || core.correlated_pong_clock != evidence.correlated_pong_clock
             || core.activity_generation != self.admitted_activity_generation
+            || usize::from(core.reconnect_count) != self.reconnect_history.len()
+            || core.reconnect_history.as_ref() != self.reconnect_history.as_slice()
             || source_high_water != core.activity_generation
             || core.business_events.as_ref() != self.business_events.as_slice()
             || !core.business_basis.matches_state(self)
@@ -1664,20 +2255,35 @@ impl PmUserStreamState {
             return Err(PmUserStreamRuntimeError::HeartbeatNotReady);
         }
         let evidence = ReadyEvidence {
+            initial_connection_epoch: self
+                .initial_connection_epoch
+                .ok_or(PmUserStreamRuntimeError::HeartbeatNotReady)?,
             connection_epoch: self
                 .active_epoch
                 .ok_or(PmUserStreamRuntimeError::HeartbeatNotReady)?,
             connection_open_generation: self
                 .connection_open_generation
                 .ok_or(PmUserStreamRuntimeError::HeartbeatNotReady)?,
+            connection_open_clock: self
+                .connection_open_clock
+                .ok_or(PmUserStreamRuntimeError::HeartbeatNotReady)?,
             subscription_generation: self
                 .subscription_generation
+                .ok_or(PmUserStreamRuntimeError::HeartbeatNotReady)?,
+            subscription_clock: self
+                .subscription_clock
                 .ok_or(PmUserStreamRuntimeError::HeartbeatNotReady)?,
             ping_generation: self
                 .last_ping_generation
                 .ok_or(PmUserStreamRuntimeError::HeartbeatNotReady)?,
+            ping_clock: self
+                .last_ping_clock
+                .ok_or(PmUserStreamRuntimeError::HeartbeatNotReady)?,
             correlated_pong_generation: self
                 .correlated_pong_generation
+                .ok_or(PmUserStreamRuntimeError::HeartbeatNotReady)?,
+            correlated_pong_clock: self
+                .correlated_pong_clock
                 .ok_or(PmUserStreamRuntimeError::HeartbeatNotReady)?,
         };
         if !(evidence.connection_open_generation < evidence.subscription_generation
@@ -1687,11 +2293,120 @@ impl PmUserStreamState {
         {
             return Err(PmUserStreamRuntimeError::HeartbeatNotReady);
         }
+        let clocks = [
+            evidence.connection_open_clock,
+            evidence.subscription_clock,
+            evidence.ping_clock,
+            evidence.correlated_pong_clock,
+        ];
+        if clocks
+            .windows(2)
+            .any(|pair| pair[1].monotonic_receive_ns() < pair[0].monotonic_receive_ns())
+        {
+            return Err(PmUserStreamRuntimeError::ClockRegression);
+        }
+        self.validate_reconnect_history(
+            evidence.initial_connection_epoch,
+            evidence.connection_epoch,
+        )?;
         Ok(evidence)
+    }
+
+    fn validate_reconnect_history(
+        &self,
+        initial_epoch: ConnectionEpoch,
+        current_epoch: ConnectionEpoch,
+    ) -> Result<(), PmUserStreamRuntimeError> {
+        let mut expected_retired_epoch = initial_epoch;
+        let mut prior_clock = None;
+        for (index, entry) in self.reconnect_history.iter().enumerate() {
+            let expected_attempt = u8::try_from(index + 1)
+                .map_err(|_| PmUserStreamRuntimeError::ReconnectHistoryMismatch)?;
+            let expected_replacement = entry
+                .retired_epoch
+                .value()
+                .checked_add(1)
+                .ok_or(PmUserStreamRuntimeError::ReconnectHistoryMismatch)?;
+            if entry.reconnect_attempt != expected_attempt
+                || entry.retired_epoch != expected_retired_epoch
+                || entry.replacement_epoch.value() != expected_replacement
+                || entry.retirement.activity_generation
+                    >= entry.reconnect_scheduled.activity_generation
+            {
+                return Err(PmUserStreamRuntimeError::ReconnectHistoryMismatch);
+            }
+            let mut lifecycle = [
+                entry.connection_open,
+                entry.subscription,
+                entry.latest_ping,
+                entry.correlated_pong,
+                Some(entry.retirement),
+                Some(entry.reconnect_scheduled),
+            ]
+            .into_iter()
+            .flatten();
+            if let Some(first) = lifecycle.next() {
+                if prior_clock.is_some_and(|clock: PmUserWsEdgeClock| {
+                    first.clock.monotonic_receive_ns() < clock.monotonic_receive_ns()
+                }) {
+                    return Err(PmUserStreamRuntimeError::ClockRegression);
+                }
+                let mut previous = first;
+                for edge in lifecycle {
+                    if edge.activity_generation <= previous.activity_generation
+                        || edge.clock.monotonic_receive_ns() < previous.clock.monotonic_receive_ns()
+                    {
+                        return Err(PmUserStreamRuntimeError::ReconnectHistoryMismatch);
+                    }
+                    previous = edge;
+                }
+                prior_clock = Some(previous.clock);
+            }
+            expected_retired_epoch = entry.replacement_epoch;
+        }
+        if expected_retired_epoch != current_epoch {
+            return Err(PmUserStreamRuntimeError::ReconnectHistoryMismatch);
+        }
+        if prior_clock.is_some_and(|clock| {
+            self.connection_open_clock
+                .is_some_and(|opened| opened.monotonic_receive_ns() < clock.monotonic_receive_ns())
+        }) {
+            return Err(PmUserStreamRuntimeError::ClockRegression);
+        }
+        Ok(())
     }
 }
 
 impl FinalCutBusinessBasis {
+    const fn rest_row_counts(&self) -> (usize, usize) {
+        match self {
+            Self::StreamEventsAndRestJoined {
+                open_order_rows,
+                trade_rows,
+                ..
+            }
+            | Self::RestBackedNoStreamEvents {
+                open_order_rows,
+                trade_rows,
+                ..
+            } => (*open_order_rows, *trade_rows),
+        }
+    }
+
+    const fn current_epoch_event_range(&self) -> (usize, usize) {
+        match self {
+            Self::StreamEventsAndRestJoined {
+                current_epoch_event_start,
+                current_epoch_event_count,
+                ..
+            } => (*current_epoch_event_start, *current_epoch_event_count),
+            Self::RestBackedNoStreamEvents {
+                current_epoch_event_start,
+                ..
+            } => (*current_epoch_event_start, 0),
+        }
+    }
+
     fn matches_state(&self, state: &PmUserStreamState) -> bool {
         match self {
             Self::StreamEventsAndRestJoined {
@@ -1734,23 +2449,35 @@ struct CollectionBoundary {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReadyEvidence {
+    initial_connection_epoch: ConnectionEpoch,
     connection_epoch: ConnectionEpoch,
     connection_open_generation: u64,
+    connection_open_clock: PmUserWsEdgeClock,
     subscription_generation: u64,
+    subscription_clock: PmUserWsEdgeClock,
     ping_generation: u64,
+    ping_clock: PmUserWsEdgeClock,
     correlated_pong_generation: u64,
+    correlated_pong_clock: PmUserWsEdgeClock,
 }
 
 struct FinalCutCore {
     scope: PmWireScope,
     proxy_maker: EvmAddress,
     state_generation: u64,
+    initial_connection_epoch: ConnectionEpoch,
     connection_epoch: ConnectionEpoch,
     connection_open_generation: u64,
+    connection_open_clock: PmUserWsEdgeClock,
     subscription_generation: u64,
+    subscription_clock: PmUserWsEdgeClock,
     ping_generation: u64,
+    ping_clock: PmUserWsEdgeClock,
     correlated_pong_generation: u64,
+    correlated_pong_clock: PmUserWsEdgeClock,
     activity_generation: u64,
+    reconnect_count: u8,
+    reconnect_history: Box<[PmUserStreamReconnectEvidence]>,
     business_basis: FinalCutBusinessBasis,
     business_events: Box<[PmUserStreamBusinessEventProjection]>,
 }
@@ -1765,7 +2492,10 @@ enum UserStreamAdmission<'a> {
     ReconnectScheduled {
         replacement_epoch: ConnectionEpoch,
         retired_generation: u64,
+        retired_clock: PmUserWsEdgeClock,
         reason: PmUserWsDisconnectReason,
+        reconnect_attempt: u8,
+        backoff: Duration,
     },
     RetryExhausted(PmUserWsDisconnectReason),
     Shutdown,
@@ -1775,10 +2505,14 @@ enum UserStreamAdmission<'a> {
 mod tests {
     use std::{
         panic::{AssertUnwindSafe, catch_unwind},
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
     };
 
     use reap_pm_core::{PmConditionId, PmMarketId, PmTokenId, U256};
+    use reap_polymarket_auth::EoaAddress;
     use reap_polymarket_wire::{PmLiveUserFrame, parse_live_user_frame};
 
     use super::*;
@@ -1788,6 +2522,7 @@ mod tests {
         "0x2222222222222222222222222222222222222222222222222222222222222222";
     const MARKET: &str = "0x3333333333333333333333333333333333333333333333333333333333333333";
     const PROXY: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+    const SIGNER: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
     const FOREIGN_PROXY: &str = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
     const OWNER: &str = "00000000-0000-4000-8000-000000000001";
     const ORDER: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1805,6 +2540,10 @@ mod tests {
 
     fn proxy() -> EvmAddress {
         EvmAddress::parse(PROXY).unwrap()
+    }
+
+    fn signer() -> EoaAddress {
+        EoaAddress::parse(SIGNER).unwrap()
     }
 
     struct Harness {
@@ -1825,12 +2564,23 @@ mod tests {
             epoch: u64,
             admission: TestAdmission<'_>,
         ) -> Result<(), PmUserStreamRuntimeError> {
+            let next_generation = self.high_water.checked_add(1).unwrap();
+            self.admit_with_clock(epoch, admission, test_clock(next_generation))
+        }
+
+        fn admit_with_clock(
+            &mut self,
+            epoch: u64,
+            admission: TestAdmission<'_>,
+            clock: PmUserWsEdgeClock,
+        ) -> Result<(), PmUserStreamRuntimeError> {
             self.high_water = self.high_water.checked_add(1).unwrap();
             self.state.admit_test_edge(
                 scope().condition(),
                 ConnectionEpoch::new(epoch),
                 self.high_water,
                 self.high_water,
+                clock,
                 admission,
             )
         }
@@ -1865,7 +2615,71 @@ mod tests {
         Reconnect {
             retired_generation: u64,
             replacement_epoch: u64,
+            reconnect_attempt: u8,
+            retired_clock: Option<PmUserWsEdgeClock>,
         },
+    }
+
+    fn test_clock(value: u64) -> PmUserWsEdgeClock {
+        PmUserWsEdgeClock::new(1_000_000 + value, value).unwrap()
+    }
+
+    fn online_preflight_fixture(
+        harness: Harness,
+        open_order_rows: usize,
+        trade_rows: usize,
+    ) -> (
+        PmUserStreamHandle,
+        PmUserOnlinePreflightLease,
+        Arc<PmUserStreamShared>,
+        Arc<AtomicU64>,
+    ) {
+        let boundary = harness.boundary().unwrap();
+        let core = harness
+            .state
+            .finish_rest_collection(boundary, harness.high_water, open_order_rows, trade_rows)
+            .unwrap();
+        let activity = Arc::new(AtomicU64::new(harness.high_water));
+        let shared = Arc::new(PmUserStreamShared {
+            state: Mutex::new(harness.state),
+            activity: RuntimeUserActivityView::Test(Arc::clone(&activity)),
+        });
+        let (marker, rest_cut_identity) =
+            PmSameCredentialAuthorityMarker::test_support_online_preflight_seal(
+                scope(),
+                signer(),
+                proxy(),
+                Arc::clone(&activity),
+            );
+        let ticket_marker = marker.fork_for_same_authority();
+        let handle = PmUserStreamHandle {
+            shared: Arc::clone(&shared),
+            marker,
+        };
+        let lease = FinalCutTicket {
+            core,
+            marker: ticket_marker,
+            rest_cut_identity,
+        }
+        .into_online_preflight_lease();
+        (handle, lease, shared, activity)
+    }
+
+    fn admit_shared(
+        shared: &Arc<PmUserStreamShared>,
+        activity: &Arc<AtomicU64>,
+        epoch: u64,
+        admission: TestAdmission<'_>,
+    ) -> Result<(), PmUserStreamRuntimeError> {
+        let generation = activity.fetch_add(1, Ordering::AcqRel) + 1;
+        shared.state.lock().unwrap().admit_test_edge(
+            scope().condition(),
+            ConnectionEpoch::new(epoch),
+            generation,
+            generation,
+            test_clock(generation),
+            admission,
+        )
     }
 
     impl PmUserStreamState {
@@ -1875,6 +2689,7 @@ mod tests {
             epoch: ConnectionEpoch,
             generation: u64,
             source_high_water: u64,
+            clock: PmUserWsEdgeClock,
             admission: TestAdmission<'_>,
         ) -> Result<(), PmUserStreamRuntimeError> {
             let result = self.admit_test_edge_inner(
@@ -1882,6 +2697,7 @@ mod tests {
                 epoch,
                 generation,
                 source_high_water,
+                clock,
                 admission,
             );
             if result.is_err() {
@@ -1896,9 +2712,11 @@ mod tests {
             epoch: ConnectionEpoch,
             generation: u64,
             source_high_water: u64,
+            clock: PmUserWsEdgeClock,
             admission: TestAdmission<'_>,
         ) -> Result<(), PmUserStreamRuntimeError> {
             self.validate_next_activity(generation, source_high_water)?;
+            self.validate_next_clock(clock)?;
             if condition != self.scope.condition() {
                 return Err(PmUserStreamRuntimeError::ConnectionMismatch);
             }
@@ -1913,13 +2731,19 @@ mod tests {
                     {
                         return Err(PmUserStreamRuntimeError::ConnectionMismatch);
                     }
+                    self.initial_connection_epoch.get_or_insert(epoch);
                     self.active_epoch = Some(epoch);
                     self.last_connection_epoch = Some(epoch);
                     self.connection_open_generation = Some(generation);
+                    self.connection_open_clock = Some(clock);
                     self.subscription_generation = None;
+                    self.subscription_clock = None;
                     self.pending_ping_generation = None;
+                    self.pending_ping_clock = None;
                     self.last_ping_generation = None;
+                    self.last_ping_clock = None;
                     self.correlated_pong_generation = None;
+                    self.correlated_pong_clock = None;
                     self.current_epoch_event_start = Some(self.business_events.len());
                     self.last_current_epoch_business_activity_generation = None;
                     self.retired = None;
@@ -1931,6 +2755,7 @@ mod tests {
                         return Err(PmUserStreamRuntimeError::LifecycleMismatch);
                     }
                     self.subscription_generation = Some(generation);
+                    self.subscription_clock = Some(clock);
                     self.phase = UserStreamPhase::Subscribed;
                 }
                 TestAdmission::Ping => {
@@ -1942,18 +2767,23 @@ mod tests {
                         return Err(PmUserStreamRuntimeError::LifecycleMismatch);
                     }
                     self.pending_ping_generation = Some(generation);
+                    self.pending_ping_clock = Some(clock);
                     self.last_ping_generation = Some(generation);
+                    self.last_ping_clock = Some(clock);
                     self.correlated_pong_generation = None;
+                    self.correlated_pong_clock = None;
                     self.phase = UserStreamPhase::AwaitingPong;
                 }
                 TestAdmission::Pong => {
                     self.require_test_epoch(epoch)?;
                     if self.phase != UserStreamPhase::AwaitingPong
                         || self.pending_ping_generation.take().is_none()
+                        || self.pending_ping_clock.take().is_none()
                     {
                         return Err(PmUserStreamRuntimeError::LifecycleMismatch);
                     }
                     self.correlated_pong_generation = Some(generation);
+                    self.correlated_pong_clock = Some(clock);
                     self.phase = UserStreamPhase::Ready;
                 }
                 TestAdmission::Business(events) => {
@@ -1978,6 +2808,7 @@ mod tests {
                                 return Err(PmUserStreamRuntimeError::ConnectionMismatch);
                             }
                             self.last_connection_epoch = Some(epoch);
+                            self.initial_connection_epoch.get_or_insert(epoch);
                         }
                         UserStreamPhase::Opened
                         | UserStreamPhase::Subscribed
@@ -1988,7 +2819,24 @@ mod tests {
                     self.retired = Some(RetiredConnection {
                         epoch,
                         activity_generation: generation,
+                        clock,
                         reason: PmUserWsDisconnectReason::SocketClosed,
+                        connection_open: Self::lifecycle_edge(
+                            self.connection_open_generation,
+                            self.connection_open_clock,
+                        )?,
+                        subscription: Self::lifecycle_edge(
+                            self.subscription_generation,
+                            self.subscription_clock,
+                        )?,
+                        latest_ping: Self::lifecycle_edge(
+                            self.last_ping_generation,
+                            self.last_ping_clock,
+                        )?,
+                        correlated_pong: Self::lifecycle_edge(
+                            self.correlated_pong_generation,
+                            self.correlated_pong_clock,
+                        )?,
                     });
                     self.active_epoch = None;
                     self.clear_readiness();
@@ -1997,6 +2845,8 @@ mod tests {
                 TestAdmission::Reconnect {
                     retired_generation,
                     replacement_epoch,
+                    reconnect_attempt,
+                    retired_clock,
                 } => {
                     let retired = self.retired.unwrap();
                     if self.phase != UserStreamPhase::Retired
@@ -2006,12 +2856,44 @@ mod tests {
                     {
                         return Err(PmUserStreamRuntimeError::LifecycleMismatch);
                     }
+                    if retired_clock.is_some_and(|value| value != retired.clock) {
+                        return Err(PmUserStreamRuntimeError::ClockEvidenceMismatch);
+                    }
+                    let expected_attempt = self
+                        .reconnect_history
+                        .len()
+                        .checked_add(1)
+                        .and_then(|value| u8::try_from(value).ok())
+                        .ok_or(PmUserStreamRuntimeError::ReconnectHistoryMismatch)?;
+                    if reconnect_attempt != expected_attempt {
+                        return Err(PmUserStreamRuntimeError::ReconnectHistoryMismatch);
+                    }
+                    let replacement_epoch = ConnectionEpoch::new(replacement_epoch);
+                    self.reconnect_history.push(PmUserStreamReconnectEvidence {
+                        retired_epoch: retired.epoch,
+                        replacement_epoch,
+                        reconnect_attempt,
+                        reason: retired.reason,
+                        backoff: Duration::from_millis(1),
+                        connection_open: retired.connection_open,
+                        subscription: retired.subscription,
+                        latest_ping: retired.latest_ping,
+                        correlated_pong: retired.correlated_pong,
+                        retirement: UserStreamLifecycleEdge {
+                            activity_generation: retired.activity_generation,
+                            clock: retired.clock,
+                        },
+                        reconnect_scheduled: UserStreamLifecycleEdge {
+                            activity_generation: generation,
+                            clock,
+                        },
+                    });
                     self.phase = UserStreamPhase::AwaitingOpen {
-                        replacement_epoch: Some(ConnectionEpoch::new(replacement_epoch)),
+                        replacement_epoch: Some(replacement_epoch),
                     };
                 }
             }
-            self.finish_activity(generation)
+            self.finish_activity(generation, clock)
         }
 
         fn require_test_epoch(
@@ -2104,6 +2986,56 @@ mod tests {
             retired.admit(1, TestAdmission::Pong),
             Err(PmUserStreamRuntimeError::ConnectionMismatch)
         );
+    }
+
+    #[test]
+    fn pong_with_an_older_source_monotonic_clock_fails_closed() {
+        let mut harness = Harness::new();
+        harness.admit(3, TestAdmission::Open).unwrap();
+        harness.admit(3, TestAdmission::Subscription).unwrap();
+        harness
+            .admit_with_clock(
+                3,
+                TestAdmission::Ping,
+                PmUserWsEdgeClock::new(2_000_000, 100).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            harness.admit_with_clock(
+                3,
+                TestAdmission::Pong,
+                PmUserWsEdgeClock::new(2_000_001, 99).unwrap(),
+            ),
+            Err(PmUserStreamRuntimeError::ClockRegression)
+        );
+        assert_eq!(harness.state.phase, UserStreamPhase::Faulted);
+        assert_eq!(
+            harness.boundary(),
+            Err(PmUserStreamRuntimeError::HeartbeatNotReady)
+        );
+    }
+
+    #[test]
+    fn reconnect_rejects_a_mismatched_retirement_clock() {
+        let mut harness = Harness::new();
+        harness.ready(4);
+        harness.admit(4, TestAdmission::Retired).unwrap();
+        let retired_generation = harness.high_water;
+        let wrong_retired_clock = PmUserWsEdgeClock::new(9_000_000, 4).unwrap();
+        assert_eq!(
+            harness.admit(
+                4,
+                TestAdmission::Reconnect {
+                    retired_generation,
+                    replacement_epoch: 5,
+                    reconnect_attempt: 1,
+                    retired_clock: Some(wrong_retired_clock),
+                },
+            ),
+            Err(PmUserStreamRuntimeError::ClockEvidenceMismatch)
+        );
+        assert_eq!(harness.state.phase, UserStreamPhase::Faulted);
+        assert!(harness.state.reconnect_history.is_empty());
     }
 
     fn order_frame(condition: &str, token: u64, maker: &str) -> PmLiveUserFrame {
@@ -2370,6 +3302,201 @@ mod tests {
     }
 
     #[test]
+    fn online_preflight_source_basis_is_inspectable_recheckable_and_consumed_once() {
+        let frame = order_frame(CONDITION, 123, PROXY);
+        let mut harness = Harness::new();
+        harness.ready(3);
+        harness
+            .admit(3, TestAdmission::Business(frame.events()))
+            .unwrap();
+        let (mut handle, lease, _shared, _activity) = online_preflight_fixture(harness, 2, 3);
+
+        assert_eq!(lease.scope(), scope());
+        assert_eq!(lease.proxy_maker(), proxy());
+        assert_eq!(lease.stream_revision(), 6);
+        assert_eq!(lease.initial_connection_epoch(), ConnectionEpoch::new(3));
+        assert_eq!(lease.current_connection_epoch(), ConnectionEpoch::new(3));
+        assert_eq!(lease.connection_open_generation(), 1);
+        assert_eq!(lease.subscription_generation(), 2);
+        assert_eq!(lease.ping_generation(), 3);
+        assert_eq!(lease.correlated_pong_generation(), 4);
+        assert_eq!(lease.admitted_activity_generation(), 5);
+        assert_eq!(lease.connection_open_clock(), test_clock(1));
+        assert_eq!(lease.subscription_clock(), test_clock(2));
+        assert_eq!(lease.ping_clock(), test_clock(3));
+        assert_eq!(lease.correlated_pong_clock(), test_clock(4));
+        assert_eq!(lease.reconnect_count(), 0);
+        assert!(lease.reconnect_history().is_empty());
+        assert_eq!(lease.open_order_rows(), 2);
+        assert_eq!(lease.trade_rows(), 3);
+        assert_eq!(lease.business_basis().rest_row_counts(), (2, 3));
+        assert_eq!(lease.business_events().len(), 1);
+        assert_eq!(lease.current_epoch_business_events().len(), 1);
+
+        let lease = handle.recheck_online_preflight_lease(lease).unwrap();
+        assert_eq!(lease.business_events().len(), 1);
+        let fields = handle.consume_online_preflight_lease(lease).unwrap();
+        assert_eq!(fields.scope(), scope());
+        assert_eq!(fields.proxy_maker(), proxy());
+        assert_eq!(fields.stream_revision(), 6);
+        assert_eq!(fields.initial_connection_epoch(), ConnectionEpoch::new(3));
+        assert_eq!(fields.current_connection_epoch(), ConnectionEpoch::new(3));
+        assert_eq!(fields.connection_open_generation(), 1);
+        assert_eq!(fields.connection_open_clock(), test_clock(1));
+        assert_eq!(fields.subscription_generation(), 2);
+        assert_eq!(fields.subscription_clock(), test_clock(2));
+        assert_eq!(fields.ping_generation(), 3);
+        assert_eq!(fields.latest_ping_clock(), test_clock(3));
+        assert_eq!(fields.correlated_pong_generation(), 4);
+        assert_eq!(fields.correlated_pong_clock(), test_clock(4));
+        assert_eq!(fields.admitted_activity_generation(), 5);
+        assert_eq!(fields.reconnect_count(), 0);
+        assert!(fields.reconnect_history().is_empty());
+        assert_eq!(fields.business_basis().rest_row_counts(), (2, 3));
+        assert_eq!(fields.business_events().len(), 1);
+        assert_eq!(fields.current_epoch_business_events().len(), 1);
+    }
+
+    #[test]
+    fn online_preflight_recheck_rejects_queued_reconnect_clock_state_and_exit_drift() {
+        let mut queued = Harness::new();
+        queued.ready(1);
+        let (mut queued_handle, queued_lease, _queued_shared, queued_activity) =
+            online_preflight_fixture(queued, 0, 0);
+        queued_activity.fetch_add(1, Ordering::AcqRel);
+        assert!(
+            queued_handle
+                .recheck_online_preflight_lease(queued_lease)
+                .is_err()
+        );
+
+        let mut retired = Harness::new();
+        retired.ready(4);
+        let (mut retired_handle, retired_lease, retired_shared, retired_activity) =
+            online_preflight_fixture(retired, 0, 0);
+        admit_shared(
+            &retired_shared,
+            &retired_activity,
+            4,
+            TestAdmission::Retired,
+        )
+        .unwrap();
+        assert!(matches!(
+            retired_handle.recheck_online_preflight_lease(retired_lease),
+            Err(PmUserStreamRuntimeError::HeartbeatNotReady)
+        ));
+
+        let mut reconnected = Harness::new();
+        reconnected.ready(7);
+        let (mut reconnected_handle, old_epoch_lease, reconnected_shared, reconnected_activity) =
+            online_preflight_fixture(reconnected, 0, 0);
+        admit_shared(
+            &reconnected_shared,
+            &reconnected_activity,
+            7,
+            TestAdmission::Retired,
+        )
+        .unwrap();
+        let retired_generation = reconnected_activity.load(Ordering::Acquire);
+        admit_shared(
+            &reconnected_shared,
+            &reconnected_activity,
+            7,
+            TestAdmission::Reconnect {
+                retired_generation,
+                replacement_epoch: 8,
+                reconnect_attempt: 1,
+                retired_clock: None,
+            },
+        )
+        .unwrap();
+        admit_shared(
+            &reconnected_shared,
+            &reconnected_activity,
+            8,
+            TestAdmission::Open,
+        )
+        .unwrap();
+        admit_shared(
+            &reconnected_shared,
+            &reconnected_activity,
+            8,
+            TestAdmission::Subscription,
+        )
+        .unwrap();
+        admit_shared(
+            &reconnected_shared,
+            &reconnected_activity,
+            8,
+            TestAdmission::Ping,
+        )
+        .unwrap();
+        admit_shared(
+            &reconnected_shared,
+            &reconnected_activity,
+            8,
+            TestAdmission::Pong,
+        )
+        .unwrap();
+        assert!(
+            reconnected_handle
+                .recheck_online_preflight_lease(old_epoch_lease)
+                .is_err()
+        );
+
+        let mut clock_drift = Harness::new();
+        clock_drift.ready(2);
+        let (mut clock_handle, clock_lease, clock_shared, _clock_activity) =
+            online_preflight_fixture(clock_drift, 0, 0);
+        clock_shared.state.lock().unwrap().correlated_pong_clock =
+            Some(PmUserWsEdgeClock::new(9_000_000, 9_000_000).unwrap());
+        assert!(matches!(
+            clock_handle.recheck_online_preflight_lease(clock_lease),
+            Err(PmUserStreamRuntimeError::TicketInvalidated)
+        ));
+
+        let mut state_drift = Harness::new();
+        state_drift.ready(5);
+        let (mut state_handle, state_lease, state_shared, _state_activity) =
+            online_preflight_fixture(state_drift, 0, 0);
+        state_shared.state.lock().unwrap().state_generation += 1;
+        assert!(matches!(
+            state_handle.recheck_online_preflight_lease(state_lease),
+            Err(PmUserStreamRuntimeError::TicketInvalidated)
+        ));
+
+        let mut exited = Harness::new();
+        exited.ready(6);
+        let (mut exited_handle, exited_lease, exited_shared, _exited_activity) =
+            online_preflight_fixture(exited, 0, 0);
+        exited_shared.state.lock().unwrap().invalidate_task_exit();
+        assert!(matches!(
+            exited_handle.recheck_online_preflight_lease(exited_lease),
+            Err(PmUserStreamRuntimeError::HeartbeatNotReady)
+        ));
+    }
+
+    #[test]
+    fn final_core_rejects_a_clock_value_detached_from_its_source_generation() {
+        let mut harness = Harness::new();
+        harness.ready(2);
+        let boundary = harness.boundary().unwrap();
+        let mut core = harness
+            .state
+            .finish_rest_collection(boundary, harness.high_water, 0, 0)
+            .unwrap();
+        core.correlated_pong_clock = PmUserWsEdgeClock::new(
+            core.correlated_pong_clock.local_wall_receive_ns() + 1,
+            core.correlated_pong_clock.monotonic_receive_ns() + 1,
+        )
+        .unwrap();
+        assert_eq!(
+            harness.state.validate_final_core(&core, harness.high_water),
+            Err(PmUserStreamRuntimeError::TicketInvalidated)
+        );
+    }
+
+    #[test]
     fn retirement_and_reconnect_invalidate_old_cut_and_require_the_replacement_sequence() {
         let mut harness = Harness::new();
         harness.ready(4);
@@ -2388,6 +3515,8 @@ mod tests {
                 TestAdmission::Reconnect {
                     retired_generation,
                     replacement_epoch: 5,
+                    reconnect_attempt: 1,
+                    retired_clock: None,
                 },
             )
             .unwrap();
@@ -2396,6 +3525,113 @@ mod tests {
         harness.admit(5, TestAdmission::Ping).unwrap();
         harness.admit(5, TestAdmission::Pong).unwrap();
         assert_eq!(harness.boundary().unwrap().connection_epoch.value(), 5);
+    }
+
+    #[test]
+    fn final_cut_retains_initial_current_epochs_and_exact_reconnect_clock_history() {
+        let mut harness = Harness::new();
+        harness.ready(4);
+        let first_ready = harness.state.ready_evidence().unwrap();
+        harness.admit(4, TestAdmission::Retired).unwrap();
+        let first_retired_generation = harness.high_water;
+        let first_retired_clock = harness.state.retired.unwrap().clock;
+        harness
+            .admit(
+                4,
+                TestAdmission::Reconnect {
+                    retired_generation: first_retired_generation,
+                    replacement_epoch: 5,
+                    reconnect_attempt: 1,
+                    retired_clock: Some(first_retired_clock),
+                },
+            )
+            .unwrap();
+        harness.ready(5);
+        harness.admit(5, TestAdmission::Retired).unwrap();
+        let second_retired_generation = harness.high_water;
+        let second_retired_clock = harness.state.retired.unwrap().clock;
+        harness
+            .admit(
+                5,
+                TestAdmission::Reconnect {
+                    retired_generation: second_retired_generation,
+                    replacement_epoch: 6,
+                    reconnect_attempt: 2,
+                    retired_clock: Some(second_retired_clock),
+                },
+            )
+            .unwrap();
+        harness.ready(6);
+
+        let boundary = harness.boundary().unwrap();
+        let core = harness
+            .state
+            .finish_rest_collection(boundary, harness.high_water, 0, 0)
+            .unwrap();
+        assert_eq!(core.initial_connection_epoch, ConnectionEpoch::new(4));
+        assert_eq!(core.connection_epoch, ConnectionEpoch::new(6));
+        assert_eq!(core.reconnect_count, 2);
+        assert_eq!(core.reconnect_history.len(), 2);
+        assert_eq!(core.reconnect_history[0].reconnect_attempt(), 1);
+        assert_eq!(core.reconnect_history[0].retired_epoch().value(), 4);
+        assert_eq!(core.reconnect_history[0].replacement_epoch().value(), 5);
+        assert_eq!(
+            core.reconnect_history[0].retirement_activity_generation(),
+            first_retired_generation
+        );
+        assert_eq!(
+            core.reconnect_history[0].retirement_clock(),
+            first_retired_clock
+        );
+        assert_eq!(
+            core.reconnect_history[0].connection_open_clock(),
+            Some(first_ready.connection_open_clock)
+        );
+        assert_eq!(
+            core.reconnect_history[0].correlated_pong_clock(),
+            Some(first_ready.correlated_pong_clock)
+        );
+        assert_eq!(core.reconnect_history[1].reconnect_attempt(), 2);
+        assert_eq!(core.reconnect_history[1].retired_epoch().value(), 5);
+        assert_eq!(core.reconnect_history[1].replacement_epoch().value(), 6);
+        assert_eq!(
+            core.correlated_pong_clock.monotonic_receive_ns(),
+            core.correlated_pong_generation
+        );
+        assert!(
+            core.reconnect_history[1]
+                .reconnect_clock()
+                .monotonic_receive_ns()
+                < core.connection_open_clock.monotonic_receive_ns()
+        );
+    }
+
+    #[test]
+    fn reconnect_attempt_count_and_current_epoch_must_match_history() {
+        let mut wrong_attempt = Harness::new();
+        wrong_attempt.ready(7);
+        wrong_attempt.admit(7, TestAdmission::Retired).unwrap();
+        let retired_generation = wrong_attempt.high_water;
+        assert_eq!(
+            wrong_attempt.admit(
+                7,
+                TestAdmission::Reconnect {
+                    retired_generation,
+                    replacement_epoch: 8,
+                    reconnect_attempt: 2,
+                    retired_clock: None,
+                },
+            ),
+            Err(PmUserStreamRuntimeError::ReconnectHistoryMismatch)
+        );
+
+        let mut wrong_current = Harness::new();
+        wrong_current.ready(9);
+        wrong_current.state.initial_connection_epoch = Some(ConnectionEpoch::new(8));
+        assert_eq!(
+            wrong_current.boundary(),
+            Err(PmUserStreamRuntimeError::ReconnectHistoryMismatch)
+        );
     }
 
     #[test]
@@ -2415,6 +3651,8 @@ mod tests {
                 TestAdmission::Reconnect {
                     retired_generation,
                     replacement_epoch: 5,
+                    reconnect_attempt: 1,
+                    retired_clock: None,
                 },
             )
             .unwrap();
@@ -2476,6 +3714,8 @@ mod tests {
                 TestAdmission::Reconnect {
                     retired_generation,
                     replacement_epoch: 12,
+                    reconnect_attempt: 1,
+                    retired_clock: None,
                 },
             )
             .unwrap();
@@ -2493,6 +3733,8 @@ mod tests {
                 TestAdmission::Reconnect {
                     retired_generation,
                     replacement_epoch: 12,
+                    reconnect_attempt: 1,
+                    retired_clock: None,
                 },
             )
             .unwrap();
@@ -2534,6 +3776,7 @@ mod tests {
                     ConnectionEpoch::new(1),
                     observed,
                     observed,
+                    test_clock(observed.saturating_add(1)),
                     TestAdmission::Open,
                 ),
                 Err(if observed == 0 || observed == 2 || observed == 7 {
@@ -2553,6 +3796,7 @@ mod tests {
                 ConnectionEpoch::new(1),
                 1,
                 1,
+                test_clock(2),
                 TestAdmission::Subscription,
             ),
             Err(PmUserStreamRuntimeError::ActivityDiscontinuity)

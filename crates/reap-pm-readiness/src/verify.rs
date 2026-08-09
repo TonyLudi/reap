@@ -1949,11 +1949,11 @@ mod tests {
 
     fn metadata(config: &PmReadOnlySmokeConfig) -> PmReadOnlyMetadataEvidence {
         let market = format!(
-            r#"{{"condition_id":"{}","question_id":"{}","active":true,"closed":false,"archived":false,"accepting_orders":true,"enable_order_book":true}}"#,
+            r#"{{"condition_id":"{}","question_id":"{}","active":true,"closed":false,"archived":false,"accepting_orders":true,"enable_order_book":true,"accepting_order_timestamp":"2026-08-08T00:00:00Z","end_date_iso":"2027-01-01T00:00:00Z","game_start_time":null,"seconds_delay":0,"minimum_order_size":5,"minimum_tick_size":0.01,"tokens":[]}}"#,
             config.condition_id, config.market_id
         );
         let clob = format!(
-            r#"{{"c":"{}","t":[{{"t":"1234","o":"Yes"}},{{"t":"5678","o":"No"}}],"mts":0.01,"mos":5,"nr":false}}"#,
+            r#"{{"c":"{}","t":[{{"t":"1234","o":"Yes"}},{{"t":"5678","o":"No"}}],"mts":0.01,"mos":5,"nr":false,"fd":{{"r":0.02,"e":2,"to":true}},"mbf":0,"tbf":0,"ao":true,"sd":0,"gst":null,"cbos":true,"aot":"2026-08-08T00:00:00Z","rfqe":false,"itode":false,"ibce":true,"oas":0}}"#,
             config.condition_id,
         );
         PmReadOnlyMetadataEvidence::from_public_bodies(config, market.as_bytes(), clob.as_bytes())

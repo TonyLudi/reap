@@ -283,8 +283,7 @@ async fn collateral_success_then_conditional_failure_never_delivers_a_complete_a
     )
     .expect("partial-account clocked public connectivity")
     .into_roles();
-    let (_, _, read_server_time, private_read_clock, _, _, _, _, _, _, _) =
-        public_roles.into_roles();
+    let (_, _, read_server_time, private_read_clock, _, _, _, _, _, _) = public_roles.into_roles();
 
     let (http_dispatch, http_receiver) = super::http::pm_http_read_channel();
     let http_task = tokio::spawn(super::http::run_http_worker(

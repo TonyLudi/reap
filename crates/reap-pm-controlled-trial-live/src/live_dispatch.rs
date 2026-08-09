@@ -466,6 +466,7 @@ pub(crate) struct PmRevalidatedPhaseAPlaceDispatchGrantV1 {
 /// Non-authority custody of the exact positive barrier after the one dispatch
 /// grant has been consumed at the transport boundary.
 pub(crate) struct PmPhaseAPlaceDispatchBarrierWitnessV1 {
+    profile: PmPhaseAPlaceLiveDispatchProfileV1,
     barrier_file: ProtectedJournal,
     expected_barrier_bytes: Vec<u8>,
 }
@@ -483,6 +484,7 @@ impl PmRevalidatedPhaseAPlaceDispatchGrantV1 {
 
     pub(crate) fn into_barrier_witness(self) -> PmPhaseAPlaceDispatchBarrierWitnessV1 {
         PmPhaseAPlaceDispatchBarrierWitnessV1 {
+            profile: self.profile,
             barrier_file: self.barrier_file,
             expected_barrier_bytes: self.expected_barrier_bytes,
         }
@@ -490,6 +492,10 @@ impl PmRevalidatedPhaseAPlaceDispatchGrantV1 {
 }
 
 impl PmPhaseAPlaceDispatchBarrierWitnessV1 {
+    pub(crate) const fn profile(&self) -> &PmPhaseAPlaceLiveDispatchProfileV1 {
+        &self.profile
+    }
+
     pub(crate) fn validate_held_barrier(&mut self) -> Result<(), PmTrialLiveJournalError> {
         self.barrier_file
             .validate_exact_bytes(&self.expected_barrier_bytes)
@@ -617,6 +623,49 @@ pub(crate) fn load_phase_a_live_dispatch_barrier(
         Err(PmTrialLiveJournalError::Absent) => return Ok(None),
         Err(error) => return Err(error),
     };
+    Ok(Some(parse_phase_a_live_dispatch_barrier(&bytes)?))
+}
+
+/// Reopen and pin the already-validated positive place barrier for a
+/// recovery-only cancel custody chain. This never recreates a place grant.
+pub(crate) fn reopen_phase_a_place_dispatch_barrier_witness(
+    config: &CanonicalTrialConfig,
+    authorization: &CanonicalAuthorization,
+    scope: &PmTrialLiveJournalScopeV1,
+    preflight: &PmTrialLivePreflightBindingV1,
+    dispatch: &[DispatchLineV1],
+    expected_record_fingerprint: &str,
+) -> Result<PmPhaseAPlaceDispatchBarrierWitnessV1, PmTrialLiveJournalError> {
+    let path = phase_a_live_dispatch_barrier_path(scope);
+    let expected_barrier_bytes = read_protected(&path, MAX_PHASE_A_LIVE_DISPATCH_BARRIER_BYTES)?;
+    let record = parse_phase_a_live_dispatch_barrier(&expected_barrier_bytes)?;
+    if record.record_fingerprint != expected_record_fingerprint {
+        return Err(PmTrialLiveJournalError::InvalidBinding);
+    }
+    validate_recovered_phase_a_live_dispatch_barrier(
+        &record,
+        config,
+        authorization,
+        scope,
+        preflight,
+        dispatch,
+    )?;
+    let mut barrier_file =
+        ProtectedJournal::open_existing(&path, MAX_PHASE_A_LIVE_DISPATCH_BARRIER_BYTES)?;
+    barrier_file.validate_exact_bytes(&expected_barrier_bytes)?;
+    Ok(PmPhaseAPlaceDispatchBarrierWitnessV1 {
+        profile: PmPhaseAPlaceLiveDispatchProfileV1 {
+            record,
+            public_request_identity: config.exact_place_public_request_identity(),
+        },
+        barrier_file,
+        expected_barrier_bytes,
+    })
+}
+
+fn parse_phase_a_live_dispatch_barrier(
+    bytes: &[u8],
+) -> Result<PmPhaseAPlaceLiveDispatchRecordV1, PmTrialLiveJournalError> {
     if bytes.is_empty() || !bytes.ends_with(b"\n") {
         return Err(PmTrialLiveJournalError::AmbiguousTail);
     }
@@ -630,7 +679,7 @@ pub(crate) fn load_phase_a_live_dispatch_barrier(
         return Err(PmTrialLiveJournalError::InvalidRecord);
     }
     record.validate_structural()?;
-    Ok(Some(record))
+    Ok(record)
 }
 
 pub(crate) fn validate_recovered_phase_a_live_dispatch_barrier(

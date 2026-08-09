@@ -8,9 +8,7 @@ mod runtime;
 
 use std::fmt;
 
-use reap_polymarket_auth::{
-    AuthenticatedL2Headers, AuthenticatedOwnedCancelRequest, FixedOrderId, L2Timestamp,
-};
+use reap_polymarket_auth::{AuthenticatedL2Headers, FixedOrderId, L2Timestamp};
 
 /// An L2 timestamp admitted by the future in-process freshness/session join.
 ///
@@ -35,12 +33,6 @@ impl fmt::Debug for AuthorizedL2Timestamp {
     }
 }
 
-/// Move-only parent-sealed inputs for one journal-bounded exact-owned cancel.
-struct SealedExactOwnedCancelAuthentication {
-    order_id: FixedOrderId,
-    timestamp: AuthorizedL2Timestamp,
-}
-
 /// Move-only parent-sealed inputs for the one journal/scoped exact-order
 /// detail read. The route identity cannot be selected by the credential task.
 struct SealedExactOwnedOrderReadAuthentication {
@@ -60,43 +52,6 @@ impl SealedExactOwnedOrderReadAuthentication {
 impl fmt::Debug for SealedExactOwnedOrderReadAuthentication {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("SealedExactOwnedOrderReadAuthentication(<opaque>)")
-    }
-}
-
-impl SealedExactOwnedCancelAuthentication {
-    const fn new(order_id: FixedOrderId, timestamp: AuthorizedL2Timestamp) -> Self {
-        Self {
-            order_id,
-            timestamp,
-        }
-    }
-}
-
-impl fmt::Debug for SealedExactOwnedCancelAuthentication {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("SealedExactOwnedCancelAuthentication(<opaque>)")
-    }
-}
-
-/// Authenticated exact-owned cancel carrier with its admitted L2 time.
-struct AuthenticatedExactOwnedCancel {
-    request: AuthenticatedOwnedCancelRequest,
-    timestamp: L2Timestamp,
-}
-
-impl AuthenticatedExactOwnedCancel {
-    const fn new(request: AuthenticatedOwnedCancelRequest, timestamp: L2Timestamp) -> Self {
-        Self { request, timestamp }
-    }
-
-    fn into_parts(self) -> (AuthenticatedOwnedCancelRequest, L2Timestamp) {
-        (self.request, self.timestamp)
-    }
-}
-
-impl fmt::Debug for AuthenticatedExactOwnedCancel {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("AuthenticatedExactOwnedCancel([REDACTED])")
     }
 }
 

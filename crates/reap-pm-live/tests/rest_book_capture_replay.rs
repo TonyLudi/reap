@@ -70,11 +70,14 @@ fn rest_snapshot() -> String {
 
 fn live_authoritative() -> PmAuthoritativeMetadata {
     let long = format!(
-        r#"{{"condition_id":"{}","question_id":"{}","active":true,"closed":false,"archived":false,"accepting_orders":true,"enable_order_book":true}}"#,
+        r#"{{"condition_id":"{}","question_id":"{}","active":true,"closed":false,"archived":false,"accepting_orders":true,"enable_order_book":true,"accepting_order_timestamp":"2026-08-08T00:00:00Z","end_date_iso":"2027-01-01T00:00:00Z","game_start_time":null,"seconds_delay":0,"minimum_order_size":5,"minimum_tick_size":0.01,"tokens":[]}}"#,
         support::CONDITION,
         support::MARKET,
     );
-    let short = r#"{"t":[{"t":"123","o":"Yes"},{"t":"456","o":"No"}],"mts":0.01,"mos":5}"#;
+    let short = format!(
+        r#"{{"c":"{}","t":[{{"t":"123","o":"Yes"}},{{"t":"456","o":"No"}}],"mts":0.01,"mos":5,"nr":false,"fd":{{"r":0.02,"e":2,"to":true}},"mbf":0,"tbf":0,"ao":true,"sd":0,"gst":null,"cbos":true,"aot":"2026-08-08T00:00:00Z","rfqe":false,"itode":false,"ibce":true,"oas":0}}"#,
+        support::CONDITION,
+    );
     PmAuthoritativeMetadata::join_live_clob_v2_raw(
         instrument(),
         pm_source(),

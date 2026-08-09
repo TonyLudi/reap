@@ -260,7 +260,10 @@ impl<M: PmQuoteModel + Send + 'static> PmAuthenticatedLoopbackRun<M> {
             PmMutationTimePoll::Pending => return Ok(PmMutationStartOutcome::PendingTime),
             PmMutationTimePoll::Ready(pending) => pending,
         };
-        let timestamp = self.ready.mutation_time_validator.authorize(pending)?;
+        let timestamp = self
+            .ready
+            .place_time_finalizer
+            .authorize_loopback_place(pending)?;
         let effect_clock = self.ready.actor_clock.observe_control_edge()?;
         let task = self.ready.mutation_workers.prepare_place_task(
             &mut self.ready.coordinator,
@@ -299,7 +302,10 @@ impl<M: PmQuoteModel + Send + 'static> PmAuthenticatedLoopbackRun<M> {
             PmMutationTimePoll::Pending => return Ok(PmMutationStartOutcome::PendingTime),
             PmMutationTimePoll::Ready(pending) => pending,
         };
-        let timestamp = self.ready.mutation_time_validator.authorize(pending)?;
+        let timestamp = self
+            .ready
+            .cancel_time_finalizer
+            .authorize_loopback_cancel(pending)?;
         let effect_clock = self.ready.actor_clock.observe_control_edge()?;
         let task = self.ready.mutation_workers.prepare_cancel_task(
             &mut self.ready.coordinator,

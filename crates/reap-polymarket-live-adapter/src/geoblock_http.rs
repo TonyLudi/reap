@@ -71,6 +71,57 @@ impl PmGeoblockObservation {
     }
 }
 
+/// Move-only proof that one fixed geoblock observation came from the role's
+/// private production origin mode. It is public evidence, not order-entry or
+/// mutation authority, and it cannot be constructed from LocalEvidence.
+pub struct PmProductionGeoblockObservation {
+    observation: PmGeoblockObservation,
+}
+
+impl PmProductionGeoblockObservation {
+    fn from_source(
+        _production_origin: ProductionGeoblockOrigin,
+        observation: PmGeoblockObservation,
+    ) -> Self {
+        Self { observation }
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> &PmGeoblockStatus {
+        self.observation.status()
+    }
+
+    #[must_use]
+    pub const fn receive_clock(&self) -> PmHttpReceiveClock {
+        self.observation.receive_clock()
+    }
+
+    #[must_use]
+    pub const fn commitment(&self) -> PmGeoblockObservationCommitment {
+        self.observation.commitment()
+    }
+}
+
+impl std::fmt::Debug for PmProductionGeoblockObservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PmProductionGeoblockObservation(<production-origin; sealed>)")
+    }
+}
+
+struct ProductionGeoblockOrigin;
+
+impl ProductionGeoblockOrigin {
+    fn verify(mode: OriginMode) -> Result<Self, PmLiveAdapterError> {
+        match mode {
+            OriginMode::Production => Ok(Self),
+            #[cfg(any(test, feature = "loopback-evidence", feature = "read-only-evidence"))]
+            OriginMode::LocalEvidence => Err(PmLiveAdapterError::InvalidConfiguration(
+                "production geoblock observation requires the fixed production origin",
+            )),
+        }
+    }
+}
+
 /// Fixed public geoblock GET. It has no route, origin, body, retry, or mutation
 /// input after construction.
 pub struct PmGeoblockHttpRole {
@@ -108,6 +159,19 @@ impl PmGeoblockHttpRole {
             status,
             receive_clock,
             commitment,
+        ))
+    }
+
+    /// Observe through the fixed production role and seal a move-only origin
+    /// proof. The private mode check occurs before any HTTP request.
+    pub async fn production_status_observation(
+        &self,
+    ) -> Result<PmProductionGeoblockObservation, PmLiveAdapterError> {
+        let production_origin = ProductionGeoblockOrigin::verify(self.mode)?;
+        let observation = self.status_observation().await?;
+        Ok(PmProductionGeoblockObservation::from_source(
+            production_origin,
+            observation,
         ))
     }
 
@@ -298,6 +362,26 @@ mod tests {
             Some("GET /api/geoblock HTTP/1.1")
         );
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_evidence_cannot_issue_a_production_observation() {
+        let role = local_role("http://127.0.0.1:9", Duration::from_millis(100));
+        assert!(matches!(
+            role.production_status_observation().await,
+            Err(PmLiveAdapterError::InvalidConfiguration(
+                "production geoblock observation requires the fixed production origin"
+            )),
+        ));
+    }
+
+    #[test]
+    fn production_origin_proof_accepts_only_production_mode() {
+        assert!(ProductionGeoblockOrigin::verify(OriginMode::Production).is_ok());
+        assert!(matches!(
+            ProductionGeoblockOrigin::verify(OriginMode::LocalEvidence),
+            Err(PmLiveAdapterError::InvalidConfiguration(_)),
+        ));
     }
 
     #[tokio::test]

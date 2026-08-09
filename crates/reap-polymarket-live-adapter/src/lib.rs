@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 mod account;
+mod clob_health_http;
 mod config;
 mod error;
 mod geoblock_http;
@@ -29,6 +30,7 @@ mod public_ws_config;
 mod read_authority;
 mod read_only_private;
 mod reconciliation;
+mod status_announcement_http;
 mod task_guard;
 mod user_ws;
 mod user_ws_config;
@@ -38,13 +40,18 @@ pub use account::{
     PmAccountBalanceAllowanceObservationCommitment, PmAccountHttpRole, PmReadOnlyAccountHttpOwner,
     PmReadOnlySignatureType,
 };
+pub use clob_health_http::{
+    PmClobLivenessHealthError, PmClobLivenessHealthHttpRole, PmClobLivenessHealthObservation,
+    PmClobLivenessHealthObservationCommitment, PmProductionClobLivenessHealthObservation,
+};
 pub use config::{
-    PM_CLOB_PRODUCTION_ORIGIN, PM_GEOBLOCK_PRODUCTION_ORIGIN, PmGeoblockHttpConfig,
-    PmPrivateHttpConfig, PmPublicHttpConfig,
+    PM_CLOB_PRODUCTION_ORIGIN, PM_GEOBLOCK_PRODUCTION_ORIGIN, PM_STATUS_PRODUCTION_ORIGIN,
+    PmGeoblockHttpConfig, PmPrivateHttpConfig, PmPublicHttpConfig,
 };
 pub use error::{PmLiveAdapterError, PmPublicMetadataDeliveryError, PmRestBookDeliveryError};
 pub use geoblock_http::{
     PmGeoblockHttpRole, PmGeoblockObservation, PmGeoblockObservationCommitment,
+    PmProductionGeoblockObservation,
 };
 #[cfg(any(test, feature = "loopback-evidence"))]
 pub use loopback_mutation_credentials::{
@@ -133,6 +140,15 @@ pub use reconciliation::{
     PmCompleteTradesObservationCommitment, PmExactOrderDetailObservation,
     PmExactOrderDetailObservationCommitment, PmExactOrderObservation, PmOpenOrdersAssembly,
     PmOpenOrdersCutProgress, PmReconciliationHttpRole, PmTradesAssembly, PmTradesCutProgress,
+};
+pub use status_announcement_http::{
+    MAX_PM_STATUS_ACTIVE_INCIDENTS, MAX_PM_STATUS_ACTIVE_MAINTENANCES, MAX_PM_STATUS_COMPONENTS,
+    MAX_PM_STATUS_COMPONENTS_BODY_BYTES, MAX_PM_STATUS_SUMMARY_BODY_BYTES,
+    PmProductionStatusAnnouncementObservation, PmStatusActiveIncident, PmStatusActiveMaintenance,
+    PmStatusAnnouncementError, PmStatusAnnouncementHttpRole, PmStatusAnnouncementObservation,
+    PmStatusAnnouncementObservationCommitment, PmStatusComponentAnnouncement,
+    PmStatusComponentGroup, PmStatusComponentState, PmStatusIncidentImpact, PmStatusIncidentState,
+    PmStatusMaintenanceState, PmStatusPageAnnouncement, PmStatusPageState,
 };
 pub use user_ws::{
     PmAuthenticatedUserWsRole, PmUserWsActivityView, PmUserWsBoundFrame, PmUserWsClockError,

@@ -3,15 +3,33 @@ use reqwest::{Client, StatusCode, Url, redirect::Policy};
 
 use crate::{
     PmLiveAdapterError,
-    config::{OriginMode, PmGeoblockHttpConfig, PmPublicHttpConfig},
+    config::{OriginMode, PmGeoblockHttpConfig, PmPublicHttpConfig, PmStatusHttpConfig},
 };
 
 pub(crate) enum PmPublicRoute {
+    ClobHealth,
     ServerTime,
     Book(PmTokenId),
     MarketMetadata(PmConditionId),
     ClobV2Metadata(PmConditionId),
     Geoblock,
+    StatusSummary,
+    StatusComponents,
+}
+
+impl PmPublicRoute {
+    const fn accept(&self) -> &'static str {
+        match self {
+            Self::ClobHealth => "text/plain",
+            Self::ServerTime
+            | Self::Book(_)
+            | Self::MarketMetadata(_)
+            | Self::ClobV2Metadata(_)
+            | Self::Geoblock
+            | Self::StatusSummary
+            | Self::StatusComponents => "application/json",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -31,6 +49,15 @@ impl PmHttpTransport {
     }
 
     pub(crate) fn geoblock(config: &PmGeoblockHttpConfig) -> Result<Self, PmLiveAdapterError> {
+        Self::build(
+            config.origin().clone(),
+            config.connect_timeout(),
+            config.request_timeout(),
+            config.mode(),
+        )
+    }
+
+    pub(crate) fn status(config: &PmStatusHttpConfig) -> Result<Self, PmLiveAdapterError> {
         Self::build(
             config.origin().clone(),
             config.connect_timeout(),
@@ -65,11 +92,12 @@ impl PmHttpTransport {
         route: PmPublicRoute,
         maximum_body_bytes: usize,
     ) -> Result<Vec<u8>, PmLiveAdapterError> {
+        let accept = route.accept();
         let url = self.route_url(route);
         let mut response = self
             .client
             .get(url)
-            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::ACCEPT, accept)
             .send()
             .await
             .map_err(map_request_error)?;
@@ -118,6 +146,7 @@ impl PmHttpTransport {
     fn route_url(&self, route: PmPublicRoute) -> Url {
         let mut url = self.origin.clone();
         match route {
+            PmPublicRoute::ClobHealth => url.set_path("/ok"),
             PmPublicRoute::ServerTime => url.set_path("/time"),
             PmPublicRoute::Book(token) => {
                 url.set_path("/book");
@@ -131,6 +160,8 @@ impl PmHttpTransport {
                 url.set_path(&format!("/clob-markets/{condition}"));
             }
             PmPublicRoute::Geoblock => url.set_path("/api/geoblock"),
+            PmPublicRoute::StatusSummary => url.set_path("/v3/summary.json"),
+            PmPublicRoute::StatusComponents => url.set_path("/v3/components.json"),
         }
         url
     }

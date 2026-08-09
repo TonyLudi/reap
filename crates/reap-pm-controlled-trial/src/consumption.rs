@@ -17,10 +17,18 @@ use crate::{
 
 const CONSUMPTION_SCHEMA_VERSION: u32 = 1;
 const MAX_CONSUMPTION_EVIDENCE_BYTES: usize = 128 * 1024;
+const MAX_CONSUMPTION_RECORDS: usize = 32;
+const MAX_RECOVERY_PREPARED_RECORD_BYTES: usize = 64 * 1024;
 const ZERO_FINGERPRINT: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const BINDING_FINGERPRINT_DOMAIN: &[u8] = b"reap.pm-t2.authorization-consumption.binding.v1\0";
 const RECORD_FINGERPRINT_DOMAIN: &[u8] = b"reap.pm-t2.authorization-consumption.record.v1\0";
 const CLAIM_FINGERPRINT_DOMAIN: &[u8] = b"reap.pm-t2.authorization-consumption.claim.v1\0";
+const RECOVERY_CONTINUATION_ROOT_FINGERPRINT_DOMAIN: &[u8] =
+    b"reap.pm-t2.authorization-consumption.recovery-continuation-root.v1\0";
+const RECOVERY_CANCEL_PREPARED_FINGERPRINT_DOMAIN: &[u8] =
+    b"reap.pm-t2.authorization-consumption.recovery-cancel-prepared.v1\0";
+const RECOVERY_TERMINAL_PLAN_FINGERPRINT_DOMAIN: &[u8] =
+    b"reap.pm-t2.authorization-consumption.recovery-terminal-plan.v1\0";
 
 /// Non-secret values the future runner must re-observe immediately before a
 /// Prepared or Consumed transition. No value in this type grants authority.
@@ -65,6 +73,81 @@ pub enum TerminalDisposition {
     OperatorActionRequired,
 }
 
+/// Durable monotonic root for the separate recovery-only cancel continuation.
+/// It is evidence in the already-burned consumption ledger, never authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizationRecoveryContinuationRootV1 {
+    pub continuation_scope_fingerprint: String,
+    pub continuation_intent_header_fingerprint: String,
+    pub continuation_dispatch_header_fingerprint: String,
+    pub previous_anchor_fingerprint: String,
+    pub anchor_fingerprint: String,
+}
+
+/// One monotonically burned recovery-cancel preparation. The exact
+/// continuation record fingerprint covers its request semantics; the
+/// duplicated fields make cross-family validation explicit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizationRecoveryCancelPreparedAnchorV1 {
+    pub continuation_scope_fingerprint: String,
+    pub recovery_ordinal: u8,
+    pub continuation_intent_sequence: u8,
+    pub continuation_intent_record_fingerprint: String,
+    pub continuation_prepared_sequence: u8,
+    pub continuation_dispatch_previous_record_fingerprint: String,
+    pub continuation_prepared_record_fingerprint: String,
+    pub continuation_prepared_record_canonical_json: String,
+    pub exact_venue_order_id: String,
+    pub semantic_request_commitment_sha256: String,
+    pub l2_timestamp_seconds: u64,
+    pub previous_anchor_fingerprint: String,
+    pub anchor_fingerprint: String,
+}
+
+/// Sole source-owned plan for closing the recovery-only continuation. The
+/// exact canonical records are anchored in the monotonic consumption ledger
+/// before either continuation Terminal half may be appended. This is durable
+/// evidence only and never grants authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizationRecoveryTerminalPlanV1 {
+    pub continuation_scope_fingerprint: String,
+    pub continuation_intent_predecessor_sequence: u8,
+    pub continuation_intent_predecessor_record_fingerprint: String,
+    pub continuation_dispatch_predecessor_sequence: u8,
+    pub continuation_dispatch_predecessor_record_fingerprint: String,
+    pub terminal_at_utc: String,
+    pub disposition: TerminalDisposition,
+    pub continuation_dispatch_terminal_sequence: u8,
+    pub continuation_dispatch_terminal_previous_record_fingerprint: String,
+    pub continuation_dispatch_terminal_record_fingerprint: String,
+    pub continuation_dispatch_terminal_record_canonical_json: String,
+    pub continuation_intent_terminal_sequence: u8,
+    pub continuation_intent_terminal_previous_record_fingerprint: String,
+    pub continuation_intent_terminal_record_fingerprint: String,
+    pub continuation_intent_terminal_record_canonical_json: String,
+    pub previous_anchor_fingerprint: String,
+    pub anchor_fingerprint: String,
+}
+
+/// Crash-recovery monotonic registry for the recovery-only continuation.
+///
+/// The fsynced consumption ledger is the non-rollback trust boundary: ordinary
+/// crash/power-loss durability and trusted local-filesystem semantics are in
+/// scope. Coordinated valid-prefix rollback of this ledger plus every bound
+/// artifact by a post-crash same-privilege adversary is not locally detectable
+/// without TPM, remote, or WORM state and is outside this profile's model.
+/// Every field is deliberately non-secret evidence, so `Debug` may show it;
+/// this type never contains credentials, authenticated requests, or authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AuthorizationRecoveryContinuationRegistryV1 {
+    pub root: AuthorizationRecoveryContinuationRootV1,
+    pub prepared: Vec<AuthorizationRecoveryCancelPreparedAnchorV1>,
+    pub terminal_plan: Option<AuthorizationRecoveryTerminalPlanV1>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuthorizationConsumptionState {
@@ -75,6 +158,21 @@ pub enum AuthorizationConsumptionState {
         consumed_at_utc: String,
         burned_before_dispatch_authority: bool,
         crash_allows_recovery_cancel_only: bool,
+        placement_can_never_resume: bool,
+    },
+    RecoveryContinuationRootAnchored {
+        root: AuthorizationRecoveryContinuationRootV1,
+        recovery_cancel_only: bool,
+        placement_can_never_resume: bool,
+    },
+    RecoveryCancelPreparedAnchored {
+        anchor: AuthorizationRecoveryCancelPreparedAnchorV1,
+        recovery_cancel_only: bool,
+        placement_can_never_resume: bool,
+    },
+    RecoveryTerminalPlanAnchored {
+        plan: AuthorizationRecoveryTerminalPlanV1,
+        recovery_cancel_only: bool,
         placement_can_never_resume: bool,
     },
     Terminal {
@@ -122,6 +220,7 @@ pub struct AuthorizationConsumptionVerification {
     pub binding_fingerprint: String,
     pub exact_bindings_structurally_valid: bool,
     pub ambiguous_tail: bool,
+    pub recovery_continuation_registry: Option<AuthorizationRecoveryContinuationRegistryV1>,
     #[serde(flatten)]
     pub authorization: OfflineAuthorizationState,
 }
@@ -163,12 +262,21 @@ pub struct ConsumedAuthorizationConsumption {
     consumed_record: AuthorizationConsumptionEvidence,
     binding: AuthorizationConsumptionBindingEvidence,
     consumed_at_utc: String,
+    recovery_cancel_dispatch_budget: u8,
+    recovery_continuation_registry: Option<AuthorizationRecoveryContinuationRegistryV1>,
 }
 
 impl ConsumedAuthorizationConsumption {
     #[must_use]
     pub const fn evidence(&self) -> &AuthorizationConsumptionEvidence {
         &self.consumed_record
+    }
+
+    #[must_use]
+    pub const fn recovery_continuation_registry(
+        &self,
+    ) -> Option<&AuthorizationRecoveryContinuationRegistryV1> {
+        self.recovery_continuation_registry.as_ref()
     }
 
     /// Revalidate the held fixed ledger and atomic-claim descriptors, their
@@ -204,12 +312,263 @@ impl ConsumedAuthorizationConsumption {
         self.revalidate_held_consumption_evidence()
     }
 
+    /// Append, or idempotently confirm, the sole recovery-continuation root.
+    /// The continuation headers must already be durable; no recovery cancel
+    /// owner may be exposed until this append completes.
+    pub fn anchor_recovery_continuation_root(
+        &mut self,
+        continuation_scope_fingerprint: &str,
+        continuation_intent_header_fingerprint: &str,
+        continuation_dispatch_header_fingerprint: &str,
+    ) -> Result<(), PmAuthorizationConsumptionError> {
+        self.revalidate_held_consumption_evidence()?;
+        let root = make_recovery_continuation_root(
+            continuation_scope_fingerprint,
+            continuation_intent_header_fingerprint,
+            continuation_dispatch_header_fingerprint,
+        )?;
+        if let Some(existing) = &self.recovery_continuation_registry {
+            return (existing.root == root)
+                .then_some(())
+                .ok_or_else(|| invalid("recovery-continuation root anchor conflicts"));
+        }
+        self.append_recovery_registry_record(
+            AuthorizationConsumptionState::RecoveryContinuationRootAnchored {
+                root: root.clone(),
+                recovery_cancel_only: true,
+                placement_can_never_resume: true,
+            },
+        )?;
+        self.recovery_continuation_registry = Some(AuthorizationRecoveryContinuationRegistryV1 {
+            root,
+            prepared: Vec::new(),
+            terminal_plan: None,
+        });
+        Ok(())
+    }
+
+    /// Burn one exact sequential recovery-cancel preparation in the
+    /// independent ledger registry before its typed dispatch owner can exist.
+    #[allow(clippy::too_many_arguments)]
+    pub fn anchor_recovery_cancel_prepared(
+        &mut self,
+        continuation_scope_fingerprint: &str,
+        recovery_ordinal: u8,
+        continuation_intent_sequence: u8,
+        continuation_intent_record_fingerprint: &str,
+        continuation_prepared_sequence: u8,
+        continuation_dispatch_previous_record_fingerprint: &str,
+        continuation_prepared_record_fingerprint: &str,
+        continuation_prepared_record_canonical_json: &str,
+        exact_venue_order_id: &str,
+        semantic_request_commitment_sha256: &str,
+        l2_timestamp_seconds: u64,
+    ) -> Result<(), PmAuthorizationConsumptionError> {
+        self.revalidate_held_consumption_evidence()?;
+        let registry = self
+            .recovery_continuation_registry
+            .as_ref()
+            .ok_or_else(|| invalid("recovery-continuation root is not anchored"))?;
+        if registry.terminal_plan.is_some() {
+            return Err(invalid(
+                "recovery preparation cannot follow its Terminal plan",
+            ));
+        }
+        if continuation_scope_fingerprint != registry.root.continuation_scope_fingerprint {
+            return Err(invalid(
+                "recovery preparation has a foreign continuation scope",
+            ));
+        }
+        if recovery_ordinal == 0 || recovery_ordinal > self.recovery_cancel_dispatch_budget {
+            return Err(invalid("recovery preparation anchor ordinal is not next"));
+        }
+        let anchor_index = usize::from(recovery_ordinal - 1);
+        if let Some(prior) = anchor_index
+            .checked_sub(1)
+            .and_then(|index| registry.prepared.get(index))
+            && (continuation_intent_sequence <= prior.continuation_intent_sequence
+                || continuation_prepared_sequence <= prior.continuation_prepared_sequence
+                || l2_timestamp_seconds <= prior.l2_timestamp_seconds
+                || exact_venue_order_id != prior.exact_venue_order_id
+                || semantic_request_commitment_sha256 != prior.semantic_request_commitment_sha256)
+        {
+            return Err(invalid(
+                "recovery preparation anchor does not advance its exact prior lineage",
+            ));
+        }
+        if let Some(existing) = registry.prepared.get(anchor_index) {
+            let previous_anchor_fingerprint = anchor_index
+                .checked_sub(1)
+                .and_then(|prior| registry.prepared.get(prior))
+                .map(|prior| prior.anchor_fingerprint.clone())
+                .unwrap_or_else(|| registry.root.anchor_fingerprint.clone());
+            let anchor = make_recovery_cancel_prepared_anchor(
+                continuation_scope_fingerprint,
+                recovery_ordinal,
+                continuation_intent_sequence,
+                continuation_intent_record_fingerprint,
+                continuation_prepared_sequence,
+                continuation_dispatch_previous_record_fingerprint,
+                continuation_prepared_record_fingerprint,
+                continuation_prepared_record_canonical_json,
+                exact_venue_order_id,
+                semantic_request_commitment_sha256,
+                l2_timestamp_seconds,
+                previous_anchor_fingerprint,
+            )?;
+            return (existing == &anchor)
+                .then_some(())
+                .ok_or_else(|| invalid("recovery preparation anchor conflicts"));
+        }
+        if anchor_index != registry.prepared.len() {
+            return Err(invalid("recovery preparation anchor ordinal is not next"));
+        }
+        let previous_anchor_fingerprint = registry
+            .prepared
+            .last()
+            .map(|anchor| anchor.anchor_fingerprint.clone())
+            .unwrap_or_else(|| registry.root.anchor_fingerprint.clone());
+        let anchor = make_recovery_cancel_prepared_anchor(
+            continuation_scope_fingerprint,
+            recovery_ordinal,
+            continuation_intent_sequence,
+            continuation_intent_record_fingerprint,
+            continuation_prepared_sequence,
+            continuation_dispatch_previous_record_fingerprint,
+            continuation_prepared_record_fingerprint,
+            continuation_prepared_record_canonical_json,
+            exact_venue_order_id,
+            semantic_request_commitment_sha256,
+            l2_timestamp_seconds,
+            previous_anchor_fingerprint,
+        )?;
+        self.append_recovery_registry_record(
+            AuthorizationConsumptionState::RecoveryCancelPreparedAnchored {
+                anchor: anchor.clone(),
+                recovery_cancel_only: true,
+                placement_can_never_resume: true,
+            },
+        )?;
+        self.recovery_continuation_registry
+            .as_mut()
+            .ok_or_else(|| invalid("recovery-continuation root disappeared"))?
+            .prepared
+            .push(anchor);
+        Ok(())
+    }
+
+    /// Anchor the sole exact recovery-continuation Terminal plan before
+    /// either continuation journal may append a Terminal record. Repeating
+    /// the exact plan is idempotent; any competing time, disposition, causal
+    /// predecessor, or canonical record fails closed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn anchor_recovery_terminal_plan(
+        &mut self,
+        continuation_scope_fingerprint: &str,
+        continuation_intent_predecessor_sequence: u8,
+        continuation_intent_predecessor_record_fingerprint: &str,
+        continuation_dispatch_predecessor_sequence: u8,
+        continuation_dispatch_predecessor_record_fingerprint: &str,
+        terminal_at_utc: &str,
+        disposition: TerminalDisposition,
+        continuation_dispatch_terminal_sequence: u8,
+        continuation_dispatch_terminal_previous_record_fingerprint: &str,
+        continuation_dispatch_terminal_record_fingerprint: &str,
+        continuation_dispatch_terminal_record_canonical_json: &str,
+        continuation_intent_terminal_sequence: u8,
+        continuation_intent_terminal_previous_record_fingerprint: &str,
+        continuation_intent_terminal_record_fingerprint: &str,
+        continuation_intent_terminal_record_canonical_json: &str,
+    ) -> Result<(), PmAuthorizationConsumptionError> {
+        self.revalidate_held_consumption_evidence()?;
+        let registry = self
+            .recovery_continuation_registry
+            .as_ref()
+            .ok_or_else(|| invalid("recovery-continuation root is not anchored"))?;
+        if continuation_scope_fingerprint != registry.root.continuation_scope_fingerprint {
+            return Err(invalid("recovery Terminal plan has a foreign scope"));
+        }
+        if parse_canonical_utc(terminal_at_utc)? < parse_canonical_utc(&self.consumed_at_utc)? {
+            return Err(invalid("recovery Terminal plan precedes consumption"));
+        }
+        let previous_anchor_fingerprint = registry
+            .prepared
+            .last()
+            .map(|anchor| anchor.anchor_fingerprint.clone())
+            .unwrap_or_else(|| registry.root.anchor_fingerprint.clone());
+        let plan = make_recovery_terminal_plan(
+            continuation_scope_fingerprint,
+            continuation_intent_predecessor_sequence,
+            continuation_intent_predecessor_record_fingerprint,
+            continuation_dispatch_predecessor_sequence,
+            continuation_dispatch_predecessor_record_fingerprint,
+            terminal_at_utc,
+            disposition,
+            continuation_dispatch_terminal_sequence,
+            continuation_dispatch_terminal_previous_record_fingerprint,
+            continuation_dispatch_terminal_record_fingerprint,
+            continuation_dispatch_terminal_record_canonical_json,
+            continuation_intent_terminal_sequence,
+            continuation_intent_terminal_previous_record_fingerprint,
+            continuation_intent_terminal_record_fingerprint,
+            continuation_intent_terminal_record_canonical_json,
+            previous_anchor_fingerprint,
+        )?;
+        if let Some(existing) = &registry.terminal_plan {
+            return (existing == &plan)
+                .then_some(())
+                .ok_or_else(|| invalid("recovery Terminal plan conflicts"));
+        }
+        self.append_recovery_registry_record(
+            AuthorizationConsumptionState::RecoveryTerminalPlanAnchored {
+                plan: plan.clone(),
+                recovery_cancel_only: true,
+                placement_can_never_resume: true,
+            },
+        )?;
+        self.recovery_continuation_registry
+            .as_mut()
+            .ok_or_else(|| invalid("recovery-continuation root disappeared"))?
+            .terminal_plan = Some(plan);
+        Ok(())
+    }
+
+    fn append_recovery_registry_record(
+        &mut self,
+        consumption: AuthorizationConsumptionState,
+    ) -> Result<(), PmAuthorizationConsumptionError> {
+        let records = parse_ledger(&self.ledger_bytes)?;
+        let sequence = u8::try_from(records.len())
+            .map_err(|_| invalid("recovery registry sequence bound exceeded"))?;
+        let previous = records
+            .last()
+            .map(record_fingerprint)
+            .transpose()?
+            .ok_or_else(|| invalid("consumed ledger is empty"))?;
+        let record = make_record(sequence, previous, self.binding.clone(), consumption)?;
+        let encoded = encode_ledger_record(&record)?;
+        self.journal
+            .append_durable(&self.ledger_bytes, &encoded)
+            .map_err(|_| {
+                PmAuthorizationConsumptionError::Ambiguous(
+                    "recovery registry append or fsync failed; attempt remains burned",
+                )
+            })?;
+        self.ledger_bytes.extend_from_slice(&encoded);
+        Ok(())
+    }
+
     pub fn terminal(
         mut self,
         terminal_at_utc: String,
         disposition: TerminalDisposition,
     ) -> Result<TerminalAuthorizationConsumption, PmAuthorizationConsumptionError> {
         self.revalidate_held_consumption_evidence()?;
+        if self.recovery_continuation_registry.is_some() {
+            return Err(invalid(
+                "base Terminal is forbidden after recovery-continuation anchoring",
+            ));
+        }
         let consumed_at = parse_canonical_utc(&self.consumed_at_utc)?;
         let terminal_at = parse_canonical_utc(&terminal_at_utc)?;
         if terminal_at < consumed_at {
@@ -337,6 +696,82 @@ pub fn claim_prepared_authorization_consumption(
     consume_prepared(prepared, config, authorization, runtime)
 }
 
+/// Recovery/cancel-only entry: reopen and pin the exact durable Consumed
+/// ledger and its atomic claim without recreating placement authority.
+///
+/// This accepts the complete Prepared -> Consumed prefix plus an optional
+/// validated recovery-continuation registry. A missing claim, an incomplete
+/// consume, Terminal evidence, or any binding or byte drift fails closed.
+pub fn reopen_consumed_authorization_consumption(
+    config: &CanonicalTrialConfig,
+    authorization: &CanonicalAuthorization,
+) -> Result<ConsumedAuthorizationConsumption, PmAuthorizationConsumptionError> {
+    let (ledger_path, claim_path) = bound_paths(config);
+    let ledger_bytes = read_one(
+        &ledger_path,
+        ProtectedFileKind::ConsumptionEvidence,
+        MAX_CONSUMPTION_EVIDENCE_BYTES,
+    )
+    .map_err(|_| invalid("bound Consumed ledger is absent, unprotected, or unstable"))?;
+    let records = parse_ledger(&ledger_bytes)?;
+    if records.len() < 2
+        || !matches!(
+            &records[1].consumption,
+            AuthorizationConsumptionState::Consumed {
+                burned_before_dispatch_authority: true,
+                crash_allows_recovery_cancel_only: true,
+                placement_can_never_resume: true,
+                ..
+            }
+        )
+        || records.iter().any(|record| {
+            matches!(
+                record.consumption,
+                AuthorizationConsumptionState::Terminal { .. }
+            )
+        })
+    {
+        return Err(invalid(
+            "recovery custody requires one complete non-Terminal Consumed ledger",
+        ));
+    }
+    let validation = validate_records(config, authorization, &records)?;
+    let claim = read_optional_claim(&claim_path)?
+        .ok_or_else(|| invalid("Consumed recovery custody requires its atomic claim"))?;
+    let prepared_record_fingerprint = record_fingerprint(&records[0])?;
+    validate_claim(&claim, &records[0].binding, &prepared_record_fingerprint)?;
+    let consumed_at_utc = consumed_time(&records[1].consumption)?.to_owned();
+    if consumed_at_utc != claim.consumed_at_utc {
+        return Err(invalid("consume claim and ledger timestamp disagree"));
+    }
+    let claim_bytes = canonical_json(&claim)?;
+    let journal = open_existing_append(
+        &ledger_path,
+        ProtectedFileKind::ConsumptionEvidence,
+        MAX_CONSUMPTION_EVIDENCE_BYTES,
+    )
+    .map_err(|_| invalid("bound Consumed ledger cannot be pinned"))?;
+    let claim_file = open_existing_append(
+        &claim_path,
+        ProtectedFileKind::ConsumptionEvidence,
+        MAX_CONSUMPTION_EVIDENCE_BYTES,
+    )
+    .map_err(|_| invalid("bound atomic consume claim cannot be pinned"))?;
+    let mut owner = ConsumedAuthorizationConsumption {
+        journal,
+        ledger_bytes: ledger_bytes.to_vec(),
+        claim: claim_file,
+        claim_bytes,
+        consumed_record: records[1].clone(),
+        binding: records[0].binding.clone(),
+        consumed_at_utc,
+        recovery_cancel_dispatch_budget: config.value().order.recovery_cancel_dispatch_budget,
+        recovery_continuation_registry: validation.recovery_continuation_registry,
+    };
+    owner.revalidate_held_consumption_evidence()?;
+    Ok(owner)
+}
+
 pub fn verify_authorization_consumption(
     config: &CanonicalTrialConfig,
     authorization: &CanonicalAuthorization,
@@ -357,31 +792,28 @@ pub fn verify_authorization_consumption(
         validate_claim(claim, &records[0].binding, &prepared_fingerprint)?;
     }
 
-    let (state, claim_durable, consumed_record_durable) = match records.as_slice() {
-        [prepared] => match claim {
-            None => (prepared.consumption.clone(), false, false),
+    let (state, claim_durable, consumed_record_durable) = if records.len() == 1 {
+        match claim {
+            None => (records[0].consumption.clone(), false, false),
             Some(claim) => (consumed_state(claim.consumed_at_utc), true, false),
-        },
-        [_, consumed] => {
-            let claim = claim.ok_or_else(|| {
-                invalid("Consumed ledger record exists without its atomic consume claim")
-            })?;
-            let consumed_at = consumed_time(&consumed.consumption)?;
-            if consumed_at != claim.consumed_at_utc {
-                return Err(invalid("consume claim and ledger timestamp disagree"));
-            }
-            (consumed.consumption.clone(), true, true)
         }
-        [_, consumed, terminal] => {
-            let claim = claim.ok_or_else(|| {
-                invalid("Terminal ledger exists without its atomic consume claim")
-            })?;
-            if consumed_time(&consumed.consumption)? != claim.consumed_at_utc {
-                return Err(invalid("consume claim and ledger timestamp disagree"));
-            }
-            (terminal.consumption.clone(), true, true)
+    } else {
+        let consumed = &records[1];
+        let claim = claim.ok_or_else(|| {
+            invalid("Consumed ledger record exists without its atomic consume claim")
+        })?;
+        if consumed_time(&consumed.consumption)? != claim.consumed_at_utc {
+            return Err(invalid("consume claim and ledger timestamp disagree"));
         }
-        _ => return Err(invalid("consumption ledger has an impossible record count")),
+        let state = match records.last().map(|record| &record.consumption) {
+            Some(AuthorizationConsumptionState::Terminal { .. }) => records
+                .last()
+                .ok_or_else(|| invalid("consumption ledger is empty"))?
+                .consumption
+                .clone(),
+            _ => consumed.consumption.clone(),
+        };
+        (state, true, true)
     };
     Ok(AuthorizationConsumptionVerification {
         schema_version: CONSUMPTION_SCHEMA_VERSION,
@@ -394,6 +826,7 @@ pub fn verify_authorization_consumption(
         binding_fingerprint: records[0].binding_fingerprint.clone(),
         exact_bindings_structurally_valid: true,
         ambiguous_tail: false,
+        recovery_continuation_registry: validation.recovery_continuation_registry,
         authorization: OfflineAuthorizationState::DENIED,
     })
 }
@@ -479,6 +912,8 @@ fn consume_prepared(
         consumed_record: record,
         binding,
         consumed_at_utc: runtime.observed_at_utc.clone(),
+        recovery_cancel_dispatch_budget: config.value().order.recovery_cancel_dispatch_budget,
+        recovery_continuation_registry: None,
     })
 }
 
@@ -540,6 +975,7 @@ fn validated_binding(
 
 struct ValidatedRecords {
     latest_record_fingerprint: String,
+    recovery_continuation_registry: Option<AuthorizationRecoveryContinuationRegistryV1>,
 }
 
 fn validate_records(
@@ -547,7 +983,10 @@ fn validate_records(
     authorization: &CanonicalAuthorization,
     records: &[AuthorizationConsumptionEvidence],
 ) -> Result<ValidatedRecords, PmAuthorizationConsumptionError> {
-    if records.is_empty() || records.len() > 3 {
+    let maximum_records = 4_usize.saturating_add(usize::from(
+        config.value().order.recovery_cancel_dispatch_budget,
+    ));
+    if records.is_empty() || records.len() > maximum_records {
         return Err(invalid("consumption ledger record count is invalid"));
     }
     let prepared_time = match &records[0].consumption {
@@ -563,6 +1002,7 @@ fn validate_records(
     }
     let mut previous = ZERO_FINGERPRINT.to_owned();
     let mut consumed_at: Option<DateTime<Utc>> = None;
+    let mut recovery_continuation_registry = None;
     for (index, record) in records.iter().enumerate() {
         if record.schema_version != CONSUMPTION_SCHEMA_VERSION
             || usize::from(record.sequence) != index
@@ -603,11 +1043,139 @@ fn validate_records(
                     ..
                 },
                 2,
-            ) => {
+            ) if index + 1 == records.len() && recovery_continuation_registry.is_none() => {
                 let terminal = parse_canonical_utc(terminal_at_utc)?;
                 if consumed_at.is_none_or(|consumed| terminal < consumed) {
                     return Err(invalid("Terminal evidence precedes consumption"));
                 }
+            }
+            (
+                AuthorizationConsumptionState::RecoveryContinuationRootAnchored {
+                    root,
+                    recovery_cancel_only: true,
+                    placement_can_never_resume: true,
+                },
+                2,
+            ) => {
+                if recovery_continuation_registry.is_some()
+                    || make_recovery_continuation_root(
+                        &root.continuation_scope_fingerprint,
+                        &root.continuation_intent_header_fingerprint,
+                        &root.continuation_dispatch_header_fingerprint,
+                    )? != *root
+                {
+                    return Err(invalid("recovery-continuation root anchor is invalid"));
+                }
+                recovery_continuation_registry =
+                    Some(AuthorizationRecoveryContinuationRegistryV1 {
+                        root: root.clone(),
+                        prepared: Vec::new(),
+                        terminal_plan: None,
+                    });
+            }
+            (
+                AuthorizationConsumptionState::RecoveryCancelPreparedAnchored {
+                    anchor,
+                    recovery_cancel_only: true,
+                    placement_can_never_resume: true,
+                },
+                _,
+            ) => {
+                let registry = recovery_continuation_registry
+                    .as_mut()
+                    .ok_or_else(|| invalid("recovery preparation precedes its root anchor"))?;
+                let expected_ordinal = u8::try_from(registry.prepared.len())
+                    .ok()
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or_else(|| invalid("recovery preparation ordinal bound exceeded"))?;
+                let expected_previous = registry
+                    .prepared
+                    .last()
+                    .map(|prior| prior.anchor_fingerprint.as_str())
+                    .unwrap_or(&registry.root.anchor_fingerprint);
+                let prior = registry.prepared.last();
+                if registry.terminal_plan.is_some()
+                    || index != usize::from(expected_ordinal) + 2
+                    || anchor.recovery_ordinal != expected_ordinal
+                    || anchor.recovery_ordinal
+                        > config.value().order.recovery_cancel_dispatch_budget
+                    || anchor.continuation_scope_fingerprint
+                        != registry.root.continuation_scope_fingerprint
+                    || anchor.previous_anchor_fingerprint != expected_previous
+                    || prior.is_some_and(|prior| {
+                        anchor.continuation_intent_sequence <= prior.continuation_intent_sequence
+                            || anchor.continuation_prepared_sequence
+                                <= prior.continuation_prepared_sequence
+                            || anchor.l2_timestamp_seconds <= prior.l2_timestamp_seconds
+                            || anchor.exact_venue_order_id != prior.exact_venue_order_id
+                            || anchor.semantic_request_commitment_sha256
+                                != prior.semantic_request_commitment_sha256
+                    })
+                    || make_recovery_cancel_prepared_anchor(
+                        &anchor.continuation_scope_fingerprint,
+                        anchor.recovery_ordinal,
+                        anchor.continuation_intent_sequence,
+                        &anchor.continuation_intent_record_fingerprint,
+                        anchor.continuation_prepared_sequence,
+                        &anchor.continuation_dispatch_previous_record_fingerprint,
+                        &anchor.continuation_prepared_record_fingerprint,
+                        &anchor.continuation_prepared_record_canonical_json,
+                        &anchor.exact_venue_order_id,
+                        &anchor.semantic_request_commitment_sha256,
+                        anchor.l2_timestamp_seconds,
+                        anchor.previous_anchor_fingerprint.clone(),
+                    )? != *anchor
+                {
+                    return Err(invalid("recovery preparation anchor is invalid"));
+                }
+                registry.prepared.push(anchor.clone());
+            }
+            (
+                AuthorizationConsumptionState::RecoveryTerminalPlanAnchored {
+                    plan,
+                    recovery_cancel_only: true,
+                    placement_can_never_resume: true,
+                },
+                _,
+            ) => {
+                let registry = recovery_continuation_registry
+                    .as_mut()
+                    .ok_or_else(|| invalid("recovery Terminal plan precedes its root anchor"))?;
+                let expected_previous = registry
+                    .prepared
+                    .last()
+                    .map(|prior| prior.anchor_fingerprint.as_str())
+                    .unwrap_or(&registry.root.anchor_fingerprint);
+                let terminal_at = parse_canonical_utc(&plan.terminal_at_utc)?;
+                if registry.terminal_plan.is_some()
+                    || index != registry.prepared.len() + 3
+                    || index + 1 != records.len()
+                    || plan.continuation_scope_fingerprint
+                        != registry.root.continuation_scope_fingerprint
+                    || plan.previous_anchor_fingerprint != expected_previous
+                    || consumed_at.is_none_or(|consumed| terminal_at < consumed)
+                    || make_recovery_terminal_plan(
+                        &plan.continuation_scope_fingerprint,
+                        plan.continuation_intent_predecessor_sequence,
+                        &plan.continuation_intent_predecessor_record_fingerprint,
+                        plan.continuation_dispatch_predecessor_sequence,
+                        &plan.continuation_dispatch_predecessor_record_fingerprint,
+                        &plan.terminal_at_utc,
+                        plan.disposition,
+                        plan.continuation_dispatch_terminal_sequence,
+                        &plan.continuation_dispatch_terminal_previous_record_fingerprint,
+                        &plan.continuation_dispatch_terminal_record_fingerprint,
+                        &plan.continuation_dispatch_terminal_record_canonical_json,
+                        plan.continuation_intent_terminal_sequence,
+                        &plan.continuation_intent_terminal_previous_record_fingerprint,
+                        &plan.continuation_intent_terminal_record_fingerprint,
+                        &plan.continuation_intent_terminal_record_canonical_json,
+                        plan.previous_anchor_fingerprint.clone(),
+                    )? != *plan
+                {
+                    return Err(invalid("recovery Terminal plan anchor is invalid"));
+                }
+                registry.terminal_plan = Some(plan.clone());
             }
             _ => {
                 return Err(invalid(
@@ -619,6 +1187,7 @@ fn validate_records(
     }
     Ok(ValidatedRecords {
         latest_record_fingerprint: previous,
+        recovery_continuation_registry,
     })
 }
 
@@ -715,7 +1284,7 @@ fn parse_ledger(
                 "consumption ledger contains an empty interior record",
             ));
         }
-        if records.len() == 3 {
+        if records.len() == MAX_CONSUMPTION_RECORDS {
             return Err(invalid("consumption ledger contains extra records"));
         }
         let record: AuthorizationConsumptionEvidence = serde_json::from_slice(line)
@@ -813,6 +1382,203 @@ fn claim_fingerprint(
         CLAIM_FINGERPRINT_DOMAIN,
         &canonical_json(claim)?,
     ))
+}
+
+fn make_recovery_continuation_root(
+    continuation_scope_fingerprint: &str,
+    continuation_intent_header_fingerprint: &str,
+    continuation_dispatch_header_fingerprint: &str,
+) -> Result<AuthorizationRecoveryContinuationRootV1, PmAuthorizationConsumptionError> {
+    for fingerprint in [
+        continuation_scope_fingerprint,
+        continuation_intent_header_fingerprint,
+        continuation_dispatch_header_fingerprint,
+    ] {
+        validate_sha256(fingerprint)?;
+    }
+    let mut root = AuthorizationRecoveryContinuationRootV1 {
+        continuation_scope_fingerprint: continuation_scope_fingerprint.to_owned(),
+        continuation_intent_header_fingerprint: continuation_intent_header_fingerprint.to_owned(),
+        continuation_dispatch_header_fingerprint: continuation_dispatch_header_fingerprint
+            .to_owned(),
+        previous_anchor_fingerprint: ZERO_FINGERPRINT.to_owned(),
+        anchor_fingerprint: ZERO_FINGERPRINT.to_owned(),
+    };
+    root.anchor_fingerprint = hash_domain(
+        RECOVERY_CONTINUATION_ROOT_FINGERPRINT_DOMAIN,
+        &canonical_json(&root)?,
+    );
+    Ok(root)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_recovery_cancel_prepared_anchor(
+    continuation_scope_fingerprint: &str,
+    recovery_ordinal: u8,
+    continuation_intent_sequence: u8,
+    continuation_intent_record_fingerprint: &str,
+    continuation_prepared_sequence: u8,
+    continuation_dispatch_previous_record_fingerprint: &str,
+    continuation_prepared_record_fingerprint: &str,
+    continuation_prepared_record_canonical_json: &str,
+    exact_venue_order_id: &str,
+    semantic_request_commitment_sha256: &str,
+    l2_timestamp_seconds: u64,
+    previous_anchor_fingerprint: String,
+) -> Result<AuthorizationRecoveryCancelPreparedAnchorV1, PmAuthorizationConsumptionError> {
+    for fingerprint in [
+        continuation_scope_fingerprint,
+        continuation_intent_record_fingerprint,
+        continuation_dispatch_previous_record_fingerprint,
+        continuation_prepared_record_fingerprint,
+        semantic_request_commitment_sha256,
+        previous_anchor_fingerprint.as_str(),
+    ] {
+        validate_sha256(fingerprint)?;
+    }
+    if recovery_ordinal == 0
+        || continuation_intent_sequence == 0
+        || continuation_prepared_sequence == 0
+        || l2_timestamp_seconds == 0
+        || exact_venue_order_id.len() != 66
+        || !exact_venue_order_id.starts_with("0x")
+        || !exact_venue_order_id[2..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid("recovery preparation anchor values are invalid"));
+    }
+    let _: serde_json::Value = serde_json::from_str(continuation_prepared_record_canonical_json)
+        .map_err(|_| invalid("recovery preparation canonical record is malformed"))?;
+    if continuation_prepared_record_canonical_json.len() > MAX_RECOVERY_PREPARED_RECORD_BYTES
+        || continuation_prepared_record_canonical_json
+            .bytes()
+            .any(|byte| matches!(byte, b'\n' | b'\r'))
+    {
+        return Err(invalid(
+            "recovery preparation canonical record is not one bounded JSON line",
+        ));
+    }
+    let mut anchor = AuthorizationRecoveryCancelPreparedAnchorV1 {
+        continuation_scope_fingerprint: continuation_scope_fingerprint.to_owned(),
+        recovery_ordinal,
+        continuation_intent_sequence,
+        continuation_intent_record_fingerprint: continuation_intent_record_fingerprint.to_owned(),
+        continuation_prepared_sequence,
+        continuation_dispatch_previous_record_fingerprint:
+            continuation_dispatch_previous_record_fingerprint.to_owned(),
+        continuation_prepared_record_fingerprint: continuation_prepared_record_fingerprint
+            .to_owned(),
+        continuation_prepared_record_canonical_json: continuation_prepared_record_canonical_json
+            .to_owned(),
+        exact_venue_order_id: exact_venue_order_id.to_owned(),
+        semantic_request_commitment_sha256: semantic_request_commitment_sha256.to_owned(),
+        l2_timestamp_seconds,
+        previous_anchor_fingerprint,
+        anchor_fingerprint: ZERO_FINGERPRINT.to_owned(),
+    };
+    anchor.anchor_fingerprint = hash_domain(
+        RECOVERY_CANCEL_PREPARED_FINGERPRINT_DOMAIN,
+        &canonical_json(&anchor)?,
+    );
+    Ok(anchor)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_recovery_terminal_plan(
+    continuation_scope_fingerprint: &str,
+    continuation_intent_predecessor_sequence: u8,
+    continuation_intent_predecessor_record_fingerprint: &str,
+    continuation_dispatch_predecessor_sequence: u8,
+    continuation_dispatch_predecessor_record_fingerprint: &str,
+    terminal_at_utc: &str,
+    disposition: TerminalDisposition,
+    continuation_dispatch_terminal_sequence: u8,
+    continuation_dispatch_terminal_previous_record_fingerprint: &str,
+    continuation_dispatch_terminal_record_fingerprint: &str,
+    continuation_dispatch_terminal_record_canonical_json: &str,
+    continuation_intent_terminal_sequence: u8,
+    continuation_intent_terminal_previous_record_fingerprint: &str,
+    continuation_intent_terminal_record_fingerprint: &str,
+    continuation_intent_terminal_record_canonical_json: &str,
+    previous_anchor_fingerprint: String,
+) -> Result<AuthorizationRecoveryTerminalPlanV1, PmAuthorizationConsumptionError> {
+    for fingerprint in [
+        continuation_scope_fingerprint,
+        continuation_intent_predecessor_record_fingerprint,
+        continuation_dispatch_predecessor_record_fingerprint,
+        continuation_dispatch_terminal_previous_record_fingerprint,
+        continuation_dispatch_terminal_record_fingerprint,
+        continuation_intent_terminal_previous_record_fingerprint,
+        continuation_intent_terminal_record_fingerprint,
+        previous_anchor_fingerprint.as_str(),
+    ] {
+        validate_sha256(fingerprint)?;
+    }
+    parse_canonical_utc(terminal_at_utc)?;
+    if continuation_dispatch_terminal_sequence
+        != continuation_dispatch_predecessor_sequence
+            .checked_add(1)
+            .ok_or_else(|| invalid("recovery Terminal dispatch sequence overflows"))?
+        || continuation_intent_terminal_sequence
+            != continuation_intent_predecessor_sequence
+                .checked_add(1)
+                .ok_or_else(|| invalid("recovery Terminal intent sequence overflows"))?
+        || continuation_dispatch_terminal_previous_record_fingerprint
+            != continuation_dispatch_predecessor_record_fingerprint
+        || continuation_intent_terminal_previous_record_fingerprint
+            != continuation_intent_predecessor_record_fingerprint
+    {
+        return Err(invalid(
+            "recovery Terminal plan does not immediately follow its predecessors",
+        ));
+    }
+    for canonical in [
+        continuation_dispatch_terminal_record_canonical_json,
+        continuation_intent_terminal_record_canonical_json,
+    ] {
+        let _: serde_json::Value = serde_json::from_str(canonical)
+            .map_err(|_| invalid("recovery Terminal canonical record is malformed"))?;
+        if canonical.len() > MAX_RECOVERY_PREPARED_RECORD_BYTES
+            || canonical.bytes().any(|byte| matches!(byte, b'\n' | b'\r'))
+        {
+            return Err(invalid(
+                "recovery Terminal canonical record is not one bounded JSON line",
+            ));
+        }
+    }
+    let mut plan = AuthorizationRecoveryTerminalPlanV1 {
+        continuation_scope_fingerprint: continuation_scope_fingerprint.to_owned(),
+        continuation_intent_predecessor_sequence,
+        continuation_intent_predecessor_record_fingerprint:
+            continuation_intent_predecessor_record_fingerprint.to_owned(),
+        continuation_dispatch_predecessor_sequence,
+        continuation_dispatch_predecessor_record_fingerprint:
+            continuation_dispatch_predecessor_record_fingerprint.to_owned(),
+        terminal_at_utc: terminal_at_utc.to_owned(),
+        disposition,
+        continuation_dispatch_terminal_sequence,
+        continuation_dispatch_terminal_previous_record_fingerprint:
+            continuation_dispatch_terminal_previous_record_fingerprint.to_owned(),
+        continuation_dispatch_terminal_record_fingerprint:
+            continuation_dispatch_terminal_record_fingerprint.to_owned(),
+        continuation_dispatch_terminal_record_canonical_json:
+            continuation_dispatch_terminal_record_canonical_json.to_owned(),
+        continuation_intent_terminal_sequence,
+        continuation_intent_terminal_previous_record_fingerprint:
+            continuation_intent_terminal_previous_record_fingerprint.to_owned(),
+        continuation_intent_terminal_record_fingerprint:
+            continuation_intent_terminal_record_fingerprint.to_owned(),
+        continuation_intent_terminal_record_canonical_json:
+            continuation_intent_terminal_record_canonical_json.to_owned(),
+        previous_anchor_fingerprint,
+        anchor_fingerprint: ZERO_FINGERPRINT.to_owned(),
+    };
+    plan.anchor_fingerprint = hash_domain(
+        RECOVERY_TERMINAL_PLAN_FINGERPRINT_DOMAIN,
+        &canonical_json(&plan)?,
+    );
+    Ok(plan)
 }
 
 fn hash_domain(domain: &[u8], bytes: &[u8]) -> String {

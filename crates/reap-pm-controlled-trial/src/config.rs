@@ -422,8 +422,16 @@ pub struct AuthorizationBuildBinding {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorizationHostBinding {
+    /// Exact UTF-8 Linux UTS nodename exposed by the current UTS namespace.
+    /// Runtime binding is byte-for-byte and performs no DNS lookup, FQDN
+    /// expansion, case folding, trailing-dot handling, `/etc/hostname`,
+    /// machine-id, or cloud instance alias mapping.
     pub host_identity: String,
     pub boot_identity: String,
+    /// Exact effective-UID account name returned through the runner's fixed
+    /// `/usr/bin/getent passwd <euid>` lookup. That executable and its NSS
+    /// providers are correctness, integrity, and availability dependencies;
+    /// this reviewed string is not executable-release attestation.
     pub runtime_user: String,
     pub egress_identity: String,
 }
