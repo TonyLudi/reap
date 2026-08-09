@@ -106,6 +106,87 @@ struct CancelSemanticCommitmentBasis {
     order_id: FixedOrderId,
 }
 
+/// Secret-free identity of one fixed-profile place request before signing.
+///
+/// Both values are derived exclusively from the public unsigned order and
+/// the selected fixed CLOB V2 domain. The identity contains no signature,
+/// exact serialized body, L2 credential, or mutation authority.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PlacePublicRequestIdentity {
+    expected_order_id: ExpectedOrderId,
+    semantic_request_commitment: PlaceSemanticRequestCommitment,
+}
+
+impl PlacePublicRequestIdentity {
+    #[must_use]
+    pub const fn expected_order_id(self) -> ExpectedOrderId {
+        self.expected_order_id
+    }
+
+    #[must_use]
+    pub const fn semantic_request_commitment(self) -> PlaceSemanticRequestCommitment {
+        self.semantic_request_commitment
+    }
+}
+
+impl fmt::Debug for PlacePublicRequestIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PlacePublicRequestIdentity")
+            .field("expected_order_id", &self.expected_order_id)
+            .field(
+                "semantic_request_commitment",
+                &self.semantic_request_commitment,
+            )
+            .field("mutation_authority", &false)
+            .finish()
+    }
+}
+
+/// Derive the exact public place identity without possessing or using a
+/// private key. Signing later recomputes this same identity and therefore
+/// cannot silently change the reviewed order or domain.
+#[must_use]
+pub fn derive_place_public_request_identity(
+    domain: PmClobDomain,
+    order: PmUnsignedClobV2Order,
+) -> PlacePublicRequestIdentity {
+    let expected_order_id = ExpectedOrderId::from_bytes(order_digest(
+        domain_separator(domain),
+        order_struct_hash(order),
+    ));
+    let profile = match order.signature_profile() {
+        PmClobV2SignatureType::Eoa => FIXED_PLACE_SEMANTIC_PROFILE,
+        PmClobV2SignatureType::Proxy => FIXED_PROXY_PLACE_SEMANTIC_PROFILE,
+    };
+    let semantic_request_commitment = hash_place_semantic_basis(PlaceSemanticCommitmentBasis {
+        profile,
+        expected_order_id,
+        domain,
+        salt: order.salt(),
+        maker: EoaAddress::from_bytes(order.maker().bytes()),
+        signer: EoaAddress::from_bytes(order.signer().bytes()),
+        token_id: order.token_id(),
+        maker_amount: order.maker_amount(),
+        taker_amount: order.taker_amount(),
+        side: order.side(),
+        order_timestamp_ms: order.timestamp_ms(),
+    });
+    PlacePublicRequestIdentity {
+        expected_order_id,
+        semantic_request_commitment,
+    }
+}
+
+/// Derive the journal-safe semantic identity of one exact-owned cancel
+/// without serializing a body or using L2 credentials.
+#[must_use]
+pub fn derive_owned_cancel_semantic_request_commitment(
+    order_id: FixedOrderId,
+) -> OwnedCancelSemanticRequestCommitment {
+    owned_cancel_semantic_request_commitment(order_id)
+}
+
 /// One fixed-profile signed order. It can only be consumed into the fixed
 /// GTC/post-only place body.
 pub struct SignedClobV2Order {
@@ -233,9 +314,8 @@ impl FixedEoaSigner {
             return Err(PmAuthError::OrderIdentityMismatch);
         }
 
-        let domain_separator = domain_separator(domain);
-        let struct_hash = order_struct_hash(order);
-        let digest = order_digest(domain_separator, struct_hash);
+        let public_identity = derive_place_public_request_identity(domain, order);
+        let digest = public_identity.expected_order_id().bytes();
         let signing_key = self.signing_key()?;
         let (signature, recovery_id) = signing_key
             .sign_prehash_recoverable(&digest)
@@ -260,7 +340,7 @@ impl FixedEoaSigner {
             signature_profile: order.signature_profile(),
             timestamp_ms: order.timestamp_ms(),
             signature: encoded_signature,
-            expected_order_id: ExpectedOrderId::from_bytes(digest),
+            expected_order_id: public_identity.expected_order_id(),
         })
     }
 }
@@ -549,7 +629,8 @@ mod tests {
     use super::{
         CancelSemanticCommitmentBasis, FIXED_CANCEL_SEMANTIC_PROFILE, FIXED_PLACE_SEMANTIC_PROFILE,
         FIXED_PROXY_PLACE_SEMANTIC_PROFILE, FixedCancelSemanticProfile, FixedPlaceSemanticProfile,
-        ORDER_TYPE, PlaceSemanticCommitmentBasis, domain_separator, hash_cancel_semantic_basis,
+        ORDER_TYPE, PlaceSemanticCommitmentBasis, derive_owned_cancel_semantic_request_commitment,
+        derive_place_public_request_identity, domain_separator, hash_cancel_semantic_basis,
         hash_place_semantic_basis, order_struct_hash,
     };
     use crate::{EoaAddress, ExpectedOrderId, FixedOrderId, PmClobDomain};
@@ -607,6 +688,27 @@ mod tests {
             ),
             "0x8633966131c65c5cabe59dee955d024d6406ff2fee8fc4e6cb1c74c00a1f6866"
         );
+    }
+
+    #[test]
+    fn public_place_identity_is_exact_and_domain_separated_without_signing() {
+        let order = vector_order(PmOrderSide::Buy);
+        let standard = derive_place_public_request_identity(PmClobDomain::Standard, order);
+        let negative_risk = derive_place_public_request_identity(PmClobDomain::NegativeRisk, order);
+
+        assert_eq!(
+            standard.expected_order_id().to_string(),
+            "0xfaf10599783c69b375a0f0d948d37eb711ec042dbf7d52fc2f8d8832d71af7f1"
+        );
+        assert_ne!(
+            standard.expected_order_id(),
+            negative_risk.expected_order_id()
+        );
+        assert_ne!(
+            standard.semantic_request_commitment(),
+            negative_risk.semantic_request_commitment()
+        );
+        assert!(format!("{standard:?}").contains("mutation_authority: false"));
     }
 
     fn place_semantic_basis() -> PlaceSemanticCommitmentBasis {
@@ -774,6 +876,10 @@ mod tests {
         assert_ne!(
             exact.bytes(),
             hash_place_semantic_basis(place_semantic_basis()).bytes()
+        );
+        assert_eq!(
+            derive_owned_cancel_semantic_request_commitment(order_id),
+            exact
         );
     }
 }

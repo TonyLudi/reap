@@ -26,6 +26,10 @@ pub use l2::{
     AuthenticatedUserSubscription, AuthenticatedUserSubscriptionSink, FixedOwnedCancelRequestSink,
     FixedPlaceRequestSink, L2HeaderSink, L2Timestamp,
 };
-pub use order::{SerializedOwnedCancelRequest, SerializedPlaceRequest, SignedClobV2Order};
+pub use order::{
+    PlacePublicRequestIdentity, SerializedOwnedCancelRequest, SerializedPlaceRequest,
+    SignedClobV2Order, derive_owned_cancel_semantic_request_commitment,
+    derive_place_public_request_identity,
+};
 pub use secret::{EoaPrivateKeyInput, FixedEoaSigner, L2CredentialInput, L2Credentials};
 pub use user_frame::CredentialOwnedUserFrame;
