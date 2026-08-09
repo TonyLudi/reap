@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, time::Duration};
 
 use reap_polymarket_auth::{
     AuthenticatedL2Headers, AuthenticatedUserSubscription, AuthenticatedUserSubscriptionSink,
@@ -17,6 +17,97 @@ use crate::{
 };
 
 const CREDENTIAL_AUTHORITY_CAPACITY: usize = 32;
+const MAX_CREDENTIAL_AUTHORITY_JOIN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Fixed shutdown bounds used by ordinary composition teardown.
+pub const PM_CREDENTIAL_AUTHORITY_DEFAULT_SHUTDOWN_BOUNDS: PmCredentialAuthorityShutdownBounds =
+    PmCredentialAuthorityShutdownBounds::fixed(Duration::from_secs(30), Duration::from_secs(5));
+
+/// Short, fixed shutdown bounds used by the credentialed read-only smoke.
+pub const PM_CREDENTIAL_AUTHORITY_READ_ONLY_SHUTDOWN_BOUNDS: PmCredentialAuthorityShutdownBounds =
+    PmCredentialAuthorityShutdownBounds::fixed(Duration::from_secs(5), Duration::from_secs(5));
+
+/// Validated upper bounds for graceful credential-authority join and the
+/// follow-up join after abort is requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmCredentialAuthorityShutdownBounds {
+    graceful_join_timeout: Duration,
+    abort_join_timeout: Duration,
+}
+
+impl PmCredentialAuthorityShutdownBounds {
+    const fn fixed(graceful_join_timeout: Duration, abort_join_timeout: Duration) -> Self {
+        Self {
+            graceful_join_timeout,
+            abort_join_timeout,
+        }
+    }
+
+    pub fn new(
+        graceful_join_timeout: Duration,
+        abort_join_timeout: Duration,
+    ) -> Result<Self, PmLiveAdapterError> {
+        if graceful_join_timeout.is_zero()
+            || abort_join_timeout.is_zero()
+            || graceful_join_timeout > MAX_CREDENTIAL_AUTHORITY_JOIN_TIMEOUT
+            || abort_join_timeout > MAX_CREDENTIAL_AUTHORITY_JOIN_TIMEOUT
+        {
+            return Err(PmLiveAdapterError::InvalidConfiguration(
+                "credential-authority join timeouts must each be within 1ns..=60s",
+            ));
+        }
+        Ok(Self::fixed(graceful_join_timeout, abort_join_timeout))
+    }
+
+    #[must_use]
+    pub const fn graceful_join_timeout(self) -> Duration {
+        self.graceful_join_timeout
+    }
+
+    #[must_use]
+    pub const fn abort_join_timeout(self) -> Duration {
+        self.abort_join_timeout
+    }
+}
+
+/// Truthful result of bounded credential-authority teardown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmCredentialAuthorityShutdownOutcome {
+    shutdown_requested: bool,
+    abort_requested: bool,
+    task_joined: bool,
+    task_completed_cleanly: bool,
+    credentials_dropped: bool,
+}
+
+impl PmCredentialAuthorityShutdownOutcome {
+    #[must_use]
+    pub const fn shutdown_requested(self) -> bool {
+        self.shutdown_requested
+    }
+
+    #[must_use]
+    pub const fn abort_requested(self) -> bool {
+        self.abort_requested
+    }
+
+    #[must_use]
+    pub const fn task_joined(self) -> bool {
+        self.task_joined
+    }
+
+    #[must_use]
+    pub const fn task_completed_cleanly(self) -> bool {
+        self.task_completed_cleanly
+    }
+
+    /// A completed join, including a cancelled or panicked task, proves that
+    /// the secret-owning future and its credential bundle were dropped.
+    #[must_use]
+    pub const fn credentials_dropped(self) -> bool {
+        self.credentials_dropped
+    }
+}
 
 /// Sole owner of one account's L2 credential bundle and its exact private
 /// transport configuration.
@@ -129,6 +220,30 @@ pub struct PmCredentialAuthoritySupervisor {
     task: Option<JoinHandle<()>>,
 }
 
+struct PmCredentialAuthorityShutdownFailStop {
+    armed: bool,
+}
+
+impl PmCredentialAuthorityShutdownFailStop {
+    const fn armed() -> Self {
+        Self { armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PmCredentialAuthorityShutdownFailStop {
+    fn drop(&mut self) {
+        if self.armed {
+            // Cancelling the bounded shutdown future would otherwise detach
+            // the sole task that owns the L2 credential bundle.
+            std::process::abort();
+        }
+    }
+}
+
 impl PmCredentialAuthoritySupervisor {
     pub(crate) fn from_task(shutdown: oneshot::Sender<()>, task: JoinHandle<()>) -> Self {
         Self {
@@ -137,16 +252,72 @@ impl PmCredentialAuthoritySupervisor {
         }
     }
 
-    pub async fn shutdown(mut self) -> Result<(), PmLiveAdapterError> {
-        if let Some(shutdown) = self.shutdown.take() {
+    /// Request graceful shutdown, then join through two finite waits. If the
+    /// graceful wait expires the task is aborted and joined for the second
+    /// finite interval. No path awaits a task after the abort bound expires.
+    pub async fn shutdown_bounded(
+        mut self,
+        bounds: PmCredentialAuthorityShutdownBounds,
+    ) -> PmCredentialAuthorityShutdownOutcome {
+        let shutdown_requested = self.shutdown.take().is_some_and(|shutdown| {
             let _ = shutdown.send(());
+            true
+        });
+        let Some(task) = self.task.as_mut() else {
+            return PmCredentialAuthorityShutdownOutcome {
+                shutdown_requested,
+                abort_requested: false,
+                task_joined: false,
+                task_completed_cleanly: false,
+                credentials_dropped: false,
+            };
+        };
+        let mut cancellation_fail_stop = PmCredentialAuthorityShutdownFailStop::armed();
+
+        let outcome = match tokio::time::timeout(bounds.graceful_join_timeout(), &mut *task).await {
+            Ok(join) => PmCredentialAuthorityShutdownOutcome {
+                shutdown_requested,
+                abort_requested: false,
+                task_joined: true,
+                task_completed_cleanly: join.is_ok(),
+                credentials_dropped: true,
+            },
+            Err(_) => {
+                task.abort();
+                match tokio::time::timeout(bounds.abort_join_timeout(), &mut *task).await {
+                    Ok(join) => PmCredentialAuthorityShutdownOutcome {
+                        shutdown_requested,
+                        abort_requested: true,
+                        task_joined: true,
+                        task_completed_cleanly: join.is_ok(),
+                        credentials_dropped: true,
+                    },
+                    // Returning would detach the still secret-owning task.
+                    // Fail-stop the process so the OS closes sockets and
+                    // destroys the credential address space instead.
+                    Err(_) => std::process::abort(),
+                }
+            }
+        };
+        drop(self.task.take());
+        cancellation_fail_stop.disarm();
+        outcome
+    }
+
+    pub async fn shutdown(self) -> Result<(), PmLiveAdapterError> {
+        let outcome = self
+            .shutdown_bounded(PM_CREDENTIAL_AUTHORITY_DEFAULT_SHUTDOWN_BOUNDS)
+            .await;
+        if outcome.shutdown_requested()
+            && !outcome.abort_requested()
+            && outcome.task_joined()
+            && outcome.task_completed_cleanly()
+            && outcome.credentials_dropped()
+        {
+            Ok(())
+        } else {
+            Err(PmLiveAdapterError::CredentialAuthorityTaskFailed)
         }
-        let task = self
-            .task
-            .take()
-            .ok_or(PmLiveAdapterError::CredentialAuthorityClosed)?;
-        task.await
-            .map_err(|_| PmLiveAdapterError::CredentialAuthorityTaskFailed)
     }
 }
 
@@ -553,5 +724,54 @@ mod tests {
                 .await,
             Err(PmLiveAdapterError::CredentialAuthorityClosed)
         ));
+    }
+
+    #[tokio::test]
+    async fn bounded_shutdown_reports_a_clean_graceful_join() {
+        let (_sender, supervisor) = spawn_credential_authority(credentials()).unwrap();
+        let outcome = supervisor
+            .shutdown_bounded(PM_CREDENTIAL_AUTHORITY_READ_ONLY_SHUTDOWN_BOUNDS)
+            .await;
+
+        assert!(outcome.shutdown_requested());
+        assert!(!outcome.abort_requested());
+        assert!(outcome.task_joined());
+        assert!(outcome.task_completed_cleanly());
+        assert!(outcome.credentials_dropped());
+    }
+
+    #[tokio::test]
+    async fn bounded_shutdown_aborts_and_joins_a_stuck_task() {
+        let (shutdown, _shutdown_receiver) = oneshot::channel();
+        let task = tokio::spawn(std::future::pending::<()>());
+        let supervisor = PmCredentialAuthoritySupervisor::from_task(shutdown, task);
+        let bounds = PmCredentialAuthorityShutdownBounds::new(
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        let outcome = supervisor.shutdown_bounded(bounds).await;
+
+        assert!(outcome.shutdown_requested());
+        assert!(outcome.abort_requested());
+        assert!(outcome.task_joined());
+        assert!(!outcome.task_completed_cleanly());
+        assert!(outcome.credentials_dropped());
+    }
+
+    #[test]
+    fn shutdown_bounds_reject_zero_or_unbounded_waits() {
+        assert!(
+            PmCredentialAuthorityShutdownBounds::new(Duration::ZERO, Duration::from_secs(1))
+                .is_err()
+        );
+        assert!(
+            PmCredentialAuthorityShutdownBounds::new(
+                Duration::from_secs(1),
+                Duration::from_secs(61),
+            )
+            .is_err()
+        );
     }
 }

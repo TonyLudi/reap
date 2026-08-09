@@ -6,6 +6,7 @@ edition.workspace = true
 [features]
 default = []
 loopback-evidence = []
+read-only-evidence = []
 test-support = []
 
 [dependencies]
@@ -16,6 +17,7 @@ reap-polymarket-adapter.workspace = true
 reap-polymarket-auth.workspace = true
 reap-polymarket-wire.workspace = true
 reqwest.workspace = true
+sha3.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true

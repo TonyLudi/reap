@@ -1532,6 +1532,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "reap-pm-readiness"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "clap",
+ "futures-util",
+ "libc",
+ "reap-pm-core",
+ "reap-polymarket-live-adapter",
+ "reap-polymarket-wire",
+ "reap-telemetry",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite",
+ "toml 0.9.12+spec-1.1.0",
+ "zeroize",
+]
+
+[[package]]
 name = "reap-pm-state"
 version = "0.1.0"
 dependencies = [
@@ -1591,6 +1615,7 @@ dependencies = [
  "reap-polymarket-wire",
  "reap-transport",
  "reqwest",
+ "sha3",
  "thiserror",
  "tokio",
  "tokio-tungstenite",

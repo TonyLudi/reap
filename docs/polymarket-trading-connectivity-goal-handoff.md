@@ -36,8 +36,10 @@ and application/runtime architecture are not Reap authority.
 
 ## Implemented Cut
 
-The workspace has 37 crates, including the new edge crates
-`reap-polymarket-auth` and `reap-polymarket-live-adapter`. Goal F's fake root
+The workspace now has 38 crates. PM-T1 added the edge crates
+`reap-polymarket-auth` and `reap-polymarket-live-adapter`; the later
+read-only-qualification milestone added the separate `reap-pm-readiness`
+composition without changing PM-T1's mutation boundary. Goal F's fake root
 remains first-class. A distinct feature-gated authenticated-loopback root
 consumes the same product, destroys its fixture executor, and exposes no
 runtime backend selector or production-origin constructor.

@@ -1,0 +1,5 @@
+error[E0599]: no method named `authenticate_place` found for mutable reference `&mut PmReadOnlyPrivateConnectivityOwner` in the current scope
+ --> tests/ui/read_only_facade_has_no_mutation_api.rs:4:11
+  |
+4 |     owner.authenticate_place();
+  |           ^^^^^^^^^^^^^^^^^^ method not found in `&mut PmReadOnlyPrivateConnectivityOwner`

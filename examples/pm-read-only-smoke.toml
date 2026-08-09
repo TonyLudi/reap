@@ -1,0 +1,41 @@
+# Polymarket credentialed read-only certification template.
+#
+# Every identity below is synthetic. Copy this file to a protected per-run
+# location and replace the reviewed non-secret target values. Secret values do
+# not belong here: the three final fields are basename-only entries beneath the
+# directory supplied with --credentials-dir.
+
+schema_version = 1
+credential_slot_id = "replace-with-reviewed-pm-slot-v1"
+
+# Fixed type-0 EOA profile: these two canonical addresses must be identical.
+signer_address = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+funder_address = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+chain_id = 137
+signature_type = 0
+
+# Replace this synthetic condition/market/outcome tuple with one exact reviewed
+# target. Keep token_id and all exact decimal values quoted.
+condition_id = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+market_id = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+token_id = "123"
+outcome = "Yes"
+tick = "0.01"
+minimum_order_size = "5"
+negative_risk = false
+
+connect_timeout_ms = 5000
+request_timeout_ms = 10000
+user_stream_dwell_ms = 20000
+user_stream_idle_timeout_ms = 30000
+user_stream_pong_timeout_ms = 5000
+user_stream_max_reconnect_attempts = 2
+user_stream_reconnect_backoff_ms = 1000
+user_stream_event_channel_capacity = 64
+
+# These files must be direct children of --credentials-dir, regular,
+# non-symlink, single-link, mode 0400/0600, and written without a trailing
+# newline. Never replace these names with secret values.
+api_key_file = "api-key"
+secret_file = "secret"
+passphrase_file = "passphrase"

@@ -21,6 +21,15 @@ pub struct PmReadServerTimeHttpRole {
 }
 
 impl PmReadServerTimeHttpRole {
+    /// Build a standalone read-only `/time` capability.
+    ///
+    /// This constructor creates only a read-time clock domain. Callers do not
+    /// need to construct the broader public HTTP role or receive a mutation
+    /// time/validator capability.
+    pub fn new(config: PmPublicHttpConfig) -> Result<Self, PmLiveAdapterError> {
+        Self::with_product_clock(config, PmReadServerTimeProductClock::standalone_system())
+    }
+
     pub(crate) fn with_product_clock(
         config: PmPublicHttpConfig,
         clock: PmReadServerTimeProductClock,

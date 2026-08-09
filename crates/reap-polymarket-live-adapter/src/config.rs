@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-#[cfg(any(test, feature = "loopback-evidence"))]
+#[cfg(any(test, feature = "loopback-evidence", feature = "read-only-evidence"))]
 use std::net::IpAddr;
 
 use reap_polymarket_wire::PmWireScope;
@@ -14,7 +14,7 @@ const MAX_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OriginMode {
     Production,
-    #[cfg(any(test, feature = "loopback-evidence"))]
+    #[cfg(any(test, feature = "loopback-evidence", feature = "read-only-evidence"))]
     LocalEvidence,
 }
 
@@ -64,6 +64,26 @@ impl PmPrivateHttpConfig {
         request_timeout: Duration,
         exact_order_scope: PmWireScope,
     ) -> Result<Self, PmLiveAdapterError> {
+        Self::local_read_config(origin, connect_timeout, request_timeout, exact_order_scope)
+    }
+
+    #[cfg(any(test, feature = "read-only-evidence"))]
+    pub fn read_only_evidence(
+        origin: &str,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        exact_order_scope: PmWireScope,
+    ) -> Result<Self, PmLiveAdapterError> {
+        Self::local_read_config(origin, connect_timeout, request_timeout, exact_order_scope)
+    }
+
+    #[cfg(any(test, feature = "loopback-evidence", feature = "read-only-evidence"))]
+    fn local_read_config(
+        origin: &str,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        exact_order_scope: PmWireScope,
+    ) -> Result<Self, PmLiveAdapterError> {
         validate_timeouts(connect_timeout, request_timeout)?;
         let origin = validate_local_evidence_origin(origin)?;
         Ok(Self {
@@ -82,7 +102,7 @@ impl PmPrivateHttpConfig {
         request_timeout: Duration,
         exact_order_scope: PmWireScope,
     ) -> Result<Self, PmLiveAdapterError> {
-        Self::loopback_evidence(origin, connect_timeout, request_timeout, exact_order_scope)
+        Self::local_read_config(origin, connect_timeout, request_timeout, exact_order_scope)
     }
 
     #[must_use]
@@ -134,6 +154,24 @@ impl PmPublicHttpConfig {
         connect_timeout: Duration,
         request_timeout: Duration,
     ) -> Result<Self, PmLiveAdapterError> {
+        Self::local_read_config(origin, connect_timeout, request_timeout)
+    }
+
+    #[cfg(any(test, feature = "read-only-evidence"))]
+    pub fn read_only_evidence(
+        origin: &str,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Result<Self, PmLiveAdapterError> {
+        Self::local_read_config(origin, connect_timeout, request_timeout)
+    }
+
+    #[cfg(any(test, feature = "loopback-evidence", feature = "read-only-evidence"))]
+    fn local_read_config(
+        origin: &str,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Result<Self, PmLiveAdapterError> {
         validate_timeouts(connect_timeout, request_timeout)?;
         let origin = validate_local_evidence_origin(origin)?;
         Ok(Self {
@@ -150,7 +188,7 @@ impl PmPublicHttpConfig {
         connect_timeout: Duration,
         request_timeout: Duration,
     ) -> Result<Self, PmLiveAdapterError> {
-        Self::loopback_evidence(origin, connect_timeout, request_timeout)
+        Self::local_read_config(origin, connect_timeout, request_timeout)
     }
 
     #[must_use]
@@ -214,7 +252,7 @@ fn validate_production_origin(origin: &str) -> Result<Url, PmLiveAdapterError> {
     Ok(url)
 }
 
-#[cfg(any(test, feature = "loopback-evidence"))]
+#[cfg(any(test, feature = "loopback-evidence", feature = "read-only-evidence"))]
 fn validate_local_evidence_origin(origin: &str) -> Result<Url, PmLiveAdapterError> {
     let url = validate_base_origin(origin)?;
     if url.scheme() != "http" {

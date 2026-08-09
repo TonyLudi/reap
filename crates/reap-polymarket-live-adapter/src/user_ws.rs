@@ -619,7 +619,13 @@ async fn run_connected(
                 last_inbound = Instant::now();
                 match message {
                     Message::Text(text) if text.as_str() == APPLICATION_PONG => {
-                        outstanding_pong = None;
+                        if outstanding_pong.take().is_none() {
+                            return retired(
+                                clock,
+                                connection,
+                                PmUserWsDisconnectReason::UnexpectedProtocolFrame,
+                            );
+                        }
                         emit(events, PmUserWsEvent::Pong(observation(connection, received_clock))).await?;
                     }
                     Message::Text(text) => {
@@ -1146,6 +1152,12 @@ mod tests {
     #[tokio::test]
     async fn malformed_binary_and_oversized_private_frames_retire_fail_closed() {
         assert_forbidden_frame(
+            Message::text(APPLICATION_PONG),
+            1_024,
+            PmUserWsDisconnectReason::UnexpectedProtocolFrame,
+        )
+        .await;
+        assert_forbidden_frame(
             Message::text("{not-json"),
             1_024,
             PmUserWsDisconnectReason::MalformedFrame,
@@ -1375,7 +1387,10 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = accept_async(stream).await.unwrap();
-            read_exact_subscription(&mut socket).await;
+            // Connection-open evidence is intentionally delivered before the
+            // credentialed subscription write. Aborting the outer task at
+            // that barrier may therefore close before or after subscription;
+            // either ordering must still tear down the socket worker.
             let closed_before_timeout = timeout(Duration::from_secs(5), async {
                 loop {
                     match socket.next().await {

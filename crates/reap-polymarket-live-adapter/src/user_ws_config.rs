@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-#[cfg(any(test, feature = "loopback-evidence"))]
+#[cfg(any(test, feature = "loopback-evidence", feature = "read-only-evidence"))]
 use std::net::IpAddr;
 
 use reap_pm_core::{ConnectionEpoch, PmConditionId};
@@ -81,7 +81,7 @@ impl PmUserWsBounds {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EndpointMode {
     Production,
-    #[cfg(any(test, feature = "loopback-evidence"))]
+    #[cfg(any(test, feature = "loopback-evidence", feature = "read-only-evidence"))]
     LoopbackEvidence,
 }
 
@@ -112,6 +112,66 @@ impl PmUserWsConfig {
     #[cfg(any(test, feature = "loopback-evidence"))]
     #[allow(clippy::too_many_arguments)]
     pub fn loopback_evidence(
+        endpoint: &str,
+        condition: PmConditionId,
+        connect_timeout: Duration,
+        idle_timeout: Duration,
+        heartbeat_interval: Duration,
+        pong_timeout: Duration,
+        max_frame_bytes: usize,
+        max_reconnect_attempts: u8,
+        reconnect_backoff: Duration,
+        event_channel_capacity: usize,
+        initial_connection_epoch: ConnectionEpoch,
+    ) -> Result<Self, PmLiveAdapterError> {
+        Self::local_read_config(
+            endpoint,
+            condition,
+            connect_timeout,
+            idle_timeout,
+            heartbeat_interval,
+            pong_timeout,
+            max_frame_bytes,
+            max_reconnect_attempts,
+            reconnect_backoff,
+            event_channel_capacity,
+            initial_connection_epoch,
+        )
+    }
+
+    #[cfg(any(test, feature = "read-only-evidence"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_only_evidence(
+        endpoint: &str,
+        condition: PmConditionId,
+        connect_timeout: Duration,
+        idle_timeout: Duration,
+        heartbeat_interval: Duration,
+        pong_timeout: Duration,
+        max_frame_bytes: usize,
+        max_reconnect_attempts: u8,
+        reconnect_backoff: Duration,
+        event_channel_capacity: usize,
+        initial_connection_epoch: ConnectionEpoch,
+    ) -> Result<Self, PmLiveAdapterError> {
+        Self::local_read_config(
+            endpoint,
+            condition,
+            connect_timeout,
+            idle_timeout,
+            heartbeat_interval,
+            pong_timeout,
+            max_frame_bytes,
+            max_reconnect_attempts,
+            reconnect_backoff,
+            event_channel_capacity,
+            initial_connection_epoch,
+        )
+    }
+
+    #[cfg(any(test, feature = "loopback-evidence", feature = "read-only-evidence"))]
+    #[allow(clippy::too_many_arguments)]
+    fn local_read_config(
         endpoint: &str,
         condition: PmConditionId,
         connect_timeout: Duration,
@@ -282,7 +342,7 @@ fn validate_production_endpoint(value: &str) -> Result<Url, PmLiveAdapterError> 
     Ok(endpoint)
 }
 
-#[cfg(any(test, feature = "loopback-evidence"))]
+#[cfg(any(test, feature = "loopback-evidence", feature = "read-only-evidence"))]
 fn validate_loopback_endpoint(value: &str) -> Result<Url, PmLiveAdapterError> {
     let endpoint = validate_endpoint(value)?;
     let host = endpoint

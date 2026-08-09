@@ -1,0 +1,5 @@
+error[E0599]: no function or associated item named `loopback_evidence` found for struct `PmLoopbackMutationConfig` in the current scope
+ --> tests/ui/read_only_feature_has_no_mutation_constructor.rs:6:39
+  |
+6 |     let _ = PmLoopbackMutationConfig::loopback_evidence(
+  |                                       ^^^^^^^^^^^^^^^^^ function or associated item not found in `PmLoopbackMutationConfig`

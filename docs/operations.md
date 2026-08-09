@@ -35,12 +35,14 @@ not the broader Java gateway or generic OKX API surface.
 
 ## Polymarket PM-T1 Operating Boundary
 
-PM-T1 is a library-level, owner-local loopback connectivity proof. It does not
-add a CLI, deployment unit, production endpoint configuration, credential
-loader, or operator switch for PM mutation. Do not place PM credentials in an
-existing Reap configuration, environment, journal, capture path, or command
-line, and do not adapt the `loopback-evidence` feature into an external-origin
-transport. `production_order_entry_authorized = false` is mandatory.
+PM-T1 is a library-level, owner-local loopback connectivity proof. PM-T1 itself
+does not add a CLI, deployment unit, production endpoint configuration,
+credential loader, or operator switch for PM mutation. The separately composed
+`reap-pm-readiness` executable documented below is the only credentialed PM
+operator path, and it is read-only. Do not place PM credentials in an existing
+Reap configuration, environment, journal, capture path, or command line, and
+do not adapt the `loopback-evidence` feature into an external-origin transport.
+`production_order_entry_authorized = false` is mandatory.
 
 The implemented capability cut is deliberately narrow:
 
@@ -97,11 +99,186 @@ new placement. Never infer a nonzero fee from rate/notional arithmetic. PM-T1
 implements no production fee model.
 
 With PM-T1's local acceptance and standard gates green, the next external
-procedure still must be defined in a new, explicitly authorized goal and must
-be read-only: load one reviewed credential bundle, verify exact
+procedure is the separately scoped and explicitly authorized read-only
+readiness workflow below: load one reviewed credential bundle, verify exact
 EOA/funder/condition/token/account/allowance/position/open-order/trade/user-stream
 identity, and shut down without constructing mutation roles. A later
 minimal-capital place/cancel trial requires a second explicit authorization.
+
+## Polymarket Credentialed Read-Only Readiness
+
+`reap-pm-readiness` is a dedicated certification executable, not a trading
+runtime. Its production endpoint set and read methods are fixed in the binary.
+It has no private-key input, endpoint override, order input, mutation switch,
+or environment-variable secret provider. It must always report
+`production_order_entry_authorized = false`; neither `certify` nor `verify`
+places, cancels, approves, transfers, settles, redeems, or withdraws anything.
+
+Run it only after an operator has explicitly approved the exact binary,
+non-secret configuration, credential slot, target EOA, market, host, output
+location, and bounded observation window. Keep the account quiescent for the
+whole certification: stop every order-producing or account-mutating process
+and do not manually trade, cancel, approve, transfer, or settle. Existing rows
+may be observed, but never create an order merely to make the smoke pass.
+
+### Configuration contract
+
+Copy and review
+[`examples/pm-read-only-smoke.toml`](../examples/pm-read-only-smoke.toml).
+The checked-in identities are synthetic placeholders and must be replaced with
+the reviewed target values. The schema is flat and closed. It accepts exactly:
+
+- `schema_version = 1`, `credential_slot_id`, `signer_address`,
+  `funder_address`, `chain_id = 137`, and `signature_type = 0`;
+- `condition_id`, `market_id`, `token_id`, `outcome`, `tick`,
+  `minimum_order_size`, and `negative_risk`;
+- `connect_timeout_ms`, `request_timeout_ms`, `user_stream_dwell_ms`,
+  `user_stream_idle_timeout_ms`, `user_stream_pong_timeout_ms`,
+  `user_stream_max_reconnect_attempts`,
+  `user_stream_reconnect_backoff_ms`, and
+  `user_stream_event_channel_capacity`; and
+- `api_key_file`, `secret_file`, and `passphrase_file`, each naming one file
+  directly inside `--credentials-dir`.
+
+There are no endpoint, order, private-key, secret-value, environment-variable,
+mutation, or production-authorization fields. Unknown fields are an error.
+The fixed type-0 EOA profile requires `signer_address` and `funder_address` to
+be the same canonical address. Change `credential_slot_id` whenever the L2
+bundle rotates; the slot ID is non-secret and must not contain or be derived
+from an API key, HMAC secret, or passphrase.
+
+### Credential custody
+
+The certifier is Linux-only: it pins credential and evidence paths through
+Linux file descriptors and `/proc`, and it will fail closed on other operating
+systems. Run it under the same dedicated unprivileged UID that owns the
+credential files and output directory.
+
+Prefer a service manager or secret manager that presents three runtime files,
+such as systemd `LoadCredentialEncrypted=`/`LoadCredential=`. Pass the resulting
+credential directory to `--credentials-dir`; secret bytes must never appear in
+the command line or environment. A direct operator run may instead use a
+protected mode-`0700` directory owned by the run UID. Each named entry must be a
+regular, non-symlink, single-link file owned by that UID, mode `0400` or `0600`,
+within the fixed 512-byte bound. Write the exact API key, canonical padded
+base64url secret, or passphrase without a trailing newline. Do not use `echo`,
+shell variables, command substitution, `.env` files, checked-in files, or a
+shared temporary directory to provision them.
+
+For a systemd service, set `LimitCORE=0`, use a dedicated unprivileged UID, and
+give `ExecStart` the service's concrete credential directory. For a direct run,
+set `ulimit -c 0` first. In both cases, prevent ptrace/core-dump access, do not
+spawn children after credentials are loaded, and do not enable HTTP,
+WebSocket, request, header, body, or dependency debug/trace logging. The
+non-secret `CREDENTIALS_DIRECTORY` path supplied by systemd may be present;
+secret-valued environment variables remain prohibited.
+
+The readiness workflow needs only the pre-provisioned L2 API key, HMAC secret,
+and passphrase. Never supply the EOA private key. The certification verifies
+the configured signer/funder identity and credential-bound observations; it
+does not prove possession or control of that private key.
+
+### Build, certify, and verify
+
+From the repository root, build the dedicated executable from the reviewed
+locked source:
+
+```bash
+cargo build --locked --release -p reap-pm-readiness
+```
+
+For each attempt, reserve new private paths. Provision the three credential
+files out of band after creating the directory; the comments below are not a
+prompt to paste secret values into a shell:
+
+```bash
+RUN_ID="pm-read-only-$(date -u +%Y%m%dT%H%M%SZ)"
+RUN_DIR="var/reap/pm-readiness/${RUN_ID}"
+CREDENTIALS_DIR="${XDG_RUNTIME_DIR:?set a protected user runtime directory}/reap-pm-readiness/${RUN_ID}"
+CONFIG_PATH="${RUN_DIR}/config.toml"
+ARTIFACT_PATH="${RUN_DIR}/certification.json"
+
+umask 077
+ulimit -c 0
+install -d -m 0700 "$RUN_DIR" "$CREDENTIALS_DIR"
+install -m 0600 examples/pm-read-only-smoke.toml "$CONFIG_PATH"
+
+# Replace every synthetic non-secret identity/market value in CONFIG_PATH.
+# Have the approved secret manager write api-key, secret, and passphrase as
+# mode-0400/0600, single-link regular files with no trailing newline.
+
+target/release/reap-pm-readiness certify \
+  --config "$CONFIG_PATH" \
+  --credentials-dir "$CREDENTIALS_DIR" \
+  --output "$ARTIFACT_PATH" \
+  --pretty
+
+target/release/reap-pm-readiness verify \
+  --artifact "$ARTIFACT_PATH" \
+  --config "$CONFIG_PATH" \
+  --require-pass \
+  --pretty
+```
+
+`certify` refuses an existing output path. It creates a regular, non-symlink,
+mode-`0600` artifact; its parent must be a real, non-symlink, exact mode-`0700`
+directory owned by the effective UID. It does not durably retain auth headers,
+credential-owner UUIDs, authenticated subscription bytes, raw private rows or
+frames, or secret and secret-derived values. The embedded config evidence is a
+canonical re-serialization of the 24 validated fields; source paths, comments, and
+whitespace are discarded before credential loading and cannot enter the
+artifact. A completed document is serialized and self-verified in a private
+same-directory staging file before one atomic commit replaces the create-new
+reservation. A handled pre-commit error removes its untouched reservation;
+an abrupt process or storage failure may still leave an empty, invalid, or
+not-yet-directory-synced marker, which must never be treated as evidence. Use a
+new `RUN_ID` after every success or failure; do not delete or overwrite a
+failed artifact to reuse its path.
+
+A credential-load error, a credential/config alias, or a credential/final-byte
+alias is a non-artifact failure: the collector returns a fixed content-free
+error and removes the uncommitted reservation. It never persists partially
+loaded credential context or secret-bearing public/config evidence.
+
+Socket shutdown has one graceful join bound; expiry or cancellation fail-stops
+the process because its outer task supervises a nested authenticated socket
+worker. Credential-authority shutdown has a graceful bound and a second bound
+after abort is requested. If either owner cannot prove its complete join, the
+certifier fail-stops so secret-owning work cannot detach; that path produces no
+evidence artifact and the reserved marker is invalid.
+
+`verify` is offline and credential-free. It requires the separately reviewed
+non-secret config, requires the artifact's **declared** binary SHA-256 to equal
+the currently running verifier executable, and then validates the redacted
+schema, completeness, teardown, and fixed false authorization. It exits
+nonzero with `--require-pass` unless every required observation passed. An
+isolated review host therefore needs the artifact, the reviewed config, and the
+exact certifier/verifier executable bytes. Stdout always contains only the
+summary; `--pretty` changes that summary's formatting, not its scope.
+
+This verifier checks consistency, not provenance or authorship. Artifact
+fields and fingerprints are public and recomputable, so verification alone
+does not cryptographically prove that this binary contacted Polymarket or that
+a credentialed run occurred. Preserve an independently trusted collection
+process and artifact chain of custody (or add a separately reviewed external
+attestation mechanism) before treating the observations as evidence.
+
+Under that independent trust assumption, a passing artifact records the
+collector's claims that it used the reviewed non-secret scope, the configured
+L2 bundle authenticated the fixed reads, account/allowance/position and
+complete reconciliation checks finished, one owner- and scope-bound user-stream
+business event was observed, no mutation route was constructed or dispatched,
+and credential and socket owners shut down cleanly. A correlated PONG or sent
+subscription is not authentication proof. Any quiet user stream is nonpassing,
+even if historical REST orders or trades exist; never manufacture an event by
+placing or cancelling an order.
+
+A pass does **not** prove EOA private-key possession, authorize place/cancel,
+approve production order entry, certify strategy or economics, qualify a
+sustained soak or failure campaign, validate settlement/on-chain operations,
+or make Polymarket trading production-ready. Preserve the artifact for review
+and obtain a separate explicit authorization before any later capital-bearing
+trial. `production_order_entry_authorized = false` remains mandatory.
 
 ## Public Data Capture
 

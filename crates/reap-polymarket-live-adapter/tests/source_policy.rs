@@ -11,6 +11,7 @@ const PUBLIC_CONNECTIVITY: &str = include_str!("../src/public_connectivity.rs");
 const PUBLIC_HTTP: &str = include_str!("../src/public_http.rs");
 const PUBLIC_WS: &str = include_str!("../src/public_ws.rs");
 const PUBLIC_WS_CONFIG: &str = include_str!("../src/public_ws_config.rs");
+const READ_ONLY_PRIVATE: &str = include_str!("../src/read_only_private.rs");
 const RECONCILIATION: &str = include_str!("../src/reconciliation.rs");
 const ACCOUNT: &str = include_str!("../src/account.rs");
 const USER_WS: &str = include_str!("../src/user_ws.rs");
@@ -29,6 +30,7 @@ fn phase3_foundation_has_only_role_specific_dependencies() {
         "futures-util.workspace = true",
         "tokio.workspace = true",
         "tokio-tungstenite.workspace = true",
+        "sha3.workspace = true",
         "zeroize.workspace = true",
     ] {
         assert!(
@@ -58,6 +60,7 @@ fn modules_are_separate_and_raw_transport_remains_private() {
         "mod public_http;",
         "mod public_ws;",
         "mod public_ws_config;",
+        "mod read_only_private;",
         "mod reconciliation;",
         "mod task_guard;",
         "mod account;",
@@ -79,6 +82,73 @@ fn modules_are_separate_and_raw_transport_remains_private() {
     }
     assert!(CONFIG.contains("#[cfg(test)]\n    pub(crate) fn local_evidence"));
     assert!(!LIB.contains("local_evidence"));
+}
+
+#[test]
+fn production_read_only_facade_is_opaque_exact_bound_and_mutation_free() {
+    for required in [
+        "pub struct PmReadOnlyCredentialInput",
+        "api_key: Zeroizing<String>",
+        "secret: Zeroizing<String>",
+        "passphrase: Zeroizing<String>",
+        "pub struct PmReadOnlyPrivateConnectivityOwner",
+        "pub fn production(",
+        "expected_signer: EvmAddress",
+        "expected_funder: EvmAddress",
+        "exact_scope: PmWireScope",
+        "validate_one_eoa(expected_signer, expected_funder)?",
+        "credentials.address().as_core() != expected_eoa",
+        "pub struct PmReadOnlyPrivateConnectivityRoles",
+        "pub authenticated_http: PmAuthenticatedHttpOwner",
+        "pub authenticated_user_ws: PmAuthenticatedUserWsRole",
+        "pub credential_supervisor: PmCredentialAuthoritySupervisor",
+        "pub const fn production_order_entry_authorized(&self) -> bool",
+    ] {
+        assert!(
+            READ_ONLY_PRIVATE.contains(required),
+            "missing read-only facade invariant: {required}"
+        );
+    }
+    for forbidden in [
+        "pub fn authenticate_place",
+        "pub fn authenticate_cancel",
+        "pub fn credentials(",
+        "pub fn signer(",
+        "PmMutationServerTime",
+        "PmMutationServerTimeValidator",
+        "PmPendingMutationServerTime",
+        "FixedEoaSigner",
+    ] {
+        assert!(
+            !READ_ONLY_PRIVATE.contains(forbidden),
+            "read-only facade mutation/auth escape: {forbidden}"
+        );
+    }
+    assert!(LIB.contains("PmReadOnlyCredentialInput"));
+    assert!(LIB.contains("PmReadOnlyPrivateConnectivityOwner"));
+    assert!(!LIB.contains("L2CredentialInput"));
+    assert!(!LIB.contains("L2Credentials"));
+    assert!(LIB.contains("PRODUCTION_ORDER_ENTRY_AUTHORIZED: bool = false"));
+}
+
+#[test]
+fn read_only_evidence_feature_cannot_enable_mutation_constructors() {
+    assert!(MANIFEST.contains("read-only-evidence = []"));
+    assert!(!MANIFEST.contains("read-only-evidence = [\"loopback-evidence\"]"));
+    for source in [CONFIG, USER_WS_CONFIG, READ_ONLY_PRIVATE] {
+        assert!(source.contains("feature = \"read-only-evidence\""));
+        assert!(source.contains("pub fn read_only_evidence("));
+    }
+    assert!(!LOOPBACK_MUTATION_CREDENTIALS.contains("read-only-evidence"));
+}
+
+#[test]
+fn standalone_read_time_role_constructs_no_mutation_clock_capability() {
+    assert!(PUBLIC_HTTP.contains("pub fn new(config: PmPublicHttpConfig)"));
+    assert!(PUBLIC_HTTP.contains("PmReadServerTimeProductClock::standalone_system()"));
+    assert!(PRODUCT_CLOCK.contains("impl PmReadServerTimeProductClock"));
+    assert!(PRODUCT_CLOCK.contains("fn standalone_system() -> Self"));
+    assert!(LIB.contains("PRODUCTION_ORDER_ENTRY_AUTHORIZED: bool = false"));
 }
 
 #[test]
@@ -318,8 +388,15 @@ fn borrowing_roles_are_distinct_and_credentials_have_one_owner() {
     assert!(!PRIVATE_CREDENTIALS.contains("Arc<L2Credentials>"));
     assert!(PRIVATE_CREDENTIALS.contains("mpsc::channel(CREDENTIAL_AUTHORITY_CAPACITY)"));
     assert!(PRIVATE_CREDENTIALS.contains("PmCredentialAuthoritySupervisor"));
-    assert!(PRIVATE_CREDENTIALS.contains("task.await"));
+    assert!(
+        PRIVATE_CREDENTIALS.contains("timeout(bounds.graceful_join_timeout(), &mut *task).await")
+    );
+    assert!(PRIVATE_CREDENTIALS.contains("timeout(bounds.abort_join_timeout(), &mut *task).await"));
+    assert!(!PRIVATE_CREDENTIALS.contains("task.await"));
     assert!(PRIVATE_CREDENTIALS.contains("task.abort()"));
+    assert!(PRIVATE_CREDENTIALS.contains("PmCredentialAuthorityShutdownFailStop"));
+    assert!(PRIVATE_CREDENTIALS.contains("std::process::abort()"));
+    assert!(PRIVATE_CREDENTIALS.contains("let Some(task) = self.task.as_mut()"));
     assert!(PRIVATE_CREDENTIALS.contains("PmCredentialAuthoritySupervisor,"));
     assert!(PRIVATE_CREDENTIALS.contains("PmHttpCredentialRole"));
     assert!(PRIVATE_CREDENTIALS.contains("PmUserWsCredentialRole"));

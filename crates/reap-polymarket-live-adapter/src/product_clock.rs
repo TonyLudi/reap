@@ -365,6 +365,16 @@ pub struct PmReadServerTimeProductClock {
 }
 
 impl PmReadServerTimeProductClock {
+    pub(crate) fn standalone_system() -> Self {
+        Self {
+            domain: Arc::new(ProductClockDomain {
+                source: Box::new(SystemProductClock {
+                    origin: Instant::now(),
+                }),
+            }),
+        }
+    }
+
     pub(crate) fn observe_rest_edge(&self) -> Result<PmRestResponseClock, PmProductClockError> {
         observe_rest_edge(&self.domain)
     }
@@ -483,10 +493,24 @@ impl fmt::Debug for PmPendingMutationServerTime {
 }
 
 pub struct PmAuthorizedMutationServerTime {
+    #[cfg_attr(
+        not(any(test, feature = "loopback-evidence")),
+        allow(
+            dead_code,
+            reason = "the opaque timestamp is consumed only by the separately gated authenticated mutation roles"
+        )
+    )]
     timestamp: L2Timestamp,
 }
 
 impl PmAuthorizedMutationServerTime {
+    #[cfg_attr(
+        not(any(test, feature = "loopback-evidence")),
+        allow(
+            dead_code,
+            reason = "default and read-only compositions deliberately cannot consume mutation-time authority"
+        )
+    )]
     pub(crate) const fn into_l2_timestamp(self) -> L2Timestamp {
         self.timestamp
     }

@@ -136,6 +136,32 @@ trades, user stream, and complete reconciliation without mutation. A
 minimal-capital place/cancel smoke is a later authorization and remains
 prohibited now. `production_order_entry_authorized = false` remains mandatory.
 
+### Dedicated PM read-only qualification
+
+The dedicated `reap-pm-readiness` workflow now implements that bounded
+certification mechanism; the operator procedure and closed schema are in
+[`operations.md`](operations.md#polymarket-credentialed-read-only-readiness),
+and the reviewed non-secret template is
+[`examples/pm-read-only-smoke.toml`](../examples/pm-read-only-smoke.toml). Its
+only secret inputs are a pre-provisioned L2 API key, HMAC secret, and passphrase
+read from three protected runtime files. It accepts no private key, endpoint,
+order, environment-secret, or mutation field, and its artifact fixes
+`production_order_entry_authorized = false`.
+
+Tool availability is not external evidence. No checked-in result records a
+real credential or accepted target-account run. A passing offline verification
+requires the separately reviewed config and the exact certifier/verifier
+executable bytes, but those public, recomputable consistency anchors do not
+authenticate the artifact's provenance. With an independently trusted
+collection process and chain of custody, the artifact can support review of
+the recorded read-only observations, complete cuts, owner- and scope-bound
+user-stream business event, literal zero mutation facts, and clean teardown.
+It would not prove possession of the configured EOA private key or authorize an
+order, cancel, allowance change, production entry, strategy, economics,
+settlement, or capital-bearing trial. Any quiet user stream is a non-pass,
+even if REST returns historical owner rows, and must not be repaired by placing
+or cancelling an order.
+
 ### PM trading gates that remain open
 
 The remaining blockers are intentionally explicit: accepted credential
@@ -148,18 +174,20 @@ remain absent.
 | --- | --- |
 | Production quote and order model | Define, review, backtest, and independently validate the fair-probability transformation from OKX reference state and PM market state; exact supported order semantics; passive spread and size policy; inventory response; quote replacement/cancellation behavior; and stale/reference-failure behavior. The deterministic fixture threshold/model and fixed fake GTC post-only profile are not a production strategy or order model. |
 | Economics and risk calibration | Establish fees/rebates, queue and fill assumptions, adverse selection, slippage, liquidity and market-impact limits, inventory and concentration limits, capital-at-risk limits, collateral utilization, loss limits, and resolution-value treatment from representative data. Require reproducible backtests, stress tests, and a reviewed acceptance decision. No current local replay or latency artifact is economic evidence. |
-| Credential custody and signer qualification | PM-T1 implements the fixed signer and L2 algorithms with non-Clone, zeroizing, redacted holders and synthetic vectors. Still define and review the real secret loader/provider, operator credential-slot rotation, access control, process isolation, audit procedure, and target signer/funder/signature-type verification. No real key or credential has entered Reap. |
-| External connectivity qualification | PM-T1 implements allowlisted public/private/read transports and a local authenticated-loopback composition. Still build the separately authorized read-only smoke, validate current endpoint behavior and target account evidence, then qualify reconnect, rate/capacity, latency, and sustained operation. There is no deployed PM binary/service, no accepted external authenticated run, and no production mutation constructor. |
+| Credential custody and signer qualification | PM-T1 implements the fixed signer and L2 algorithms with non-Clone, zeroizing, redacted holders and synthetic vectors. The dedicated read-only workflow adds a runtime-file L2 provider, rotation slot, process-isolation contract, and secret-free offline artifact, but the operator must still review custody/access/audit controls and accept target signer/funder/signature-type evidence. The workflow intentionally cannot prove private-key possession. No real key or credential has entered Reap. |
+| External connectivity qualification | PM-T1 implements allowlisted public/private/read transports and local authenticated-loopback evidence; `reap-pm-readiness` now supplies the separately authorized read-only certification composition. An accepted external target-account artifact, reconnect/rate/capacity/latency qualification, and sustained operation still do not exist. The certification executable is not a deployed trading service and has no production mutation constructor. |
 | Settlement and on-chain operations | Define and implement the supported fill-settlement and market-resolution lifecycle, then separately review any required collateral allowance or ERC-1155 operator-approval mutation, transfers, split/merge, redemption, bridge, or withdrawal behavior. The current fill settlement-state reducer is observational only and performs none of these operations. |
 | Operations and target host | Declare a target host and deployment profile; add PM-specific configuration/secrets handling, supervision, health/alerts, storage and recovery procedures, emergency owned-order cleanup, incident response, rollout/rollback, and operator runbooks; then exercise them under bounded failure. No target host is currently declared. |
 | Target-account certification | On the exact intended account, verify signer/funder/account identity, chain and current protocol/domain addresses, market/token membership, lifecycle/tick/minimum/lot rules, required spenders and allowances, collateral and token balances, positions, fees and limits, open orders, fills, ownership, cancellation, and complete reconciliation. Fixture account state is not target-account evidence. |
 | Demo or controlled trial evidence | First define an acceptable PM test environment or tightly bounded minimal-capital equivalent and its safety envelope. Then obtain credentialed smoke, reconnect/restart, partial/immediate/multiple/duplicate fill, ambiguous-order, cancellation-race, reconciliation, fault, sustained-soak, latency, and economic evidence. None has been run or accepted. |
 | Approval evidence | Build a source-bound evidence bundle and obtain explicit independent strategy/model, risk, security/key-custody, and operations approval for the exact binary, configuration, host, account, limits, and rollout/rollback plan. No current PM artifact or existing Chaos/OKX approval grants that authority. `production_order_entry_authorized: false` remains mandatory. |
 
-The safe current interpretation is public-protocol/capture/replay, offline
-fixture/fake validation, and synthetic owner-local authenticated-loopback
-validation only. Real credentials, external authenticated PM access, and real
-order mutation must remain disconnected.
+Absent explicit approval for one exact `reap-pm-readiness` run, the safe current
+interpretation remains public-protocol/capture/replay, offline fixture/fake
+validation, and synthetic owner-local authenticated-loopback validation only.
+The dedicated read-only certification is the sole documented exception for
+approved external authenticated PM access. Real order mutation must remain
+disconnected.
 `production_order_entry_authorized = false` is mandatory.
 The existing Chaos/OKX readiness material and its separate gates are unchanged
 and do not transfer approval to the PM product.

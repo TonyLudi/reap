@@ -9,6 +9,9 @@ const LOOPBACK_CREDENTIALS: &str = include_str!("../src/loopback_mutation_creden
 fn production_surface_has_no_constructible_mutation_transport() {
     assert!(MANIFEST.contains("default = []"));
     assert!(MANIFEST.contains("loopback-evidence = []"));
+    assert!(MANIFEST.contains("read-only-evidence = []"));
+    assert!(!TRANSPORT.contains("read-only-evidence"));
+    assert!(!LOOPBACK_CREDENTIALS.contains("read-only-evidence"));
     assert!(TRANSPORT.contains("#[cfg(any(test, feature = \"loopback-evidence\"))]"));
     assert!(TRANSPORT.contains("pub fn loopback_evidence("));
     assert!(!TRANSPORT.contains("pub fn production("));

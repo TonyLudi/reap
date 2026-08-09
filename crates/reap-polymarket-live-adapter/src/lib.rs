@@ -24,6 +24,7 @@ mod public_connectivity;
 mod public_http;
 mod public_ws;
 mod public_ws_config;
+mod read_only_private;
 mod reconciliation;
 mod task_guard;
 mod user_ws;
@@ -47,7 +48,10 @@ pub use mutation::{
     PmRetainedOwnedCancelRequest, PmRetainedPlaceRequest,
 };
 pub use private_credentials::{
-    PmCredentialAuthoritySupervisor, PmPrivateConnectivityOwner, PmPrivateConnectivityRoles,
+    PM_CREDENTIAL_AUTHORITY_DEFAULT_SHUTDOWN_BOUNDS,
+    PM_CREDENTIAL_AUTHORITY_READ_ONLY_SHUTDOWN_BOUNDS, PmCredentialAuthorityShutdownBounds,
+    PmCredentialAuthorityShutdownOutcome, PmCredentialAuthoritySupervisor,
+    PmPrivateConnectivityOwner, PmPrivateConnectivityRoles,
 };
 pub use private_http::PmAuthenticatedHttpOwner;
 #[cfg(any(test, feature = "loopback-evidence"))]
@@ -75,6 +79,10 @@ pub use public_ws::{
 pub use public_ws_config::{
     PM_PUBLIC_MARKET_WS_ENDPOINT, PM_PUBLIC_WS_HEARTBEAT_INTERVAL, PmPublicWsBounds,
     PmPublicWsConfig, PmPublicWsTransportPolicy,
+};
+pub use read_only_private::{
+    PmReadOnlyCredentialInput, PmReadOnlyPrivateConnectivityOwner,
+    PmReadOnlyPrivateConnectivityRoles,
 };
 pub use reconciliation::{
     MAX_PM_AUTHENTICATED_CUT_PAGES, MAX_PM_AUTHENTICATED_ORDER_ROWS,

@@ -14,6 +14,7 @@ members = [
     "crates/reap-polymarket-live-adapter",
     "crates/reap-pm-live-contracts",
     "crates/reap-pm-live",
+    "crates/reap-pm-readiness",
     "crates/reap-okx-public-source",
     "crates/reap-venue",
     "crates/reap-feed",
@@ -81,6 +82,7 @@ reap-polymarket-auth = { path = "crates/reap-polymarket-auth" }
 reap-polymarket-wire = { path = "crates/reap-polymarket-wire" }
 reap-pm-live = { path = "crates/reap-pm-live" }
 reap-pm-live-contracts = { path = "crates/reap-pm-live-contracts" }
+reap-pm-readiness = { path = "crates/reap-pm-readiness" }
 reap-pm-strategy = { path = "crates/reap-pm-strategy" }
 reap-polymarket-adapter = { path = "crates/reap-polymarket-adapter" }
 reap-polymarket-live-adapter = { path = "crates/reap-polymarket-live-adapter" }

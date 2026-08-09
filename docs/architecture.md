@@ -71,6 +71,17 @@ The fixed profile remains GTC post-only place plus exact journal-owned cancel;
 `production_order_entry_authorized = false` is unchanged. PM-T1 is local
 connectivity and recovery proof, not a production strategy or trading approval.
 
+The separate `reap-pm-readiness` composition is the only operator-facing PM
+credentialed path. It owns a closed read-only config and protected runtime-file
+credential loader, receives only the live adapter's opaque read capabilities,
+and emits a bounded secret-free artifact for offline verification. It has no
+private-key, product coordinator, journal, or strategy dependency; it imports
+no generic HTTP client and receives no constructible mutation capability. Its
+verifier checks internal consistency plus reviewed config and declared-binary
+anchors; it is not cryptographic provenance attestation. Under
+an independently trusted collection chain, a pass records only the exact
+read-only observations and never authorizes order entry.
+
 ## Goals
 
 - Replicate the important `imm-strategy/chaos` decision logic in Rust.
@@ -406,7 +417,7 @@ Recommended initial stack:
 
 ## Workspace Layout
 
-Current 37-crate structure:
+Current 38-crate structure:
 
 ```text
 reap/
@@ -425,6 +436,7 @@ reap/
     reap-polymarket-live-adapter/
     reap-pm-live-contracts/
     reap-pm-live/
+    reap-pm-readiness/
     reap-okx-public-source/
     reap-venue/
     reap-feed/
@@ -466,6 +478,7 @@ reap/
 | `reap-polymarket-live-adapter` | Allowlisted, bounded PM public/authenticated HTTP and WebSocket transports plus fixed place/exact-owned cancel roles; no strategy decisions, canonical PM state, generic request, or production-origin constructor. |
 | `reap-pm-live-contracts` | Secret-free scoped PM configuration, exact capability plan, role bindings, lanes, and readiness dependencies. |
 | `reap-pm-live` | Sibling PM public capture/replay, read-only monitor, deterministic lanes, one-owner coordinator, Goal F and authenticated journals, cross-journal recovery, fake product root, and feature-gated authenticated-loopback root with owned read supervision and controlled live-order shutdown. |
+| `reap-pm-readiness` | Dedicated operator-runnable PM credentialed-read-only certification and offline verification; fixed production reads, protected runtime-file credential loading, bounded redacted evidence, explicit joined teardown, and literal false/zero mutation authority. |
 | `reap-okx-public-source` | Narrow credential-free OKX index-ticker source used by the PM product; no OKX private/account/order role. |
 | `reap-venue` | Existing credential-free Chaos/OKX protocol/parsing, exact OKX metadata, and connectivity keys; no signer or authenticated client, and not a universal PM adapter. |
 | `reap-feed` | Legacy Chaos/OKX public/private socket supervision, subscription readiness, deduplication, sequencing, book arbitration, and recovery; checked outer planning/capture bridges reject PM input. |
