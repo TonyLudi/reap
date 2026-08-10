@@ -15,6 +15,7 @@ mod preflight;
 mod protected_file;
 mod reviewed_destination_profile_v1;
 mod reviewed_fresh_credential_slot_locator_v1;
+mod reviewed_signer_proxy_account_identity_v1;
 
 pub use config::{
     AuthorizationApproval, AuthorizationBuildBinding, AuthorizationHostBinding,
@@ -126,6 +127,20 @@ pub use reviewed_fresh_credential_slot_locator_v1::{
     load_canonical_reviewed_fresh_credential_slot_locator_v1,
     verify_reviewed_fresh_credential_slot_locator_evidence_v1,
     verify_reviewed_fresh_credential_slot_locator_v1,
+};
+pub use reviewed_signer_proxy_account_identity_v1::{
+    CanonicalReviewedSignerProxyAccountIdentityV1, PM_T2_OFFICIAL_SOURCE_MANIFEST_BYTE_LENGTH_V1,
+    PM_T2_OFFICIAL_SOURCE_MANIFEST_RETRIEVED_AT_UTC_V1,
+    PM_T2_OFFICIAL_SOURCE_MANIFEST_SCHEMA_FAMILY_V1,
+    PM_T2_OFFICIAL_SOURCE_MANIFEST_SCHEMA_VERSION_V1, PM_T2_OFFICIAL_SOURCE_MANIFEST_SHA256_V1,
+    PM_T2_REVIEWED_SIGNER_PROXY_ACCOUNT_IDENTITY_FILE_V1,
+    PmReviewedSignerProxyAccountIdentityV1Error,
+    REVIEWED_SIGNER_PROXY_ACCOUNT_IDENTITY_V1_SCHEMA_VERSION, ReviewedOfficialSourceManifestPinsV1,
+    ReviewedSignerProxyAccountEvidenceKindV1, ReviewedSignerProxyAccountIdentityV1,
+    ReviewedSignerProxyAccountIdentityVerificationV1, ReviewedSignerProxyClaimedAccountV1,
+    UnattestedReviewedSignerProxyAccountEvidenceV1,
+    load_canonical_reviewed_signer_proxy_account_identity_v1,
+    verify_reviewed_signer_proxy_account_identity_v1,
 };
 
 /// Hard offline outcome of every command in this A0 executable.

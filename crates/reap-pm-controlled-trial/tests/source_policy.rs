@@ -13,6 +13,8 @@ const REVIEWED_FRESH_CREDENTIAL_SLOT_LOCATOR_V1: &str =
     include_str!("../src/reviewed_fresh_credential_slot_locator_v1.rs");
 const FRESH_CREDENTIAL_DELIVERY_BINDING_V1: &str =
     include_str!("../src/fresh_credential_delivery_binding_v1.rs");
+const REVIEWED_SIGNER_PROXY_ACCOUNT_IDENTITY_V1: &str =
+    include_str!("../src/reviewed_signer_proxy_account_identity_v1.rs");
 const MAIN: &str = include_str!("../src/main.rs");
 
 #[test]
@@ -46,6 +48,7 @@ fn source_exposes_only_offline_dry_run_commands_and_no_mutation_route_or_body() 
         REVIEWED_DESTINATION_PROFILE_V1,
         REVIEWED_FRESH_CREDENTIAL_SLOT_LOCATOR_V1,
         FRESH_CREDENTIAL_DELIVERY_BINDING_V1,
+        REVIEWED_SIGNER_PROXY_ACCOUNT_IDENTITY_V1,
         MAIN,
     ]
     .join("\n");
@@ -70,6 +73,284 @@ fn source_exposes_only_offline_dry_run_commands_and_no_mutation_route_or_body() 
     assert!(!MAIN.contains("Place"));
     assert!(!MAIN.contains("Cancel"));
     assert!(!MAIN.contains("ConsumeAuthorization"));
+}
+
+#[test]
+fn reviewed_signer_proxy_account_identity_v1_is_exact_unattested_and_denied_only() {
+    for required in [
+        "REVIEWED_SIGNER_PROXY_ACCOUNT_IDENTITY_V1_FINGERPRINT_DOMAIN",
+        "reap.pm-t2.controlled-trial.reviewed-signer-proxy-account-identity.v1\\0",
+        "pm-t2-reviewed-signer-proxy-account-identity-v1.json",
+        "reap-pm-controlled-trial-official-sources",
+        "2026-08-09T10:17:00Z",
+        "PM_T2_OFFICIAL_SOURCE_MANIFEST_BYTE_LENGTH_V1: u64 = 9_103",
+        "ebd07e0dfbb7ee0dd825b7b435b303826130761d156e2f23b6c3428f1486e910",
+        "pub struct ReviewedOfficialSourceManifestPinsV1",
+        "pub schema_family: String,",
+        "pub schema_version: u32,",
+        "pub retrieved_at_utc: String,",
+        "pub byte_length: u64,",
+        "pub sha256: String,",
+        "self.schema_family != PM_T2_OFFICIAL_SOURCE_MANIFEST_SCHEMA_FAMILY_V1",
+        "self.byte_length != PM_T2_OFFICIAL_SOURCE_MANIFEST_BYTE_LENGTH_V1",
+        "self.sha256 != PM_T2_OFFICIAL_SOURCE_MANIFEST_SHA256_V1",
+        "raw pretty-JSON",
+        "not publisher-signed Polymarket evidence",
+        "neither byte set is supplied for comparison",
+        "pub enum ReviewedSignerProxyAccountEvidenceKindV1",
+        "#[serde(rename = \"unattested_reviewed_account_source_v1\")]",
+        "UnattestedReviewedAccountSourceV1,",
+        "pub evidence_kind: ReviewedSignerProxyAccountEvidenceKindV1,",
+        "pub evidence_id_label: String,",
+        "pub issuer_label: String,",
+        "pub source_reference_label: String,",
+        "pub observed_at_utc: String,",
+        "pub payload_media_type_label: String,",
+        "pub payload_byte_length: u64,",
+        "pub payload_sha256: String,",
+        "pub claimed_account: ReviewedSignerProxyClaimedAccountV1,",
+        "pub chain_id: u64,",
+        "pub wallet_profile: String,",
+        "pub signature_type: u8,",
+        "pub signer: String,",
+        "pub proxy_funder: String,",
+        "self.chain_id != PM_T2_ACCOUNT_CHAIN_ID_V1",
+        "self.wallet_profile != PM_T2_ACCOUNT_WALLET_PROFILE_V1",
+        "self.signature_type != PM_T2_ACCOUNT_SIGNATURE_TYPE_V1",
+        "parse_eip55_address_syntax(&self.signer)",
+        "parse_eip55_address_syntax(&self.proxy_funder)",
+        "signer == proxy_funder",
+        "strict nonzero EIP-55 spelling",
+        "proxy field is not asserted to be an EOA",
+        "pub reviewer_label: String,",
+        "pub v1_config: V1ConfigPinsV2,",
+        "pub online_policy: OnlinePolicyPinsV2,",
+        "pub online_authorization: ReviewedOnlineAuthorizationPinsV1,",
+        "pub official_source_manifest: ReviewedOfficialSourceManifestPinsV1,",
+        "pub evidence: UnattestedReviewedSignerProxyAccountEvidenceV1,",
+        "manifest_retrieved_at > reviewed_at",
+        "evidence_observed_at > reviewed_at",
+        "reviewed_at > valid_not_before",
+        "valid_not_before >= valid_not_after",
+        "validate_online_authorization_contract_v2",
+        "identity_times.reviewed_at < authorization_times.reviewed_at",
+        "identity_times.reviewed_at > authorization_times.not_before",
+        "identity_times.valid_not_before != authorization_times.not_before",
+        "identity_times.valid_not_after != authorization_times.cleanup_not_after",
+        "official_source_manifest.sha256",
+        "config.value().source_pin_manifest_sha256",
+        "claimed_account.proxy_funder != configured_account.funder",
+        "format!(\"reviewed-account-record:{}\", identity.value.identity_id)",
+        "source_reference_label != configured_evidence_reference.as_str()",
+        "only exact label",
+        "loads no evidence and proves no authorship",
+        "schema defines no credential, private-key, API-key",
+        "cryptographic signature bytes or material",
+        "so callers must",
+        "never place secrets or secret-derived",
+        "material in them",
+        "pub struct CanonicalReviewedSignerProxyAccountIdentityV1",
+        "pub fn load_canonical_reviewed_signer_proxy_account_identity_v1(",
+        "pub fn verify_reviewed_signer_proxy_account_identity_v1(",
+        "without consulting a caller clock",
+        "official_source_manifest_bytes_loaded_and_hash_verified: false",
+        "reviewed_account_evidence_bytes_loaded_and_hash_verified: false",
+        "official_source_manifest_publisher_authorship_attested: false",
+        "reviewer_authorship_attested: false",
+        "source_authorship_attested: false",
+        "issuer_signature_verified: false",
+        "evidence_source_tls_and_server_identity_verified: false",
+        "signer_on_chain_eoa_status_verified: false",
+        "proxy_on_chain_contract_status_verified: false",
+        "on_chain_account_state_checked: false",
+        "on_chain_finality_checked: false",
+        "proxy_factory_semantics_verified: false",
+        "signer_controls_proxy_attested: false",
+        "signer_proxy_relationship_current: false",
+        "signer_proxy_relationship_unrevoked: false",
+        "account_specific_evidence_reference_resolved_and_authenticated: false",
+        "source_owned_current_time_checked: false",
+        "remote_api_key_owner_attested: false",
+        "private_key_derived_signer_matches_config_checked: false",
+        "l2_credentials_match_configured_signer_checked: false",
+        "identity_fingerprint_pinned_by_online_authorization_v2: false",
+        "identity_fingerprint_pinned_by_v3: false",
+        "identity_consumption_durably_recorded: false",
+        "authorization_consumption_checked: false",
+        "credential_mutation_authority_attested: false",
+        "OfflineAuthorizationState::DENIED",
+        "The frozen online",
+        "authorization V2 points nowhere to, and does not consume, this sidecar",
+        "ProtectedFileKind::ReviewedSignerProxyAccountIdentityV1",
+        "CanonicalReviewedSignerProxyAccountIdentityV1(<exact-protected-canonical-bytes; no-value-address-reference-or-path-projection; redacted; denied>)",
+    ] {
+        assert!(
+            REVIEWED_SIGNER_PROXY_ACCOUNT_IDENTITY_V1.contains(required),
+            "missing reviewed signer/proxy account identity V1 source pin `{required}`"
+        );
+    }
+
+    for forbidden in [
+        "reqwest",
+        "tokio",
+        "TcpStream",
+        "connect_async",
+        "JsonRpc",
+        "L2Credentials",
+        "EoaPrivateKeyInput",
+        "read_four(",
+        "include_bytes!",
+        "fs::read",
+        "File::open",
+        "production_order_entry_authorized: true",
+        "real_order_submission_authorized: true",
+        "official_source_manifest_bytes_loaded_and_hash_verified: true",
+        "reviewed_account_evidence_bytes_loaded_and_hash_verified: true",
+        "official_source_manifest_publisher_authorship_attested: true",
+        "reviewer_authorship_attested: true",
+        "source_authorship_attested: true",
+        "issuer_signature_verified: true",
+        "evidence_source_tls_and_server_identity_verified: true",
+        "signer_on_chain_eoa_status_verified: true",
+        "proxy_on_chain_contract_status_verified: true",
+        "on_chain_account_state_checked: true",
+        "on_chain_finality_checked: true",
+        "proxy_factory_semantics_verified: true",
+        "signer_controls_proxy_attested: true",
+        "signer_proxy_relationship_current: true",
+        "signer_proxy_relationship_unrevoked: true",
+        "account_specific_evidence_reference_resolved_and_authenticated: true",
+        "source_owned_current_time_checked: true",
+        "remote_api_key_owner_attested: true",
+        "private_key_derived_signer_matches_config_checked: true",
+        "l2_credentials_match_configured_signer_checked: true",
+        "identity_fingerprint_pinned_by_online_authorization_v2: true",
+        "identity_fingerprint_pinned_by_v3: true",
+        "identity_consumption_durably_recorded: true",
+        "authorization_consumption_checked: true",
+        "credential_mutation_authority_attested: true",
+        "impl Clone for CanonicalReviewedSignerProxyAccountIdentityV1",
+        "impl Serialize for CanonicalReviewedSignerProxyAccountIdentityV1",
+        "Deserialize<'de> for CanonicalReviewedSignerProxyAccountIdentityV1",
+        "pub fn value(&self)",
+        "pub const fn value(&self)",
+        "pub fn signer(&self)",
+        "pub fn proxy_funder(&self)",
+        "pub fn source_reference(&self)",
+        "pub fn canonical_bytes(&self)",
+        "pub fn path(&self)",
+        "pub struct ReviewedSignerProxyAccountIdentityTokenV1",
+        "pub fn bind_reviewed_signer_proxy_account_identity_v1(",
+    ] {
+        assert!(
+            !REVIEWED_SIGNER_PROXY_ACCOUNT_IDENTITY_V1.contains(forbidden),
+            "forbidden transport, secret, projection, clone, or authority surface: {forbidden}"
+        );
+    }
+
+    let evidence_kind = REVIEWED_SIGNER_PROXY_ACCOUNT_IDENTITY_V1
+        .split_once("pub enum ReviewedSignerProxyAccountEvidenceKindV1 {")
+        .and_then(|(_, tail)| tail.split_once("\n}").map(|(body, _)| body.trim()))
+        .expect("reviewed account evidence-kind enum must remain recognizable");
+    assert_eq!(
+        evidence_kind,
+        "#[serde(rename = \"unattested_reviewed_account_source_v1\")]\n    UnattestedReviewedAccountSourceV1,"
+    );
+
+    let claimed_account = REVIEWED_SIGNER_PROXY_ACCOUNT_IDENTITY_V1
+        .split_once("pub struct ReviewedSignerProxyClaimedAccountV1 {")
+        .and_then(|(_, tail)| tail.split_once("\n}").map(|(body, _)| body))
+        .expect("reviewed account claimed tuple must remain recognizable");
+    assert_eq!(
+        claimed_account
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>(),
+        [
+            "pub chain_id: u64,",
+            "pub wallet_profile: String,",
+            "pub signature_type: u8,",
+            "pub signer: String,",
+            "pub proxy_funder: String,",
+        ]
+    );
+
+    let evidence = REVIEWED_SIGNER_PROXY_ACCOUNT_IDENTITY_V1
+        .split_once("pub struct UnattestedReviewedSignerProxyAccountEvidenceV1 {")
+        .and_then(|(_, tail)| tail.split_once("\n}").map(|(body, _)| body))
+        .expect("reviewed account evidence schema must remain recognizable");
+    for forbidden_field in [
+        "private_key",
+        "api_key",
+        "l2_secret",
+        "passphrase",
+        "hmac",
+        "header",
+        "signed_body",
+        "signature:",
+        "payload_bytes",
+    ] {
+        assert!(
+            !evidence.contains(forbidden_field),
+            "reviewed account evidence gained forbidden field `{forbidden_field}`"
+        );
+    }
+
+    let canonical_surface = REVIEWED_SIGNER_PROXY_ACCOUNT_IDENTITY_V1
+        .split_once("impl CanonicalReviewedSignerProxyAccountIdentityV1 {")
+        .and_then(|(_, tail)| {
+            tail.split_once("impl fmt::Debug for CanonicalReviewedSignerProxyAccountIdentityV1")
+                .map(|(surface, _)| surface)
+        })
+        .expect("canonical reviewed account surface must remain recognizable");
+    for forbidden_projection in [
+        "value(",
+        "signer(",
+        "proxy_funder(",
+        "reference(",
+        "bytes(",
+        "path(",
+    ] {
+        assert!(
+            !canonical_surface.contains(forbidden_projection),
+            "canonical reviewed account holder gained projection `{forbidden_projection}`"
+        );
+    }
+
+    let declaration = "pub struct CanonicalReviewedSignerProxyAccountIdentityV1 {";
+    let before = REVIEWED_SIGNER_PROXY_ACCOUNT_IDENTITY_V1
+        .split_once(declaration)
+        .map(|(before, _)| before)
+        .expect("reviewed account canonical declaration must remain recognizable");
+    let declaration_attributes = before
+        .rsplit_once("\n}\n\n")
+        .map_or(before, |(_, attributes)| attributes);
+    assert!(!declaration_attributes.contains("#[derive"));
+    for implementation in REVIEWED_SIGNER_PROXY_ACCOUNT_IDENTITY_V1.split("\nimpl") {
+        let header = implementation
+            .split_once('{')
+            .map_or(implementation, |(header, _)| header);
+        assert!(
+            !(header.contains("CanonicalReviewedSignerProxyAccountIdentityV1")
+                && ["Clone", "Copy", "Serialize", "Deserialize"]
+                    .iter()
+                    .any(|trait_name| header.contains(trait_name))),
+            "canonical reviewed account holder gained manual Clone, Copy, Serialize, or Deserialize"
+        );
+    }
+
+    assert!(PROTECTED.contains("ReviewedSignerProxyAccountIdentityV1"));
+    assert!(LIB.contains("mod reviewed_signer_proxy_account_identity_v1;"));
+    assert!(!ONLINE_POLICY_V2.contains("ReviewedSignerProxyAccountIdentityV1"));
+    assert!(!ONLINE_CONSUMPTION_V2.contains("ReviewedSignerProxyAccountIdentityV1"));
+    assert!(!CONFIG.contains("ReviewedSignerProxyAccountIdentityV1"));
+    assert!(!PREFLIGHT.contains("ReviewedSignerProxyAccountIdentityV1"));
+    assert!(!FRESH_CREDENTIAL_DELIVERY_BINDING_V1.contains("ReviewedSignerProxyAccountIdentityV1"));
+    assert!(
+        !REVIEWED_FRESH_CREDENTIAL_SLOT_LOCATOR_V1.contains("ReviewedSignerProxyAccountIdentityV1")
+    );
+    assert!(!REVIEWED_DESTINATION_PROFILE_V1.contains("ReviewedSignerProxyAccountIdentityV1"));
 }
 
 #[test]
