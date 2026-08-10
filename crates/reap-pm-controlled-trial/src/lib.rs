@@ -17,6 +17,7 @@ mod reviewed_destination_profile_v1;
 mod reviewed_fresh_credential_slot_locator_v1;
 mod reviewed_remote_credential_proof_policy_v1;
 mod reviewed_signer_proxy_account_identity_v1;
+mod reviewed_static_online_authorization_v3;
 
 pub use config::{
     AuthorizationApproval, AuthorizationBuildBinding, AuthorizationHostBinding,
@@ -164,6 +165,32 @@ pub use reviewed_signer_proxy_account_identity_v1::{
     UnattestedReviewedSignerProxyAccountEvidenceV1,
     load_canonical_reviewed_signer_proxy_account_identity_v1,
     verify_reviewed_signer_proxy_account_identity_v1,
+};
+pub use reviewed_static_online_authorization_v3::{
+    CanonicalReviewedStaticOnlineAuthorizationV3,
+    PM_T2_REVIEWED_STATIC_ONLINE_AUTHORIZATION_FILE_V3, PmReviewedStaticOnlineAuthorizationV3Error,
+    REVIEWED_STATIC_ONLINE_AUTHORIZATION_V3_SCHEMA_VERSION, ReviewedActorCommandSetV3,
+    ReviewedActorGenerationAllocationV3, ReviewedActorGenerationSchemeV3, ReviewedActorReadinessV3,
+    ReviewedActorRuntimeAttemptCommitmentLocationV3, ReviewedActorTerminalRequirementV3,
+    ReviewedBasisAndBurnOrderV3, ReviewedCrashRecoveryProfileV3,
+    ReviewedCredentialDeliveryLeaseProtocolStatusV3, ReviewedCredentialProviderTrustRootStatusV3,
+    ReviewedPreparedCreationOrderV3, ReviewedRemoteCredentialAcceptanceContractStatusV3,
+    ReviewedSelectedActorProfileV3, ReviewedSignerProxyControlContractStatusV3,
+    ReviewedStaticOnlineAuthorizationAccountIdentityPinsV3,
+    ReviewedStaticOnlineAuthorizationConfigPinsV3, ReviewedStaticOnlineAuthorizationContextV3,
+    ReviewedStaticOnlineAuthorizationDeliveryPinsV3,
+    ReviewedStaticOnlineAuthorizationDestinationPinsV3,
+    ReviewedStaticOnlineAuthorizationFrozenConsumptionLineageV3,
+    ReviewedStaticOnlineAuthorizationLocatorPinsV3,
+    ReviewedStaticOnlineAuthorizationOnlineAuthorizationPinsV3,
+    ReviewedStaticOnlineAuthorizationOnlinePolicyPinsV3,
+    ReviewedStaticOnlineAuthorizationRemoteProofPolicyPinsV3,
+    ReviewedStaticOnlineAuthorizationSelectedActorProfileV3,
+    ReviewedStaticOnlineAuthorizationUnavailablePositiveContractsV3,
+    ReviewedStaticOnlineAuthorizationV1AuthorizationPinsV3, ReviewedStaticOnlineAuthorizationV3,
+    ReviewedStaticOnlineAuthorizationVerificationV3, ReviewedStaticV3RuntimeStateV3,
+    load_canonical_reviewed_static_online_authorization_v3,
+    verify_reviewed_static_online_authorization_v3,
 };
 
 /// Hard offline outcome of every command in this A0 executable.

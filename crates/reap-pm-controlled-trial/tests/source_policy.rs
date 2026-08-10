@@ -17,6 +17,8 @@ const REVIEWED_SIGNER_PROXY_ACCOUNT_IDENTITY_V1: &str =
     include_str!("../src/reviewed_signer_proxy_account_identity_v1.rs");
 const REVIEWED_REMOTE_CREDENTIAL_PROOF_POLICY_V1: &str =
     include_str!("../src/reviewed_remote_credential_proof_policy_v1.rs");
+const REVIEWED_STATIC_ONLINE_AUTHORIZATION_V3: &str =
+    include_str!("../src/reviewed_static_online_authorization_v3.rs");
 const MAIN: &str = include_str!("../src/main.rs");
 
 #[test]
@@ -52,6 +54,7 @@ fn source_exposes_only_offline_dry_run_commands_and_no_mutation_route_or_body() 
         FRESH_CREDENTIAL_DELIVERY_BINDING_V1,
         REVIEWED_SIGNER_PROXY_ACCOUNT_IDENTITY_V1,
         REVIEWED_REMOTE_CREDENTIAL_PROOF_POLICY_V1,
+        REVIEWED_STATIC_ONLINE_AUTHORIZATION_V3,
         MAIN,
     ]
     .join("\n");
@@ -76,6 +79,492 @@ fn source_exposes_only_offline_dry_run_commands_and_no_mutation_route_or_body() 
     assert!(!MAIN.contains("Place"));
     assert!(!MAIN.contains("Cancel"));
     assert!(!MAIN.contains("ConsumeAuthorization"));
+}
+
+#[test]
+fn reviewed_static_online_authorization_v3_is_exact_static_noncapable_and_denied_only() {
+    for required in [
+        "REVIEWED_STATIC_ONLINE_AUTHORIZATION_V3_FINGERPRINT_DOMAIN",
+        "reap.pm-t2.controlled-trial.reviewed-static-online-authorization.v3\\0",
+        "pm-t2-reviewed-static-online-authorization-v3.json",
+        "MAX_CANONICAL_REVIEWED_STATIC_ONLINE_AUTHORIZATION_BYTES_V3: usize = 128 * 1024",
+        "pub struct ReviewedStaticOnlineAuthorizationConfigPinsV3",
+        "pub struct ReviewedStaticOnlineAuthorizationV1AuthorizationPinsV3",
+        "pub struct ReviewedStaticOnlineAuthorizationOnlinePolicyPinsV3",
+        "pub struct ReviewedStaticOnlineAuthorizationOnlineAuthorizationPinsV3",
+        "pub struct ReviewedStaticOnlineAuthorizationDestinationPinsV3",
+        "pub struct ReviewedStaticOnlineAuthorizationLocatorPinsV3",
+        "pub struct ReviewedStaticOnlineAuthorizationDeliveryPinsV3",
+        "pub struct ReviewedStaticOnlineAuthorizationAccountIdentityPinsV3",
+        "pub struct ReviewedStaticOnlineAuthorizationRemoteProofPolicyPinsV3",
+        "pub schema_version: u32,",
+        "pub canonical_sha256: String,",
+        "pub canonical_length: u64,",
+        "pub fingerprint: String,",
+        "pub plan_fingerprint: String,",
+        "pub authorization_id: String,",
+        "pub policy_id: String,",
+        "pub profile_id: String,",
+        "pub locator_id: String,",
+        "pub binding_id: String,",
+        "pub identity_id: String,",
+        "pub struct ReviewedStaticOnlineAuthorizationV3",
+        "pub v1_config: ReviewedStaticOnlineAuthorizationConfigPinsV3,",
+        "pub v1_authorization: ReviewedStaticOnlineAuthorizationV1AuthorizationPinsV3,",
+        "pub online_policy_v2: ReviewedStaticOnlineAuthorizationOnlinePolicyPinsV3,",
+        "pub online_authorization_v2: ReviewedStaticOnlineAuthorizationOnlineAuthorizationPinsV3,",
+        "pub reviewed_production_destination_v1: ReviewedStaticOnlineAuthorizationDestinationPinsV3,",
+        "pub reviewed_fresh_credential_slot_locator_v1: ReviewedStaticOnlineAuthorizationLocatorPinsV3,",
+        "pub fresh_credential_delivery_binding_v1: ReviewedStaticOnlineAuthorizationDeliveryPinsV3,",
+        "ReviewedStaticOnlineAuthorizationAccountIdentityPinsV3,",
+        "ReviewedStaticOnlineAuthorizationRemoteProofPolicyPinsV3,",
+        "pub struct ReviewedStaticOnlineAuthorizationContextV3<'a>",
+        "pub v1_config: &'a CanonicalTrialConfig,",
+        "pub v1_authorization: &'a CanonicalAuthorization,",
+        "pub online_policy_v2: &'a CanonicalOnlinePolicyV2,",
+        "pub online_authorization_v2: &'a CanonicalOnlineAuthorizationV2,",
+        "pub reviewed_production_destination_v1: &'a CanonicalReviewedProductionDestinationProfileV1,",
+        "CanonicalReviewedFreshCredentialSlotLocatorV1,",
+        "pub fresh_credential_delivery_binding_v1: &'a CanonicalFreshCredentialDeliveryBindingV1,",
+        "CanonicalReviewedSignerProxyAccountIdentityV1,",
+        "CanonicalReviewedRemoteCredentialProofPolicyV1,",
+        "pub fn load_canonical_reviewed_static_online_authorization_v3(",
+        "ProtectedFileKind::ReviewedStaticOnlineAuthorizationV3",
+        "pub fn verify_reviewed_static_online_authorization_v3(",
+        "serde_json::to_vec(v1_value)",
+        "verify_authorization(",
+        "context.v1_authorization,",
+        "v1_not_before,",
+        "validate_online_authorization_contract_v2(",
+        "common_v1_v2_tuple_matches(context)",
+        "v1.build.repository_commit == v2.build.repository_commit",
+        "v1.build.cargo_lock_sha256 == v2.build.cargo_lock_sha256",
+        "v1.build.release_binary_sha256 == v2.build.release_binary_sha256",
+        "v1.build.release_binary_length == v2.build.release_binary_length",
+        "v1.host.host_identity == v2.host.uts_nodename",
+        "v1.host.boot_identity == v2.host.boot_id",
+        "v1.host.runtime_user == v2.host.nss_username",
+        "v1.host.egress_identity == v2.host.egress.authorized_geoblock_reported_public_ip",
+        "v2_times.not_before < v1_not_before",
+        "v2_times.expires_at > v1_expires_at",
+        "v2_times.cleanup_not_after > v1_cleanup_not_after",
+        "static_times.not_before != v2_times.not_before",
+        "static_times.expires_at != v2_times.expires_at",
+        "static_times.cleanup_not_after != v2_times.cleanup_not_after",
+        "std::cmp::max(v1_reviewed_at, v2_times.reviewed_at)",
+        "static_review_order_against_v1_and_v2_structurally_valid: true",
+        "Static review ordering compares only the V1 and V2 authorization review",
+        "Exact pins do not prove that any of the five prerequisite sidecars",
+        "existed when this V3 record was reviewed",
+        "prerequisite_artifacts_existed_at_static_review_time_attested: false",
+        "verify_reviewed_production_destination_profile_v1(",
+        "verify_reviewed_fresh_credential_slot_locator_v1(",
+        "verify_fresh_credential_delivery_binding_v1(",
+        "verify_reviewed_signer_proxy_account_identity_v1(",
+        "verify_reviewed_remote_credential_proof_policy_v1(",
+        "component_verifications_are_denied(",
+        "component_verifiers_denied_and_negative_facts_checked: true",
+        "let crate::ReviewedProductionDestinationProfileVerificationV1 {",
+        "let crate::ReviewedFreshCredentialSlotLocatorVerificationV1 {",
+        "let crate::FreshCredentialDeliveryBindingVerificationV1 {",
+        "let crate::ReviewedSignerProxyAccountIdentityVerificationV1 {",
+        "let crate::ReviewedRemoteCredentialProofPolicyVerificationV1 {",
+        "OnlineV2PreparedThenV1PreparedV1",
+        "BasisAfterExistingPlaceAndBothConsumptionPreparedThenV2ClaimThenV1ClaimThenV1A3ThenV2A3ConjunctV1",
+        "ExistingV1LifecycleOnlyNoPlacementResumeV1",
+        "NoPreparedClaimBurnRecoveryOrDispatchV1",
+        "The V2 attempt value in that design is only the existing Basis",
+        "fingerprint, never a fresh runtime commitment",
+        "a one-record ledger plus its durable claim is",
+        "already burned even when no later `Consumed` line exists",
+        "failed claim never proves that an attempt is unburned",
+        "V2 has no",
+        "placement-reopen path",
+        "V1 may reopen only to consume or recovery-cancel",
+        "always with zero placement resumption",
+        "OfflineAuthorizationState::DENIED",
+        "CanonicalReviewedStaticOnlineAuthorizationV3(<exact-protected-canonical-bytes; no-value-id-address-path-actor-or-lineage-projection; redacted; denied>)",
+        "separately versioned Prepared lineage must consume the retained delivery",
+        "evidence and load token, bind a selected actor generation",
+        "The schema defines no designated",
+        "secret, credential-value, cryptographic-signature, lease-token",
+        "Arbitrary ID",
+        "and reviewer-label strings cannot be proven secret-free",
+        "operators must never place secrets or secret-derived material in them",
+    ] {
+        assert!(
+            REVIEWED_STATIC_ONLINE_AUTHORIZATION_V3.contains(required),
+            "missing reviewed static online-authorization V3 source pin `{required}`"
+        );
+    }
+
+    for (enum_name, exact_body) in [
+        (
+            "ReviewedCredentialProviderTrustRootStatusV3",
+            "#[serde(rename = \"unavailable_in_frozen_sources_v1\")]\n    UnavailableInFrozenSourcesV1,",
+        ),
+        (
+            "ReviewedCredentialDeliveryLeaseProtocolStatusV3",
+            "#[serde(rename = \"unavailable_in_frozen_sources_v1\")]\n    UnavailableInFrozenSourcesV1,",
+        ),
+        (
+            "ReviewedRemoteCredentialAcceptanceContractStatusV3",
+            "#[serde(rename = \"unavailable_in_frozen_sources_v1\")]\n    UnavailableInFrozenSourcesV1,",
+        ),
+        (
+            "ReviewedSignerProxyControlContractStatusV3",
+            "#[serde(rename = \"unattested_reviewed_labels_only_v1\")]\n    UnattestedReviewedLabelsOnlyV1,",
+        ),
+        (
+            "ReviewedSelectedActorProfileV3",
+            "#[serde(rename = \"shutdown_only_selected_egress_current_thread_local_set_v1\")]\n    ShutdownOnlySelectedEgressCurrentThreadLocalSetV1,",
+        ),
+        (
+            "ReviewedActorGenerationSchemeV3",
+            "#[serde(rename = \"process_id_thread_id_and_rc_pointer_identity_v1\")]\n    ProcessIdThreadIdAndRcPointerIdentityV1,",
+        ),
+        (
+            "ReviewedActorGenerationAllocationV3",
+            "#[serde(rename = \"before_runtime_local_set_and_all_actor_local_construction_v1\")]\n    BeforeRuntimeLocalSetAndAllActorLocalConstructionV1,",
+        ),
+        (
+            "ReviewedActorReadinessV3",
+            "#[serde(rename = \"task_entry_ack_after_generation_membership_revalidation_v1\")]\n    TaskEntryAckAfterGenerationMembershipRevalidationV1,",
+        ),
+        (
+            "ReviewedActorCommandSetV3",
+            "#[serde(rename = \"shutdown_only_v1\")]\n    ShutdownOnlyV1,",
+        ),
+        (
+            "ReviewedActorTerminalRequirementV3",
+            "#[serde(\n        rename = \"shutdown_requested_no_abort_task_joined_clean_credentials_dropped_staged_files_removed_generation_revalidated_v1\"\n    )]\n    ShutdownRequestedNoAbortTaskJoinedCleanCredentialsDroppedStagedFilesRemovedGenerationRevalidatedV1,",
+        ),
+        (
+            "ReviewedActorRuntimeAttemptCommitmentLocationV3",
+            "#[serde(rename = \"future_prepared_only_absent_from_static_v3\")]\n    FuturePreparedOnlyAbsentFromStaticV3,",
+        ),
+        (
+            "ReviewedPreparedCreationOrderV3",
+            "#[serde(rename = \"online_v2_prepared_then_v1_prepared_v1\")]\n    OnlineV2PreparedThenV1PreparedV1,",
+        ),
+        (
+            "ReviewedBasisAndBurnOrderV3",
+            "#[serde(\n        rename = \"basis_after_existing_place_and_both_consumption_prepared_then_v2_claim_then_v1_claim_then_v1_a3_then_v2_a3_conjunct_v1\"\n    )]\n    BasisAfterExistingPlaceAndBothConsumptionPreparedThenV2ClaimThenV1ClaimThenV1A3ThenV2A3ConjunctV1,",
+        ),
+        (
+            "ReviewedCrashRecoveryProfileV3",
+            "#[serde(rename = \"existing_v1_lifecycle_only_no_placement_resume_v1\")]\n    ExistingV1LifecycleOnlyNoPlacementResumeV1,",
+        ),
+        (
+            "ReviewedStaticV3RuntimeStateV3",
+            "#[serde(rename = \"no_prepared_claim_burn_recovery_or_dispatch_v1\")]\n    NoPreparedClaimBurnRecoveryOrDispatchV1,",
+        ),
+    ] {
+        let declaration = format!("pub enum {enum_name} {{");
+        let body = REVIEWED_STATIC_ONLINE_AUTHORIZATION_V3
+            .split_once(&declaration)
+            .and_then(|(_, tail)| tail.split_once("\n}").map(|(body, _)| body.trim()))
+            .expect("closed static V3 enum must remain recognizable");
+        assert_eq!(body, exact_body, "closed enum changed: {enum_name}");
+    }
+
+    let false_claims = [
+        "prerequisite_artifacts_existed_at_static_review_time_attested",
+        "reviewer_authorship_attested",
+        "credential_provider_trust_root_available",
+        "credential_provider_trust_root_authenticated",
+        "credential_provider_authorship_attested",
+        "authenticated_credential_delivery_lease_protocol_available",
+        "credential_provider_signature_verified",
+        "credential_delivery_lease_verified",
+        "credential_delivery_lease_current_and_unrevoked",
+        "delivery_generation_attested",
+        "rotation_generation_attested",
+        "authoritative_remote_credential_acceptance_contract_available",
+        "authoritative_signer_proxy_control_contract_available",
+        "official_source_bytes_loaded_and_hash_verified",
+        "official_source_publisher_authorship_attested",
+        "remote_api_key_owner_attested",
+        "live_credential_tuple_accepted_by_provider",
+        "signer_controls_proxy_attested",
+        "signer_proxy_relationship_current_and_unrevoked_attested",
+        "signer_on_chain_eoa_status_verified",
+        "proxy_on_chain_contract_status_verified",
+        "on_chain_account_state_checked",
+        "on_chain_finality_checked",
+        "proxy_factory_semantics_verified",
+        "credential_tuple_current_and_unrevoked_attested",
+        "source_owned_current_time_checked",
+        "v1_authorization_current",
+        "online_authorization_v2_current",
+        "static_online_authorization_v3_current",
+        "retained_delivery_evidence_joined",
+        "fresh_credential_delivery_load_token_consumed",
+        "retained_delivery_evidence_and_load_token_joined",
+        "same_loaded_credential_holder_attested",
+        "delivery_and_remote_proof_same_source_generation_attested",
+        "globally_unique_credential_delivery_attested",
+        "loaded_credentials_match_delivery_binding",
+        "protected_credential_directory_and_four_files_checked",
+        "private_key_derived_signer_matches_config_checked",
+        "l2_credentials_match_configured_signer_checked",
+        "runner_actor_profile_implementation_checked",
+        "actor_started",
+        "selected_actor_bound",
+        "selected_actor_generation_bound",
+        "selected_actor_generation_membership_revalidated",
+        "actor_runtime_attempt_commitment_bound",
+        "runtime_attempt_commitment_present",
+        "runtime_attempt_commitment_source_owned",
+        "runtime_attempt_commitment_fresh",
+        "product_clock_owner_bound",
+        "server_time_proof_authenticated_and_fresh",
+        "preflight_collected_and_validated",
+        "v1_prepared_consumption_inspected",
+        "v2_prepared_consumption_inspected",
+        "prospective_v3_prepared_implemented",
+        "prospective_v3_prepared_created",
+        "v1_durable_prepared_observed",
+        "v2_durable_prepared_observed",
+        "v1_claim_absence_reserved",
+        "v2_claim_absence_reserved",
+        "artifact_file_created_or_written",
+        "v3_create_new_performed",
+        "v3_file_fsynced",
+        "v3_parent_directory_fsynced",
+        "journal_opened_for_append",
+        "parent_directory_snapshot_refreshed",
+        "basis_inspected",
+        "basis_durable",
+        "online_v2_claim_inspected",
+        "online_v2_claim_durable",
+        "v1_claim_inspected",
+        "v1_claim_durable",
+        "v1_authorization_consumption_checked",
+        "online_authorization_v2_consumption_checked",
+        "static_online_authorization_v3_consumption_checked",
+        "atomic_consumption_claim_created",
+        "v1_authorization_burn_performed",
+        "online_authorization_v2_burn_performed",
+        "v3_authorization_burn_performed",
+        "burn_and_no_resend_established",
+        "recovery_state_checked",
+        "v1_recovery_reopen_eligibility_established",
+        "v2_recovery_reopen_eligibility_established",
+        "placement_resumption_allowed",
+        "v1_a3_created",
+        "v1_a3_checked",
+        "v1_a3_durable",
+        "online_v2_a3_conjunct_created",
+        "online_v2_a3_conjunct_checked",
+        "online_v2_a3_conjunct_durable",
+        "authenticated_request_or_hmac_constructed",
+        "signed_order_body_constructed",
+        "place_dispatch_owner_or_grant_minted",
+        "network_dispatch_performed",
+        "pid_tid_or_rc_pointer_value_recorded",
+        "randomness_or_runtime_nonce_sampled",
+        "v1_config_reverse_pins_static_authorization_v3",
+        "v1_authorization_reverse_pins_static_authorization_v3",
+        "online_policy_v2_reverse_pins_static_authorization_v3",
+        "online_authorization_v2_reverse_pins_static_authorization_v3",
+        "reviewed_destination_reverse_pins_static_authorization_v3",
+        "reviewed_locator_reverse_pins_static_authorization_v3",
+        "fresh_delivery_reverse_pins_static_authorization_v3",
+        "reviewed_identity_reverse_pins_static_authorization_v3",
+        "remote_proof_policy_reverse_pins_static_authorization_v3",
+        "static_authorization_fingerprint_pinned_by_prospective_v3_prepared",
+        "durable_static_authorization_consumption_recorded",
+        "credential_mutation_authority_attested",
+    ];
+    for claim in false_claims {
+        assert!(
+            REVIEWED_STATIC_ONLINE_AUTHORIZATION_V3.contains(&format!("{claim}: false")),
+            "reviewed static V3 claim is not explicitly false: {claim}"
+        );
+        assert!(
+            !REVIEWED_STATIC_ONLINE_AUTHORIZATION_V3.contains(&format!("{claim}: true")),
+            "reviewed static V3 claim became true: {claim}"
+        );
+    }
+
+    assert!(
+        !REVIEWED_STATIC_ONLINE_AUTHORIZATION_V3.contains("static_review_order_structurally_valid"),
+        "static V3 review-order fact overclaims prerequisite history"
+    );
+    let component_helper = REVIEWED_STATIC_ONLINE_AUTHORIZATION_V3
+        .split_once("fn component_verifications_are_denied(")
+        .and_then(|(_, tail)| {
+            tail.split_once("struct ExactPinViewV3")
+                .map(|(body, _)| body)
+        })
+        .expect("static V3 exhaustive component helper must remain recognizable");
+    assert_eq!(component_helper.matches("let crate::").count(), 5);
+    assert!(
+        !component_helper.contains(".."),
+        "component verification destructuring must remain exhaustive"
+    );
+    assert!(
+        !component_helper.contains("#[allow"),
+        "component verification coverage must not suppress unused-field diagnostics"
+    );
+
+    for forbidden in [
+        "reqwest::",
+        "tokio::",
+        "TcpStream",
+        "reap_polymarket_auth",
+        "reap_polymarket_wire",
+        "L2Credentials",
+        "AuthenticatedL2Headers",
+        "EoaPrivateKeyInput",
+        "DurableCreateNewFile",
+        "OpenOptions",
+        "File::create",
+        "File::open",
+        "fs::write",
+        "write_all",
+        "open_for_append",
+        "prepare_authorization_consumption",
+        "prepare_online_authorization_consumption_v2",
+        "claim_authorization_consumption",
+        "consume_authorization",
+        "Utc::now",
+        "SystemTime",
+        "rand::",
+        "getrandom",
+        "pub fn bind_",
+        "pub fn into_parts",
+        "pub fn prepare_",
+        "pub fn inspect_",
+        "pub fn consume_",
+        "pub struct Prospective",
+        "pub struct PreparedReviewedStatic",
+        "ProtectedFileKind::Prepared",
+        "production_order_entry_authorized: true",
+        "real_order_submission_authorized: true",
+    ] {
+        assert!(
+            !REVIEWED_STATIC_ONLINE_AUTHORIZATION_V3.contains(forbidden),
+            "reviewed static V3 gained forbidden capability or positive surface `{forbidden}`"
+        );
+    }
+
+    let record = REVIEWED_STATIC_ONLINE_AUTHORIZATION_V3
+        .split_once("pub struct ReviewedStaticOnlineAuthorizationV3 {")
+        .and_then(|(_, tail)| tail.split_once("\n}").map(|(body, _)| body))
+        .expect("static V3 record must remain recognizable");
+    for forbidden_field in [
+        "private_key",
+        "l2_secret",
+        "api_key",
+        "passphrase",
+        "signature_bytes",
+        "lease_token",
+        "provider_public_key",
+        "process_id_value",
+        "thread_id_value",
+        "pointer_value",
+        "runtime_nonce",
+        "prepared_file",
+        "consumption_claim",
+        "request_body",
+        "signed_order",
+    ] {
+        assert!(
+            !record.contains(forbidden_field),
+            "static V3 record gained forbidden field `{forbidden_field}`"
+        );
+    }
+
+    let context = REVIEWED_STATIC_ONLINE_AUTHORIZATION_V3
+        .split_once("pub struct ReviewedStaticOnlineAuthorizationContextV3<'a> {")
+        .and_then(|(_, tail)| tail.split_once("\n}").map(|(body, _)| body))
+        .expect("static V3 context must remain recognizable");
+    for forbidden_context_input in [
+        "Verification",
+        "String",
+        "&str",
+        "fingerprint:",
+        "Token",
+        "Evidence",
+        "Prepared",
+        "Actor",
+        "Clock",
+    ] {
+        assert!(
+            !context.contains(forbidden_context_input),
+            "static V3 context gained caller-supplied evidence `{forbidden_context_input}`"
+        );
+    }
+
+    let canonical_surface = REVIEWED_STATIC_ONLINE_AUTHORIZATION_V3
+        .split_once("impl CanonicalReviewedStaticOnlineAuthorizationV3 {")
+        .and_then(|(_, tail)| {
+            tail.split_once("impl fmt::Debug for CanonicalReviewedStaticOnlineAuthorizationV3")
+                .map(|(surface, _)| surface)
+        })
+        .expect("canonical static V3 surface must remain recognizable");
+    for forbidden_projection in [
+        "value(",
+        "id(",
+        "address(",
+        "path(",
+        "actor(",
+        "lineage(",
+        "bytes(",
+        "config(",
+        "authorization(",
+    ] {
+        assert!(
+            !canonical_surface.contains(forbidden_projection),
+            "canonical static V3 holder gained projection `{forbidden_projection}`"
+        );
+    }
+
+    let declaration = "pub struct CanonicalReviewedStaticOnlineAuthorizationV3 {";
+    let before = REVIEWED_STATIC_ONLINE_AUTHORIZATION_V3
+        .split_once(declaration)
+        .map(|(before, _)| before)
+        .expect("canonical static V3 declaration must remain recognizable");
+    let declaration_attributes = before
+        .rsplit_once("\n}\n\n")
+        .map_or(before, |(_, attributes)| attributes);
+    assert!(!declaration_attributes.contains("#[derive"));
+    for implementation in REVIEWED_STATIC_ONLINE_AUTHORIZATION_V3.split("\nimpl") {
+        let header = implementation
+            .split_once('{')
+            .map_or(implementation, |(header, _)| header);
+        assert!(
+            !(header.contains("CanonicalReviewedStaticOnlineAuthorizationV3")
+                && ["Clone", "Copy", "Serialize", "Deserialize"]
+                    .iter()
+                    .any(|trait_name| header.contains(trait_name))),
+            "canonical static V3 holder gained manual Clone, Copy, Serialize, or Deserialize"
+        );
+    }
+
+    assert!(PROTECTED.contains("ReviewedStaticOnlineAuthorizationV3"));
+    assert!(LIB.contains("mod reviewed_static_online_authorization_v3;"));
+    for upstream in [
+        CONFIG,
+        CONSUMPTION,
+        CUSTODY,
+        ONLINE_CONSUMPTION_V2,
+        ONLINE_POLICY_V2,
+        PREFLIGHT,
+        REVIEWED_DESTINATION_PROFILE_V1,
+        REVIEWED_FRESH_CREDENTIAL_SLOT_LOCATOR_V1,
+        FRESH_CREDENTIAL_DELIVERY_BINDING_V1,
+        REVIEWED_SIGNER_PROXY_ACCOUNT_IDENTITY_V1,
+        REVIEWED_REMOTE_CREDENTIAL_PROOF_POLICY_V1,
+        MAIN,
+    ] {
+        assert!(
+            !upstream.contains("ReviewedStaticOnlineAuthorizationV3"),
+            "upstream or runtime source reverse-wired static V3"
+        );
+    }
 }
 
 #[test]
