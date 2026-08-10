@@ -29,14 +29,16 @@ use reap_polymarket_adapter::{
     PmPublicSession, PmPublicSessionBatch, PmPublicSessionError, PmPublicSessionFault,
     PmSnapshotFlowToken,
 };
+use reap_polymarket_egress_binding::{PmFixedTlsPeerSelection, PmLocalEgressSelection};
 use reap_polymarket_live_adapter::{
-    PmActorProductClock, PmCancelMutationTimeOwner, PmHttpReceiveClock,
-    PmLiveAuthoritativeMetadataError, PmLiveAuthoritativeMetadataObservation,
+    PmActorProductClock, PmCancelMutationTimeOwner, PmDeferredMutationClockCapsule,
+    PmHttpReceiveClock, PmLiveAuthoritativeMetadataError, PmLiveAuthoritativeMetadataObservation,
     PmLiveMetadataObservationCommitment, PmOkxProductClock, PmPlaceMutationTimeOwner,
     PmPrivateReadProductClock, PmProductClockError, PmPublicConnectivityRoles, PmPublicHttpRole,
-    PmPublicMarketWsRole, PmPublicMetadataHttpRole, PmPublicWsActivityView, PmPublicWsConnection,
-    PmPublicWsDisconnectReason, PmPublicWsEvent, PmPublicWsEventSink, PmPublicWsReconnect,
-    PmPublicWsReconnectDirective, PmPublicWsRetirement, PmPublicWsRunError,
+    PmPublicMarketWsRole, PmPublicMetadataHttpRole,
+    PmPublicObservationWithDeferredMutationClockOwner, PmPublicWsActivityView,
+    PmPublicWsConnection, PmPublicWsDisconnectReason, PmPublicWsEvent, PmPublicWsEventSink,
+    PmPublicWsReconnect, PmPublicWsReconnectDirective, PmPublicWsRetirement, PmPublicWsRunError,
     PmPublicWsShutdownSignal, PmPublicWsTransportPolicy, PmReadServerTimeHttpRole,
     PmRestBookDeliveryError, PmRestBookPurpose, PmRestBookSnapshotSink, PmRestResponseClock,
     PmTypedLiveMarketDetails, PmUserWsProductClock,
@@ -47,7 +49,151 @@ use reap_polymarket_wire::{
 use reap_transport::ReconnectPolicy;
 use thiserror::Error;
 
+use super::super::authority::{CredentialAuthorityShutdownBounds, FreshCredentialAuthorityOwner};
+use super::private_reads::{
+    PmFreshStagedSelectedObservationRoles, PmPrivateReadRuntimeError, PmPrivateReadRuntimeProfile,
+};
+
 const MAX_PUBLIC_BOOK_AGE_NS: u64 = 5_000_000_000;
+
+// BEGIN SELECTED_DEFERRED_OBSERVATION_HANDOFF
+/// Runner-private split of one whole selected observation/deferred-clock
+/// owner.
+///
+/// Accepting the unsplit adapter owner is important: callers cannot pair
+/// observation views from one product-clock domain with a deferred capsule
+/// from another. The raw public WebSocket and exact clock bundle stay lexical
+/// locals inside the one token-gated consuming assembly method below and are
+/// immediately paired by the selected actor.
+pub(super) struct PmDeferredObservationRuntimeRoles {
+    public_ws: PmPublicMarketWsRole,
+    private_read_clocks: PmPrivateReadClockBundle,
+    inert: PmInertDeferredObservationCustody,
+}
+
+/// Unforgeable sibling-module admission for the sole raw observation split.
+/// Only `public_book` can construct this value.
+pub(super) struct PmDeferredObservationAssemblyToken {
+    _private: (),
+}
+
+#[cfg(test)]
+impl PmDeferredObservationAssemblyToken {
+    pub(super) const fn test_support() -> Self {
+        Self { _private: () }
+    }
+}
+
+impl PmDeferredObservationRuntimeRoles {
+    pub(super) fn from_owner(owner: PmPublicObservationWithDeferredMutationClockOwner) -> Self {
+        let configured_scope = owner.configured_scope();
+        let (roles, deferred_mutation_clock) = owner.into_parts();
+        let (
+            metadata_http,
+            book_http,
+            read_server_time_http,
+            private_read_clock,
+            public_ws,
+            user_ws_clock,
+            actor_clock,
+            okx_clock,
+        ) = roles.into_roles();
+        Self {
+            public_ws,
+            private_read_clocks: PmPrivateReadClockBundle {
+                server_time: read_server_time_http,
+                private_read: private_read_clock,
+                user_ws: user_ws_clock,
+            },
+            inert: PmInertDeferredObservationCustody {
+                _metadata_http: metadata_http,
+                _book_http: book_http,
+                _actor_clock: actor_clock,
+                _okx_clock: okx_clock,
+                _deferred_mutation_clock: deferred_mutation_clock,
+                _configured_scope: configured_scope,
+            },
+        }
+    }
+
+    /// Consume this whole same-domain owner into the one selected private-read
+    /// and paired-WebSocket carrier. No sibling ever receives the raw public
+    /// role or clock bundle without the unforgeable assembly token.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn production_selected(
+        self,
+        credential_owner: FreshCredentialAuthorityOwner,
+        local_set: &tokio::task::LocalSet,
+        profile: PmPrivateReadRuntimeProfile,
+        fixed_clob_http_peer: PmFixedTlsPeerSelection,
+        fixed_clob_ws_peer: PmFixedTlsPeerSelection,
+        selected_local_egress: PmLocalEgressSelection,
+        shutdown_bounds: CredentialAuthorityShutdownBounds,
+    ) -> Result<
+        (
+            PmFreshStagedSelectedObservationRoles,
+            PmInertDeferredObservationCustody,
+        ),
+        PmPrivateReadRuntimeError,
+    > {
+        let Self {
+            public_ws,
+            private_read_clocks,
+            inert,
+        } = self;
+        let selected = match PmFreshStagedSelectedObservationRoles::production_selected_internal(
+            PmDeferredObservationAssemblyToken { _private: () },
+            credential_owner,
+            local_set,
+            profile,
+            private_read_clocks,
+            public_ws,
+            fixed_clob_http_peer,
+            fixed_clob_ws_peer,
+            selected_local_egress,
+            shutdown_bounds,
+        )
+        .await
+        {
+            Ok(selected) => selected,
+            // The internal bridge consumes and terminally cleans any custody
+            // it armed before yielding an error. Only inert public companions
+            // remain in this frame and may now drop.
+            Err(error) => return Err(error),
+        };
+        Ok((selected, inert))
+    }
+}
+
+impl fmt::Debug for PmDeferredObservationRuntimeRoles {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .write_str("PmDeferredObservationRuntimeRoles(<selected; one-product-clock; deferred>)")
+    }
+}
+
+/// Inert remainder retained by the selected actor.
+///
+/// This value deliberately has no projection, source, sampling, promotion, or
+/// transport method. In particular, the deferred mutation capsule cannot be
+/// recovered from this custody in the Shutdown-only actor tranche.
+pub(super) struct PmInertDeferredObservationCustody {
+    _metadata_http: PmPublicMetadataHttpRole,
+    _book_http: PmPublicHttpRole,
+    _actor_clock: PmActorProductClock,
+    _okx_clock: PmOkxProductClock,
+    _deferred_mutation_clock: PmDeferredMutationClockCapsule,
+    _configured_scope: reap_polymarket_wire::PmWireScope,
+}
+
+impl fmt::Debug for PmInertDeferredObservationCustody {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "PmInertDeferredObservationCustody(<no projection; scope and clocks retained>)",
+        )
+    }
+}
+// END SELECTED_DEFERRED_OBSERVATION_HANDOFF
 
 /// Sole runner-private split of the live adapter's move-only public
 /// connectivity roles. Construction consumes the exact source bundle, so the

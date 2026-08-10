@@ -14,6 +14,7 @@ use reap_pm_core::{
     PmQuantity, PmTokenId, PmVenueOrderId, U256,
 };
 use reap_polymarket_auth::{EoaAddress, FixedOrderId, L2Timestamp};
+use reap_polymarket_egress_binding::{PmFixedTlsPeerSelection, PmLocalEgressSelection};
 use reap_polymarket_live_adapter::{
     PmAccountAsset, PmAccountBalanceAllowanceObservation,
     PmAccountBalanceAllowanceObservationCommitment, PmAuthenticatedHttpOwner,
@@ -21,24 +22,27 @@ use reap_polymarket_live_adapter::{
     PmCompleteTradesObservationCommitment, PmExactOrderDetailObservation,
     PmExactOrderDetailObservationCommitment, PmExactOrderObservation,
     PmExternalProxyReadConnectivityOwner, PmLiveAdapterError, PmOpenOrdersCutProgress,
-    PmPrivateReadEdgeClock, PmPrivateReadProductClock, PmReadServerTime, PmReadServerTimeHttpRole,
-    PmReadServerTimeObservationCommitment, PmRestResponseClock, PmTradesCutProgress,
-    PmUserWsActivityView, PmUserWsBounds,
+    PmPrivateReadEdgeClock, PmPrivateReadProductClock, PmProductionSelectedPublicWsRole,
+    PmProductionSelectedUserWsRole, PmProductionSelectedWsOwner, PmPublicMarketWsRole,
+    PmReadServerTime, PmReadServerTimeHttpRole, PmReadServerTimeObservationCommitment,
+    PmRestResponseClock, PmTradesCutProgress, PmUserWsActivityView, PmUserWsBounds,
 };
 #[cfg(test)]
 use reap_polymarket_live_adapter::{PmPrivateHttpConfig, PmUserWsConfig};
 use reap_polymarket_wire::{PmLiveOrder, PmLiveTrade, PmWireScope};
 use thiserror::Error;
 
+#[cfg(test)]
+use super::super::authority::FreshStagedObservationAuthorityRoles;
 use super::super::authority::{
-    CredentialAuthorityShutdownBounds, ExactOwnedCancelAuthenticationRole,
-    FixedHttpAuthenticationRole, FixedUserWsAuthenticationRole, FreshCredentialAuthorityRoles,
+    CredentialAuthorityShutdownBounds, CredentialAuthorityShutdownOutcome,
+    ExactOwnedCancelAuthenticationRole, FixedHttpAuthenticationRole, FixedUserWsAuthenticationRole,
+    FreshCredentialAuthorityOwner, FreshCredentialAuthorityRoles,
     FreshCredentialAuthoritySupervisor, FreshPlaceAuthenticationOnce,
-    FreshStagedObservationAuthorityRoles, PmObservingFreshCredentialCustody,
-    PmObservingFreshCredentialShutdownError, RecoveryCredentialAuthorityRoles,
-    RecoveryCredentialAuthoritySupervisor,
+    PmObservingFreshCredentialCustody, PmObservingFreshCredentialShutdownError,
+    RecoveryCredentialAuthorityRoles, RecoveryCredentialAuthoritySupervisor,
 };
-use super::public_book::PmPrivateReadClockBundle;
+use super::public_book::{PmDeferredObservationAssemblyToken, PmPrivateReadClockBundle};
 
 /// Cold production-only profile for the fixed type-1 private read edge.
 ///
@@ -1096,12 +1100,22 @@ pub(super) enum PmPrivateReadRuntimeError {
     UserActivityChangedRetryRequired,
     #[error("staged observation credentials do not match the fixed private-read signer")]
     StagedObservationSignerBindingMismatch,
+    #[error("staged observation credential authority could not be started")]
+    StagedObservationStartFailed,
     #[error(
         "staged observation build failed ({build}) and bounded credential cleanup failed ({cleanup})"
     )]
     StagedObservationCleanupFailed {
         build: Box<PmPrivateReadRuntimeError>,
         cleanup: PmObservingFreshCredentialShutdownError,
+    },
+    #[error(
+        "staged observation build failed ({build}) after credential custody reached an abnormal but terminal shutdown"
+    )]
+    StagedObservationCleanupAbnormal {
+        build: Box<PmPrivateReadRuntimeError>,
+        abort_requested: bool,
+        task_completed_cleanly: bool,
     },
 }
 
@@ -1551,18 +1565,172 @@ impl PmRecoveryAuthenticatedRestRuntime {
 }
 
 // BEGIN STAGED_OBSERVATION_PRIVATE_READ_ROLES
-/// Complete observation-only runtime projection of one fresh custody.
+/// Inseparable selected observation roles and the exact fresh credential
+/// custody behind them.
 ///
-/// Construction consumes the unsplit authority bundle, preserving the common
-/// task behind both authenticated read roles and its armed terminal custody.
-pub(super) struct PmFreshStagedObservationPrivateReadRuntimeRoles {
+/// All fields are private and this tranche exposes no source or transport
+/// projection. Construction installs selected fixed-peer HTTP, immediately
+/// pairs the public and same-credential user WebSockets, and retains both
+/// forks of the same-authority marker. The only production operation is
+/// consuming bounded shutdown.
+pub(super) struct PmFreshStagedSelectedObservationRoles {
+    rest: PmFreshAuthenticatedRestRuntime,
+    public_ws: PmProductionSelectedPublicWsRole,
+    user_ws: PmProductionSelectedUserWsRole,
+    user_ws_activity: PmUserWsActivityView,
+    same_authority: PmSameCredentialAuthorityMarker,
+    custody: PmObservingFreshCredentialCustody,
+    _configured_scope: PmWireScope,
+}
+
+impl PmFreshStagedSelectedObservationRoles {
+    /// Start cold credential custody on the supplied actor LocalSet, construct
+    /// fixed-peer authenticated HTTP, and immediately pair both production
+    /// WebSockets to the one supplied selected local route.
+    ///
+    /// Every error after the credential task is armed explicitly joins and
+    /// tears down custody before returning. This function makes no HTTP or
+    /// WebSocket source call. The unforgeable assembly token arrives only from
+    /// the whole deferred-observation owner, whose selected constructor has
+    /// already rejected a non-production public WebSocket configuration; the
+    /// exact full scope is nevertheless rechecked here before arming secrets.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn production_selected_internal(
+        _assembly: PmDeferredObservationAssemblyToken,
+        credential_owner: FreshCredentialAuthorityOwner,
+        local_set: &tokio::task::LocalSet,
+        profile: PmPrivateReadRuntimeProfile,
+        clocks: PmPrivateReadClockBundle,
+        public_ws: PmPublicMarketWsRole,
+        fixed_clob_http_peer: PmFixedTlsPeerSelection,
+        fixed_clob_ws_peer: PmFixedTlsPeerSelection,
+        selected_local_egress: PmLocalEgressSelection,
+        shutdown_bounds: CredentialAuthorityShutdownBounds,
+    ) -> Result<Self, PmPrivateReadRuntimeError> {
+        if public_ws.scope() != profile.scope {
+            return Err(PmLiveAdapterError::InvalidConfiguration(
+                "selected public and private observation scopes diverged",
+            )
+            .into());
+        }
+        let authority = match credential_owner.spawn_staged_observation(local_set) {
+            Ok(authority) => authority,
+            Err(_) => return Err(PmPrivateReadRuntimeError::StagedObservationStartFailed),
+        };
+        let (http_authority, user_authority, loaded_signer, custody) =
+            authority.into_private_read_runtime_parts();
+        if loaded_signer != profile.signer {
+            drop(http_authority);
+            drop(user_authority);
+            drop(public_ws);
+            drop(clocks);
+            return Err(cleanup_staged_observation_after_assembly_failure(
+                custody,
+                shutdown_bounds,
+                PmPrivateReadRuntimeError::StagedObservationSignerBindingMismatch,
+            )
+            .await);
+        }
+
+        let configured_scope = profile.scope;
+        let selected_http_local = selected_local_egress.clone();
+        let (core, user_ws) =
+            match production_runtime_core_on_fixed_tls_peer_and_selected_local_egress(
+                profile,
+                clocks,
+                fixed_clob_http_peer,
+                selected_http_local,
+                http_authority,
+                user_authority,
+            ) {
+                Ok(roles) => roles,
+                Err(build) => {
+                    drop(public_ws);
+                    return Err(cleanup_staged_observation_after_assembly_failure(
+                        custody,
+                        shutdown_bounds,
+                        build,
+                    )
+                    .await);
+                }
+            };
+        let rest = PmFreshAuthenticatedRestRuntime { core };
+        let (user_ws, user_ws_activity, same_authority) = user_ws.into_parts();
+        let selected_ws = match PmProductionSelectedWsOwner::new(
+            public_ws,
+            user_ws,
+            fixed_clob_ws_peer,
+            selected_local_egress,
+        ) {
+            Ok(selected_ws) => selected_ws,
+            Err(build) => {
+                drop(rest);
+                drop(user_ws_activity);
+                drop(same_authority);
+                return Err(cleanup_staged_observation_after_assembly_failure(
+                    custody,
+                    shutdown_bounds,
+                    build.into(),
+                )
+                .await);
+            }
+        };
+        let (public_ws, user_ws) = selected_ws.into_roles();
+        Ok(Self {
+            rest,
+            public_ws,
+            user_ws,
+            user_ws_activity,
+            same_authority,
+            custody,
+            _configured_scope: configured_scope,
+        })
+    }
+
+    /// Destroy all role/provider senders before asking the credential task to
+    /// stop. The returned outcome retains whether bounded shutdown required an
+    /// abort; a safe abnormal join is evidence, not silently rewritten as a
+    /// clean completion.
+    pub(super) async fn shutdown_bounded(
+        self,
+        bounds: CredentialAuthorityShutdownBounds,
+    ) -> Result<CredentialAuthorityShutdownOutcome, PmObservingFreshCredentialShutdownError> {
+        let Self {
+            rest,
+            public_ws,
+            user_ws,
+            user_ws_activity,
+            same_authority,
+            custody,
+            _configured_scope: _,
+        } = self;
+        drop(rest);
+        drop(public_ws);
+        drop(user_ws);
+        drop(user_ws_activity);
+        drop(same_authority);
+        custody.shutdown_bounded(bounds).await
+    }
+}
+
+impl fmt::Debug for PmFreshStagedSelectedObservationRoles {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PmFreshStagedSelectedObservationRoles([REDACTED; SELECTED; ARMED])")
+    }
+}
+
+/// Test-only legacy observation projection. Production selected composition
+/// cannot obtain this armed intermediate or its raw user role.
+#[cfg(test)]
+struct PmFreshStagedObservationPrivateReadRuntimeRoles {
     rest: PmFreshAuthenticatedRestRuntime,
     user_ws: PmSameCredentialUserWsInput,
     custody: PmObservingFreshCredentialCustody,
 }
 
+#[cfg(test)]
 impl PmFreshStagedObservationPrivateReadRuntimeRoles {
-    pub(super) async fn production(
+    async fn production(
         authority: FreshStagedObservationAuthorityRoles,
         profile: PmPrivateReadRuntimeProfile,
         clocks: PmPrivateReadClockBundle,
@@ -1585,21 +1753,16 @@ impl PmFreshStagedObservationPrivateReadRuntimeRoles {
                 user_ws,
                 custody,
             }),
-            Err(build) => {
-                // A failed connectivity build has already dropped both common
-                // role senders. The task deliberately remains alive until this
-                // explicit joined teardown consumes its armed custody.
-                Err(cleanup_staged_observation_after_assembly_failure(
-                    custody,
-                    shutdown_bounds,
-                    build,
-                )
-                .await)
-            }
+            Err(build) => Err(cleanup_staged_observation_after_assembly_failure(
+                custody,
+                shutdown_bounds,
+                build,
+            )
+            .await),
         }
     }
 
-    pub(super) fn into_parts(
+    fn into_parts(
         self,
     ) -> (
         PmFreshAuthenticatedRestRuntime,
@@ -1616,7 +1779,21 @@ async fn cleanup_staged_observation_after_assembly_failure(
     build: PmPrivateReadRuntimeError,
 ) -> PmPrivateReadRuntimeError {
     match custody.shutdown_bounded(shutdown_bounds).await {
-        Ok(_) => build,
+        Ok(outcome)
+            if outcome.shutdown_requested()
+                && !outcome.abort_requested()
+                && outcome.task_joined()
+                && outcome.task_completed_cleanly()
+                && outcome.credentials_dropped()
+                && outcome.staged_l2_files_removed() =>
+        {
+            build
+        }
+        Ok(outcome) => PmPrivateReadRuntimeError::StagedObservationCleanupAbnormal {
+            build: Box::new(build),
+            abort_requested: outcome.abort_requested(),
+            task_completed_cleanly: outcome.task_completed_cleanly(),
+        },
         Err(cleanup) => PmPrivateReadRuntimeError::StagedObservationCleanupFailed {
             build: Box::new(build),
             cleanup,
@@ -1738,6 +1915,37 @@ fn production_runtime_core(
     )
 }
 
+fn production_runtime_core_on_fixed_tls_peer_and_selected_local_egress(
+    profile: PmPrivateReadRuntimeProfile,
+    clocks: PmPrivateReadClockBundle,
+    fixed_tls_peer: PmFixedTlsPeerSelection,
+    selected_local_egress: PmLocalEgressSelection,
+    http_authority: FixedHttpAuthenticationRole,
+    user_authority: FixedUserWsAuthenticationRole,
+) -> Result<(PmAuthenticatedRestRuntimeCore, PmSameCredentialUserWsInput), PmPrivateReadRuntimeError>
+{
+    let owner = PmExternalProxyReadConnectivityOwner::
+        production_on_fixed_tls_peer_and_selected_local_egress(
+            profile.connect_timeout,
+            profile.request_timeout,
+            profile.scope,
+            profile.user_ws_bounds,
+            fixed_tls_peer,
+            selected_local_egress,
+            profile.signer,
+            profile.proxy_funder,
+            http_authority,
+            user_authority,
+        )?;
+    finish_runtime_core(
+        owner,
+        clocks,
+        profile.scope,
+        profile.signer,
+        profile.proxy_funder,
+    )
+}
+
 fn finish_runtime_core(
     owner: PmExternalProxyReadConnectivityOwner,
     clocks: PmPrivateReadClockBundle,
@@ -1807,7 +2015,8 @@ mod tests {
 
     use reap_pm_core::{PmMarketId, PmTick, U256};
     use reap_polymarket_live_adapter::{
-        PmProductClockOwner, PmPublicConnectivityOwner, PmPublicHttpConfig, PmPublicWsConfig,
+        PmProductClockOwner, PmPublicConnectivityOwner, PmPublicHttpConfig,
+        PmPublicObservationConnectivityOwner, PmPublicWsBounds, PmPublicWsConfig,
     };
     use reap_polymarket_wire::PmBookParserConfig;
     use tempfile::TempDir;
@@ -2112,6 +2321,12 @@ mod tests {
     fn fresh_staged_authority(
         local_set: &tokio::task::LocalSet,
     ) -> (TempDir, FreshStagedObservationAuthorityRoles) {
+        let (directory, owner) = fresh_credential_owner();
+        let roles = owner.spawn_staged_observation(local_set).unwrap();
+        (directory, roles)
+    }
+
+    fn fresh_credential_owner() -> (TempDir, FreshCredentialAuthorityOwner) {
         fn assert_send<T: Send>() {}
         assert_send::<FreshCredentialAuthorityOwner>();
 
@@ -2121,7 +2336,7 @@ mod tests {
         write_secret(directory.path(), "api-key", API_KEY);
         write_secret(directory.path(), "l2-secret", L2_SECRET);
         write_secret(directory.path(), "passphrase", PASSPHRASE);
-        let roles = FreshCredentialAuthorityOwner::load_from_protected_files(
+        let owner = FreshCredentialAuthorityOwner::load_from_protected_files(
             directory.path().to_owned(),
             "private-key".into(),
             "api-key".into(),
@@ -2129,10 +2344,8 @@ mod tests {
             "passphrase".into(),
             signer(),
         )
-        .unwrap()
-        .spawn_staged_observation(local_set)
         .unwrap();
-        (directory, roles)
+        (directory, owner)
     }
 
     fn user_ws_bounds() -> PmUserWsBounds {
@@ -2192,6 +2405,62 @@ mod tests {
             .into_roles()
             .into_roles();
         PmPrivateReadClockBundle::test_support_from_roles(server_time, private_read, user_ws)
+    }
+
+    fn selected_public_and_clocks() -> (PmPublicMarketWsRole, PmPrivateReadClockBundle) {
+        let http_peer =
+            PmFixedTlsPeerSelection::production("clob.polymarket.com", "8.8.8.8").unwrap();
+        let local =
+            PmLocalEgressSelection::production("pm0", "192.0.2.10".parse().unwrap()).unwrap();
+        let public_bounds = PmPublicWsBounds::new(
+            Duration::from_secs(1),
+            Duration::from_secs(20),
+            Duration::from_secs(2),
+            64 * 1_024,
+            0,
+            Duration::from_millis(1),
+            8,
+            ConnectionEpoch::new(1),
+        )
+        .unwrap();
+        let parser = PmBookParserConfig::new_condition_bound(
+            scope(),
+            PmTick::parse_decimal("0.01").unwrap(),
+            PmQuantity::parse_decimal("5").unwrap(),
+            false,
+        );
+        let roles = PmPublicObservationConnectivityOwner::
+            production_on_fixed_tls_peer_and_selected_local_egress(
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                parser,
+                PmPublicWsConfig::production(scope(), public_bounds).unwrap(),
+                http_peer,
+                local,
+                PmProductClockOwner::system(),
+            )
+            .unwrap()
+            .into_roles();
+        let (metadata, book, server_time, private_read, public_ws, user_ws, actor, okx) =
+            roles.into_roles();
+        drop((metadata, book, actor, okx));
+        (
+            public_ws,
+            PmPrivateReadClockBundle::test_support_from_roles(server_time, private_read, user_ws),
+        )
+    }
+
+    fn selected_http_peer() -> PmFixedTlsPeerSelection {
+        PmFixedTlsPeerSelection::production("clob.polymarket.com", "8.8.8.8").unwrap()
+    }
+
+    fn selected_ws_peer() -> PmFixedTlsPeerSelection {
+        PmFixedTlsPeerSelection::production("ws-subscriptions-clob.polymarket.com", "8.8.8.8")
+            .unwrap()
+    }
+
+    fn selected_local() -> PmLocalEgressSelection {
+        PmLocalEgressSelection::production("pm0", "192.0.2.10".parse().unwrap()).unwrap()
     }
 
     async fn recovery_runtime(mut plan: MockPlan) -> RecoveryTestRuntime {
@@ -2326,6 +2595,122 @@ mod tests {
                 assert!(outcome.staged_l2_files_removed());
                 for entry in ["private-key", "api-key", "l2-secret", "passphrase"] {
                     assert!(!directory.path().join(entry).exists());
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn selected_staged_observation_pairs_both_ws_roles_and_cleans_immediate_shutdown() {
+        let local_set = tokio::task::LocalSet::new();
+        local_set
+            .run_until(async {
+                let (directory, credential_owner) = fresh_credential_owner();
+                let (public_ws, clocks) = selected_public_and_clocks();
+                let bounds = CredentialAuthorityShutdownBounds::new(
+                    Duration::from_secs(2),
+                    Duration::from_secs(2),
+                )
+                .unwrap();
+                let profile = PmPrivateReadRuntimeProfile::new(
+                    Duration::from_secs(1),
+                    Duration::from_secs(2),
+                    scope(),
+                    user_ws_bounds(),
+                    signer(),
+                    proxy(),
+                );
+
+                let selected = PmFreshStagedSelectedObservationRoles::production_selected_internal(
+                    PmDeferredObservationAssemblyToken::test_support(),
+                    credential_owner,
+                    &local_set,
+                    profile,
+                    clocks,
+                    public_ws,
+                    selected_http_peer(),
+                    selected_ws_peer(),
+                    selected_local(),
+                    bounds,
+                )
+                .await
+                .unwrap();
+                assert!(
+                    selected
+                        .rest
+                        .core
+                        .marker
+                        .same_instance(&selected.same_authority)
+                );
+                let outcome = selected.shutdown_bounded(bounds).await.unwrap();
+                assert!(outcome.shutdown_requested());
+                assert!(!outcome.abort_requested());
+                assert!(outcome.task_joined());
+                assert!(outcome.task_completed_cleanly());
+                assert!(outcome.credentials_dropped());
+                assert!(outcome.staged_l2_files_removed());
+                for entry in ["private-key", "api-key", "l2-secret", "passphrase"] {
+                    assert!(!directory.path().join(entry).exists());
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn selected_scope_mismatch_is_prearm_and_leaves_protected_files_for_retry() {
+        let local_set = tokio::task::LocalSet::new();
+        local_set
+            .run_until(async {
+                let (directory, credential_owner) = fresh_credential_owner();
+                let (public_ws, clocks) = selected_public_and_clocks();
+                let mismatched_scope = PmWireScope::new(
+                    scope().condition(),
+                    PmMarketId::parse(
+                        "0x8888888888888888888888888888888888888888888888888888888888888888",
+                    )
+                    .unwrap(),
+                    PmTokenId::new(U256::from_u64(4_321)).unwrap(),
+                );
+                let profile = PmPrivateReadRuntimeProfile::new(
+                    Duration::from_secs(1),
+                    Duration::from_secs(2),
+                    mismatched_scope,
+                    user_ws_bounds(),
+                    signer(),
+                    proxy(),
+                );
+                let bounds = CredentialAuthorityShutdownBounds::new(
+                    Duration::from_secs(2),
+                    Duration::from_secs(2),
+                )
+                .unwrap();
+
+                let result = PmFreshStagedSelectedObservationRoles::production_selected_internal(
+                    PmDeferredObservationAssemblyToken::test_support(),
+                    credential_owner,
+                    &local_set,
+                    profile,
+                    clocks,
+                    public_ws,
+                    selected_http_peer(),
+                    selected_ws_peer(),
+                    selected_local(),
+                    bounds,
+                )
+                .await;
+                assert!(matches!(
+                    result,
+                    Err(PmPrivateReadRuntimeError::Live(
+                        PmLiveAdapterError::InvalidConfiguration(
+                            "selected public and private observation scopes diverged"
+                        )
+                    ))
+                ));
+                for entry in ["private-key", "api-key", "l2-secret", "passphrase"] {
+                    assert!(
+                        directory.path().join(entry).exists(),
+                        "pre-arm rejection must leave protected {entry} available for retry"
+                    );
                 }
             })
             .await;

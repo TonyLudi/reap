@@ -76,9 +76,35 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
     let production = production_prefix(SELECTED_EGRESS);
     for required in [
         "CanonicalOnlinePolicyV2",
+        "canonical_config: CanonicalTrialConfig",
+        "canonical_config: config.clone()",
         "CanonicalReviewedProductionDestinationProfileV1",
         "verify_reviewed_production_destination_profile_v1(",
         "verification.authorization != OfflineAuthorizationState::DENIED",
+        "unattested_fresh_credential_directory: PathBuf",
+        "caller-supplied credential directory is explicitly unattested",
+        "does not bind the directory to the canonical credential",
+        "does not claim that the credential task",
+        "or positive-preflight tranche requires a separate reviewed slot-locator",
+        "generation is only an actor-lifecycle topology check",
+        "is not embedded in any selected HTTP/WS source fact",
+        "is not positive",
+        "provenance for a socket, observation, or authorization",
+        "const FRESH_PRIVATE_KEY_ENTRY: &str = \"private-key\";",
+        "const FRESH_API_KEY_ENTRY: &str = \"api-key\";",
+        "const FRESH_L2_SECRET_ENTRY: &str = \"l2-secret\";",
+        "const FRESH_PASSPHRASE_ENTRY: &str = \"passphrase\";",
+        "PmMarketId::parse(&value.market.question_id)",
+        "PmTokenId::new(",
+        "PmWireScope::new(condition, market, token)",
+        "PmTick::parse_decimal(&value.order.tick)",
+        "PmQuantity::parse_decimal(&value.order.minimum_order_size)",
+        "value.account.chain_id != 137",
+        "value.account.signature_type != 1",
+        "signer.as_core() == proxy_funder",
+        "PmBookParserConfig::new_condition_bound(",
+        ".maximum_preflight_observation_age_ms",
+        ".min(online_policy.value().maximum_observation_age_ms)",
         "PmLinuxEgressLocalFactCustody::capture(",
         ".revalidate_for_current_runtime(",
         "PmLocalEgressSelection::production(",
@@ -90,25 +116,49 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
         "PmClobLivenessHealthHttpRole::production_on_fixed_tls_peer_and_selected_local_egress(",
         "PmPolygonAuthorizationSource::production_on_fixed_tls_peer_and_selected_local_egress(",
         "PmDataApiCurrentPositionSource::production_on_fixed_tls_peer_and_selected_local_egress(",
+        "PmPublicWsBounds::new(",
+        "PmUserWsBounds::new(",
+        "MAX_PUBLIC_WS_FRAME_BYTES",
+        "MAX_PM_LIVE_BODY_BYTES",
+        "PmPublicWsConfig::production(scope, public_ws_bounds)",
+        "PmPublicObservationWithDeferredMutationClockOwner::",
+        "production_on_fixed_tls_peer_and_selected_local_egress(",
+        "PmProductClockOwner::system()",
+        "PmDeferredObservationRuntimeRoles::from_owner(observation_owner)",
+        "FreshCredentialAuthorityOwner::load_from_protected_files(",
+        "FRESH_PRIVATE_KEY_ENTRY.to_owned()",
+        "FRESH_API_KEY_ENTRY.to_owned()",
+        "FRESH_L2_SECRET_ENTRY.to_owned()",
+        "FRESH_PASSPHRASE_ENTRY.to_owned()",
+        ".production_selected(",
+        "reviewed_fixed_tls_peers.clob_https.clone()",
+        "reviewed_fixed_tls_peers.clob_websocket_wss.clone()",
+        "selected_local_egress.clone()",
+        "DEFAULT_AUTHORITY_SHUTDOWN_BOUNDS",
         "thread::Builder::new()",
         ".name(SELECTED_EGRESS_ACTOR_THREAD_NAME.to_owned())",
         "TokioRuntimeBuilder::new_current_thread()",
         "let local_set = LocalSet::new();",
         "let generation = Rc::new(PmSelectedEgressActorGeneration::current());",
+        "cold.assemble(&local_set)",
         "local_set.spawn_local(run_selected_egress_actor(",
         "enum PmSelectedEgressActorCommand {\n    Shutdown,\n}",
         "pub(super) struct PmDeniedSelectedEgressActorSupervisor",
         "pub(super) fn shutdown_and_join(",
         "impl Drop for PmDeniedSelectedEgressActorSupervisor",
         "std::process::abort();",
-        "_local_egress_custody: PmLinuxEgressLocalFactCustody",
-        "_selected_http_bundle: PmFixedSelectedEgressHttpBundle",
-        "_reviewed_fixed_tls_peers: PmReviewedFixedTlsPeerBundle",
-        "_online_policy: CanonicalOnlinePolicyV2",
-        "_online_authorization: CanonicalOnlineAuthorizationV2",
-        "_reviewed_destination_profile: CanonicalReviewedProductionDestinationProfileV1",
-        "The WebSocket peer remains inert",
-        "startup makes no caller-time or\n//! current-time freshness claim",
+        "struct PmSelectedActorTaskShutdownProof",
+        "shutdown_requested: bool",
+        "abort_requested: bool",
+        "task_joined: bool",
+        "task_completed_cleanly: bool",
+        "credentials_dropped: bool",
+        "staged_files_removed: bool",
+        "generation_revalidated: bool",
+        "pub(super) struct PmDeniedSelectedEgressShutdownEvidence",
+        "PmDeniedSelectedEgressActorError::CredentialShutdownAbnormal",
+        "A runtime-construction failure is therefore pre-arm",
+        "intentionally leaves all protected staged files available for retry",
     ] {
         assert!(
             production.contains(required),
@@ -122,6 +172,17 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
     assert!(
         SELECTED_EGRESS.contains("failing_task_entry_returns_startup_error_without_a_supervisor")
     );
+    for regression in [
+        "post_assembly_generation_mismatch_cleans_before_startup_error",
+        "ready_delivery_failure_cleans_assembled_resources",
+        "actor_cleanup_error_precedes_shutdown_delivery_error",
+        "shutdown_proof_is_send_and_payload_free",
+    ] {
+        assert!(
+            SELECTED_EGRESS.contains(regression),
+            "missing `{regression}`"
+        );
+    }
 
     let startup_inputs = between(
         production,
@@ -134,11 +195,36 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
     let position_scope = startup_inputs.find("let proxy_funder =").unwrap();
     assert!(profile_verification < position_scope);
     for owned in [
+        "config: &CanonicalTrialConfig",
         "online_policy: CanonicalOnlinePolicyV2",
         "online_authorization: CanonicalOnlineAuthorizationV2",
         "reviewed_destination_profile: CanonicalReviewedProductionDestinationProfileV1",
+        "unattested_fresh_credential_directory: &Path",
     ] {
         assert!(startup_inputs.contains(owned));
+    }
+    for forbidden_caller_choice in [
+        "private_key_entry:",
+        "api_key_entry:",
+        "l2_secret_entry:",
+        "passphrase_entry:",
+        "fixed_clob_http_peer:",
+        "fixed_clob_ws_peer:",
+        "selected_local_egress:",
+        "connect_timeout:",
+        "request_timeout:",
+        "user_ws_bounds:",
+        "parser_config:",
+    ] {
+        let spawn_signature = between(
+            production,
+            "pub(super) fn spawn(",
+            ") -> Result<Self, PmDeniedSelectedEgressActorError>",
+        );
+        assert!(
+            !spawn_signature.contains(forbidden_caller_choice),
+            "selected actor launch gained caller choice `{forbidden_caller_choice}`",
+        );
     }
 
     let fixed_peers = between(
@@ -165,7 +251,7 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
         "destinations.data_api_https",
         "destinations.polygon_rpc_https",
         "destinations.clob_websocket_wss",
-        "_clob_websocket_wss: clob_websocket_wss",
+        "clob_websocket_wss,",
     ] {
         assert!(
             fixed_peers.contains(reviewed_role),
@@ -176,7 +262,7 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
     let http_bundle = between(
         production,
         "impl PmFixedSelectedEgressHttpBundle {",
-        "struct PmDeniedSelectedEgressActorResources",
+        "struct PmSelectedEgressActorGeneration",
     );
     assert_eq!(
         http_bundle
@@ -189,8 +275,8 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
 
     let setup = between(
         production,
-        "fn build_production_resources(",
-        "fn spawn_selected_egress_actor_thread<",
+        "fn build_production_cold_resources(",
+        "impl PmSelectedEgressActorColdResources for PmDeniedSelectedEgressActorColdResources",
     );
     let capture = setup
         .find("PmLinuxEgressLocalFactCustody::capture(")
@@ -203,50 +289,67 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
     let clients = setup
         .find("PmFixedSelectedEgressHttpBundle::build(")
         .unwrap();
+    let public_observation = setup
+        .find("PmPublicObservationWithDeferredMutationClockOwner::")
+        .unwrap();
+    let credential_load = setup
+        .find("FreshCredentialAuthorityOwner::load_from_protected_files(")
+        .unwrap();
     assert!(
         capture < revalidate
             && revalidate < selection
             && selection < reviewed_peers
             && reviewed_peers < clients
+            && clients < public_observation
+            && public_observation < credential_load
     );
     assert_eq!(setup.matches(".revalidate_for_current_runtime(").count(), 2);
     let post_constructor_revalidation = setup.rfind(".revalidate_for_current_runtime(").unwrap();
-    let resources_return = setup
-        .find("Ok(PmDeniedSelectedEgressActorResources {")
-        .unwrap();
     assert!(clients < post_constructor_revalidation);
-    assert!(post_constructor_revalidation < resources_return);
+    assert!(post_constructor_revalidation < credential_load);
 
     let owned_resources = between(
         production,
         "struct PmDeniedSelectedEgressActorResources {",
-        "trait PmSelectedEgressActorResources",
+        "struct PmSelectedActorTaskShutdownProof",
     );
+    let selected_field = owned_resources
+        .find("selected_observation: PmFreshStagedSelectedObservationRoles")
+        .unwrap();
+    let inert_field = owned_resources
+        .find("inert_observation: PmInertDeferredObservationCustody")
+        .unwrap();
     let bundle_field = owned_resources
-        .find("_selected_http_bundle: PmFixedSelectedEgressHttpBundle")
+        .find("selected_http_bundle: PmFixedSelectedEgressHttpBundle")
         .unwrap();
     let peer_field = owned_resources
-        .find("_reviewed_fixed_tls_peers: PmReviewedFixedTlsPeerBundle")
+        .find("reviewed_fixed_tls_peers: PmReviewedFixedTlsPeerBundle")
         .unwrap();
     let selection_field = owned_resources
-        .find("_selected_local_egress: PmLocalEgressSelection")
+        .find("selected_local_egress: PmLocalEgressSelection")
         .unwrap();
     let custody_field = owned_resources
-        .find("_local_egress_custody: PmLinuxEgressLocalFactCustody")
+        .find("local_egress_custody: PmLinuxEgressLocalFactCustody")
         .unwrap();
     let authorization_field = owned_resources
-        .find("_online_authorization: CanonicalOnlineAuthorizationV2")
+        .find("online_authorization: CanonicalOnlineAuthorizationV2")
+        .unwrap();
+    let config_field = owned_resources
+        .find("canonical_config: CanonicalTrialConfig")
         .unwrap();
     let policy_field = owned_resources
-        .find("_online_policy: CanonicalOnlinePolicyV2")
+        .find("online_policy: CanonicalOnlinePolicyV2")
         .unwrap();
     let profile_field = owned_resources
-        .find("_reviewed_destination_profile: CanonicalReviewedProductionDestinationProfileV1")
+        .find("reviewed_destination_profile: CanonicalReviewedProductionDestinationProfileV1")
         .unwrap();
+    assert!(selected_field < inert_field);
+    assert!(inert_field < bundle_field);
     assert!(bundle_field < peer_field);
     assert!(peer_field < selection_field);
     assert!(selection_field < custody_field);
-    assert!(custody_field < authorization_field);
+    assert!(custody_field < config_field);
+    assert!(config_field < authorization_field);
     assert!(authorization_field < policy_field);
     assert!(policy_field < profile_field);
 
@@ -268,18 +371,20 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
         "fn run_selected_egress_actor_thread<",
         "async fn run_selected_egress_actor<",
     );
-    let resources = thread_run.find("let resources = setup()?").unwrap();
+    let generation = thread_run
+        .find("let generation = Rc::new(PmSelectedEgressActorGeneration::current());")
+        .unwrap();
     let runtime = thread_run
         .find("TokioRuntimeBuilder::new_current_thread()")
         .unwrap();
     let local_set = thread_run.find("let local_set = LocalSet::new();").unwrap();
-    let generation = thread_run
-        .find("let generation = Rc::new(PmSelectedEgressActorGeneration::current());")
+    let cold = thread_run
+        .find("let cold = setup(Rc::clone(&generation))?")
         .unwrap();
+    let assembly = thread_run.find("cold.assemble(&local_set)").unwrap();
     let task = thread_run.find("local_set.spawn_local(").unwrap();
-    assert!(
-        resources < runtime && runtime < local_set && local_set < generation && generation < task
-    );
+    assert!(generation < runtime && runtime < local_set && local_set < cold);
+    assert!(cold < assembly && assembly < task);
     assert_eq!(
         production
             .matches("Rc::new(PmSelectedEgressActorGeneration")
@@ -293,7 +398,7 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
         "struct PmSelectedEgressActorState<R> {",
         "enum PmSelectedEgressActorCommand",
     );
-    let state_resources = actor_state.find("_resources: R").unwrap();
+    let state_resources = actor_state.find("resources: R").unwrap();
     let state_generation = actor_state
         .find("generation: Rc<PmSelectedEgressActorGeneration>")
         .unwrap();
@@ -303,30 +408,86 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
         .split_once("async fn run_selected_egress_actor<")
         .map(|(_, actor_task)| actor_task)
         .expect("selected actor task must remain in the production prefix");
-    let generation_revalidate = actor_task.find("state.generation.revalidate()?").unwrap();
-    let entered = actor_task
-        .find("state._resources.on_actor_task_enter()?")
-        .unwrap();
+    let generation_revalidate = actor_task.find("generation.revalidate().is_err()").unwrap();
+    let entered = actor_task.find("resources.on_actor_task_enter()").unwrap();
     let ready = actor_task.find(".send(Ok(()))").unwrap();
     let receive = actor_task.find("commands.recv().await").unwrap();
     assert!(generation_revalidate < entered && entered < ready && ready < receive);
+    assert_eq!(
+        actor_task[..ready]
+            .matches("generation.revalidate().is_err()")
+            .count(),
+        2
+    );
     assert!(!thread_run.contains(".send(Ok(()))"));
+
+    let assembly = between(
+        production,
+        "impl PmSelectedEgressActorColdResources for PmDeniedSelectedEgressActorColdResources",
+        "fn map_selected_observation_error(",
+    );
+    let pair = assembly.find(".production_selected(").unwrap();
+    let final_revalidation = assembly
+        .find("local_egress_custody.revalidate_for_current_runtime(")
+        .unwrap();
+    let cleanup = assembly
+        .find("shutdown_selected_after_failure(selected_observation, primary).await")
+        .unwrap();
+    assert!(pair < final_revalidation && final_revalidation < cleanup);
+    assert!(!assembly[pair..].contains(".await?"));
+
+    let shutdown = between(
+        production,
+        "impl PmSelectedEgressActorResources for PmDeniedSelectedEgressActorResources",
+        "fn spawn_selected_egress_actor_thread<",
+    );
+    let drop_inert = shutdown.find("drop(inert_observation);").unwrap();
+    let credential_shutdown = shutdown
+        .find("selected_observation\n            .shutdown_bounded")
+        .unwrap();
+    let drop_clients = shutdown.find("drop(selected_http_bundle);").unwrap();
+    let drop_peers = shutdown.find("drop(reviewed_fixed_tls_peers);").unwrap();
+    let drop_local = shutdown.find("drop(selected_local_egress);").unwrap();
+    let drop_facts = shutdown.find("drop(local_egress_custody);").unwrap();
+    let drop_config = shutdown.find("drop(canonical_config);").unwrap();
+    assert!(drop_inert < credential_shutdown);
+    assert!(credential_shutdown < drop_clients);
+    assert!(drop_clients < drop_peers && drop_peers < drop_local && drop_local < drop_facts);
+    assert!(drop_facts < drop_config);
+
+    let supervisor_shutdown = between(
+        production,
+        "pub(super) fn shutdown_and_join(",
+        "impl Drop for PmDeniedSelectedEgressActorSupervisor",
+    );
+    let join = supervisor_shutdown.find(".join();").unwrap();
+    let actor_result = supervisor_shutdown.find("let actor = joined").unwrap();
+    let clean_check = supervisor_shutdown
+        .find("if !actor.clean_terminal()")
+        .unwrap();
+    let delivery_check = supervisor_shutdown.find("if !shutdown_delivered").unwrap();
+    assert!(join < actor_result && actor_result < clean_check && clean_check < delivery_check);
 
     for forbidden in [
         "PmSelectedEgressGeoblockObservation",
         "PmPhaseAOnlinePreflightWindow",
         "PmDeniedOnlinePreflightCandidate",
         "PmPhaseAOnlineRuntimeBurnedV2",
-        "PmReadOnlyCredentialInput",
-        "PmCredentialAuthoritySupervisor",
-        "PmClobWebSocket",
-        "PmUserWebSocket",
-        "PmPublicBookWebSocket",
-        "reap_polymarket_auth",
+        "credential_slot_id:",
+        "credential_slot_fingerprint:",
+        "remote_api_key_owner:",
         "hmac::",
         "PlaceHmacAdmission",
+        "CancelHmacAdmission",
         "AuthenticatedPlaceRequest",
+        "AuthenticatedOwnedCancelRequest",
         "PmRetainedPlaceRequest",
+        "PmProductionSelectedPlaceCancelTimeOwner",
+        "from_deferred_clock",
+        ".run(",
+        ".collect(",
+        ".seal(",
+        ".request(",
         "POST /order",
         "DELETE /order",
         ".status_observation(",
@@ -347,6 +508,10 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
         "fn position(",
         "fn client(",
         "fn config(",
+        "fn into_parts(",
+        "pub(super) fn rest(",
+        "pub(super) fn public_ws(",
+        "pub(super) fn user_ws(",
         "impl Clone for PmDeniedSelectedEgressActorSupervisor",
         "impl Clone for PmDeniedSelectedEgressActorResources",
     ] {
@@ -356,6 +521,13 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
         );
     }
     assert!(!CURRENT_RUNTIME.contains("impl<T> PmSelectedEgressGeoblockObservation<T>"));
+    assert_eq!(production.matches(".production_selected(").count(), 1);
+    assert_eq!(
+        production
+            .matches("FreshCredentialAuthorityOwner::load_from_protected_files(")
+            .count(),
+        1
+    );
     assert!(MANIFEST.contains("reap-polymarket-egress-binding.workspace = true"));
     assert!(!MANIFEST.contains("reqwest"));
 }
@@ -1326,12 +1498,90 @@ fn staged_fresh_private_reads_are_actor_local_signer_bound_and_cleanup_on_build_
         "// BEGIN STAGED_OBSERVATION_PRIVATE_READ_ROLES",
         "// END STAGED_OBSERVATION_PRIVATE_READ_ROLES",
     );
+    let selected = between(
+        staged,
+        "pub(super) struct PmFreshStagedSelectedObservationRoles",
+        "impl fmt::Debug for PmFreshStagedSelectedObservationRoles",
+    );
     for required in [
-        "pub(super) struct PmFreshStagedObservationPrivateReadRuntimeRoles",
+        "rest: PmFreshAuthenticatedRestRuntime",
+        "public_ws: PmProductionSelectedPublicWsRole",
+        "user_ws: PmProductionSelectedUserWsRole",
+        "user_ws_activity: PmUserWsActivityView",
+        "same_authority: PmSameCredentialAuthorityMarker",
+        "custody: PmObservingFreshCredentialCustody",
+        "_configured_scope: PmWireScope",
+        "pub(super) async fn production_selected_internal(",
+        "_assembly: PmDeferredObservationAssemblyToken",
+        "credential_owner: FreshCredentialAuthorityOwner",
+        "local_set: &tokio::task::LocalSet",
+        "fixed_clob_http_peer: PmFixedTlsPeerSelection",
+        "fixed_clob_ws_peer: PmFixedTlsPeerSelection",
+        "selected_local_egress: PmLocalEgressSelection",
+        "if public_ws.scope() != profile.scope",
+        "assembly token arrives only from",
+        "already rejected a non-production public WebSocket configuration",
+        "full scope is nevertheless rechecked here before arming secrets",
+        "credential_owner.spawn_staged_observation(local_set)",
+        "let (http_authority, user_authority, loaded_signer, custody)",
+        "if loaded_signer != profile.signer",
+        "production_runtime_core_on_fixed_tls_peer_and_selected_local_egress(",
+        "let (user_ws, user_ws_activity, same_authority) = user_ws.into_parts();",
+        "PmProductionSelectedWsOwner::new(",
+        "let (public_ws, user_ws) = selected_ws.into_roles();",
+        "pub(super) async fn shutdown_bounded(",
+        "CredentialAuthorityShutdownOutcome",
+        "drop(rest);",
+        "drop(public_ws);",
+        "drop(user_ws);",
+        "drop(user_ws_activity);",
+        "drop(same_authority);",
+        "custody.shutdown_bounded(bounds).await",
+    ] {
+        assert!(
+            selected.contains(required),
+            "selected staged private reads lost `{required}`"
+        );
+    }
+    assert!(
+        !selected.contains('?'),
+        "selected staged assembly must not drop armed custody through `?`",
+    );
+    let scope_check = selected
+        .find("if public_ws.scope() != profile.scope")
+        .unwrap();
+    let credential_spawn = selected
+        .find("credential_owner.spawn_staged_observation(local_set)")
+        .unwrap();
+    let selected_http = selected
+        .find("production_runtime_core_on_fixed_tls_peer_and_selected_local_egress(")
+        .unwrap();
+    let selected_ws = selected.find("PmProductionSelectedWsOwner::new(").unwrap();
+    assert!(scope_check < credential_spawn);
+    assert!(credential_spawn < selected_http && selected_http < selected_ws);
+
+    let selected_shutdown = selected
+        .split_once("pub(super) async fn shutdown_bounded(")
+        .map(|(_, shutdown)| shutdown)
+        .unwrap();
+    let drop_rest = selected_shutdown.find("drop(rest);").unwrap();
+    let drop_public = selected_shutdown.find("drop(public_ws);").unwrap();
+    let drop_user = selected_shutdown.find("drop(user_ws);").unwrap();
+    let drop_activity = selected_shutdown.find("drop(user_ws_activity);").unwrap();
+    let drop_marker = selected_shutdown.find("drop(same_authority);").unwrap();
+    let shutdown = selected_shutdown
+        .find("custody.shutdown_bounded(bounds).await")
+        .unwrap();
+    assert!(drop_rest < drop_public);
+    assert!(drop_public < drop_user && drop_user < drop_activity && drop_activity < drop_marker);
+    assert!(drop_marker < shutdown);
+
+    for required in [
+        "#[cfg(test)]\nstruct PmFreshStagedObservationPrivateReadRuntimeRoles",
         "rest: PmFreshAuthenticatedRestRuntime",
         "user_ws: PmSameCredentialUserWsInput",
         "custody: PmObservingFreshCredentialCustody",
-        "pub(super) async fn production(",
+        "async fn production(",
         "authority: FreshStagedObservationAuthorityRoles",
         "shutdown_bounds: CredentialAuthorityShutdownBounds",
         "let (http_authority, user_authority, loaded_signer, custody)",
@@ -1342,17 +1592,14 @@ fn staged_fresh_private_reads_are_actor_local_signer_bound_and_cleanup_on_build_
         "cleanup_staged_observation_after_assembly_failure(",
         "custody.shutdown_bounded(shutdown_bounds).await",
         "PmPrivateReadRuntimeError::StagedObservationCleanupFailed",
-        "pub(super) fn into_parts(",
+        "PmPrivateReadRuntimeError::StagedObservationCleanupAbnormal",
+        "fn into_parts(",
     ] {
         assert!(
             staged.contains(required),
             "staged private reads lost `{required}`"
         );
     }
-    assert!(
-        !staged.contains('?'),
-        "staged assembly must not unwind by dropping armed custody through `?`",
-    );
     for forbidden in [
         "FreshPlaceAuthenticationOnce",
         "ExactOwnedCancelAuthenticationRole",
@@ -1374,10 +1621,34 @@ fn staged_fresh_private_reads_are_actor_local_signer_bound_and_cleanup_on_build_
         "cancel_sender",
     ] {
         assert!(
-            !staged.contains(forbidden),
+            !selected.contains(forbidden),
             "staged private-read surface gained forbidden `{forbidden}` authority",
         );
     }
+    for forbidden in [
+        "fn into_parts(",
+        "fn rest(",
+        "fn public_ws(",
+        "fn user_ws(",
+        "fn source(",
+        "fn collect(",
+        "fn run(",
+        "from_deferred_clock",
+        "PmProductionSelectedPlaceCancelTimeOwner",
+        "PlaceHmacAdmission",
+        "CancelHmacAdmission",
+        "PlaceAuthorityRequest",
+        "CancelAuthorityRequest",
+    ] {
+        assert!(
+            !selected.contains(forbidden),
+            "selected staged carrier gained escape `{forbidden}`",
+        );
+    }
+
+    assert!(PRIVATE_READS.contains(
+        "#[cfg(test)]\nuse super::super::authority::FreshStagedObservationAuthorityRoles;"
+    ));
 
     let authority_roles = between(
         AUTHORITY,
@@ -1409,17 +1680,95 @@ fn staged_fresh_private_reads_are_actor_local_signer_bound_and_cleanup_on_build_
     assert!(observing_task.contains("None => common_open = false"));
     assert!(observing_task.contains("drop(credentials);\n    drop(signer);"));
     assert!(PRIVATE_READS.contains("assert_send::<FreshCredentialAuthorityOwner>();"));
-    assert!(PRIVATE_READS.contains(".spawn_staged_observation(local_set)"));
+    assert!(PRIVATE_READS.contains("credential_owner.spawn_staged_observation(local_set)"));
     for regression in [
         "staged_production_builds_real_same_credential_rest_and_user_roles",
         "failed_staged_production_build_joins_and_removes_all_four_files",
         "staged_production_rejects_profile_signer_mismatch_then_cleans_up",
+        "selected_staged_observation_pairs_both_ws_roles_and_cleans_immediate_shutdown",
+        "selected_scope_mismatch_is_prearm_and_leaves_protected_files_for_retry",
     ] {
         assert!(PRIVATE_READS.contains(regression), "missing `{regression}`");
         assert!(PRIVATE_READS.contains(&format!(
             "#[tokio::test(flavor = \"current_thread\")]\n    async fn {regression}"
         )));
     }
+}
+
+#[test]
+fn deferred_public_observation_handoff_is_whole_owner_token_gated_and_inert() {
+    let production = production_prefix(PUBLIC_BOOK);
+    let handoff = between(
+        production,
+        "// BEGIN SELECTED_DEFERRED_OBSERVATION_HANDOFF",
+        "// END SELECTED_DEFERRED_OBSERVATION_HANDOFF",
+    );
+    for required in [
+        "pub(super) struct PmDeferredObservationRuntimeRoles",
+        "public_ws: PmPublicMarketWsRole",
+        "private_read_clocks: PmPrivateReadClockBundle",
+        "inert: PmInertDeferredObservationCustody",
+        "pub(super) struct PmDeferredObservationAssemblyToken",
+        "_private: ()",
+        "owner: PmPublicObservationWithDeferredMutationClockOwner",
+        "let (roles, deferred_mutation_clock) = owner.into_parts();",
+        "PmPrivateReadClockBundle {",
+        "pub(super) async fn production_selected(",
+        "PmFreshStagedSelectedObservationRoles::production_selected_internal(",
+        "PmDeferredObservationAssemblyToken { _private: () }",
+        "pub(super) struct PmInertDeferredObservationCustody",
+        "_metadata_http: PmPublicMetadataHttpRole",
+        "_book_http: PmPublicHttpRole",
+        "_actor_clock: PmActorProductClock",
+        "_okx_clock: PmOkxProductClock",
+        "_deferred_mutation_clock: PmDeferredMutationClockCapsule",
+        "_configured_scope: reap_polymarket_wire::PmWireScope",
+        "no projection, source, sampling, promotion, or",
+    ] {
+        assert!(handoff.contains(required), "handoff lost `{required}`");
+    }
+    let runtime_roles = between(
+        handoff,
+        "pub(super) struct PmDeferredObservationRuntimeRoles",
+        "impl fmt::Debug for PmDeferredObservationRuntimeRoles",
+    );
+    assert_eq!(
+        runtime_roles
+            .matches("production_selected_internal(")
+            .count(),
+        1
+    );
+    assert!(!runtime_roles.contains('?'));
+    for forbidden in [
+        "pub(super) fn into_parts(",
+        "pub(super) fn public_ws(",
+        "pub(super) fn private_read_clocks(",
+        "fn from_deferred_clock(",
+        "PmProductionSelectedPlaceCancelTimeOwner",
+        "PmPlaceMutationTimeOwner",
+        "PmCancelMutationTimeOwner",
+        "fn promote(",
+        "fn source(",
+        "fn run(",
+    ] {
+        assert!(
+            !runtime_roles.contains(forbidden),
+            "deferred handoff gained escape `{forbidden}`",
+        );
+    }
+    let inert = between(
+        handoff,
+        "pub(super) struct PmInertDeferredObservationCustody",
+        "impl fmt::Debug for PmInertDeferredObservationCustody",
+    );
+    assert!(!inert.contains("impl PmInertDeferredObservationCustody"));
+    assert!(!production_prefix(SELECTED_EGRESS).contains("PmDeferredMutationClockCapsule"));
+    assert_eq!(
+        production_prefix(SELECTED_EGRESS)
+            .matches(".production_selected(")
+            .count(),
+        1,
+    );
 }
 
 #[test]
