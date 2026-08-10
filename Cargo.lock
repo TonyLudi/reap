@@ -1548,6 +1548,7 @@ dependencies = [
  "reap-polymarket-adapter",
  "reap-polymarket-auth",
  "reap-polymarket-chain-source",
+ "reap-polymarket-egress-binding",
  "reap-polymarket-live-adapter",
  "reap-polymarket-public-source",
  "reap-polymarket-wire",

@@ -19,6 +19,7 @@ reap-pm-state.workspace = true
 reap-polymarket-adapter.workspace = true
 reap-polymarket-auth.workspace = true
 reap-polymarket-chain-source.workspace = true
+reap-polymarket-egress-binding.workspace = true
 reap-polymarket-live-adapter.workspace = true
 reap-polymarket-public-source.workspace = true
 reap-polymarket-wire.workspace = true

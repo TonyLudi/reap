@@ -1,5 +1,7 @@
 const AUTHORITY: &str = include_str!("../src/controlled_trial/authority.rs");
 const CURRENT_RUNTIME: &str = include_str!("../src/controlled_trial/runtime/current_runtime.rs");
+const SELECTED_EGRESS: &str =
+    include_str!("../src/controlled_trial/runtime/current_runtime/selected_egress.rs");
 const LINUX_EGRESS_LOCAL_FACTS: &str =
     include_str!("../src/controlled_trial/runtime/linux_egress_local_facts.rs");
 const ONLINE_PREFLIGHT: &str = include_str!("../src/controlled_trial/runtime/online_preflight.rs");
@@ -25,6 +27,8 @@ fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
 #[test]
 fn runtime_is_binary_private_read_only_evidence_without_a_transport_escape() {
     assert!(RUNTIME_MOD.contains("mod current_runtime;"));
+    assert!(CURRENT_RUNTIME.contains("mod selected_egress;"));
+    assert!(!CURRENT_RUNTIME.contains("pub mod selected_egress;"));
     assert!(RUNTIME_MOD.contains("mod linux_egress_local_facts;"));
     assert!(RUNTIME_MOD.contains("mod online_preflight;"));
     assert!(RUNTIME_MOD.contains("mod private_reads;"));
@@ -34,6 +38,7 @@ fn runtime_is_binary_private_read_only_evidence_without_a_transport_escape() {
 
     for (name, source) in [
         ("current runtime", production_prefix(CURRENT_RUNTIME)),
+        ("selected egress", production_prefix(SELECTED_EGRESS)),
         (
             "Linux local-egress facts",
             production_prefix(LINUX_EGRESS_LOCAL_FACTS),
@@ -64,6 +69,177 @@ fn runtime_is_binary_private_read_only_evidence_without_a_transport_escape() {
             );
         }
     }
+}
+
+#[test]
+fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
+    let production = production_prefix(SELECTED_EGRESS);
+    for required in [
+        "PmLinuxEgressLocalFactCustody::capture(",
+        ".revalidate_for_current_runtime(",
+        "PmLocalEgressSelection::production(",
+        "PmGeoblockHttpConfig::production_on_selected_local_egress(",
+        "PmStatusAnnouncementHttpRole::production_on_selected_local_egress(",
+        "PmClobLivenessHealthHttpRole::production_on_selected_local_egress(",
+        "PmPolygonAuthorizationSource::production_on_selected_local_egress(selection)",
+        "PmDataApiCurrentPositionSource::production_on_selected_local_egress(",
+        "thread::Builder::new()",
+        ".name(SELECTED_EGRESS_ACTOR_THREAD_NAME.to_owned())",
+        "TokioRuntimeBuilder::new_current_thread()",
+        "let local_set = LocalSet::new();",
+        "let generation = Rc::new(PmSelectedEgressActorGeneration::current());",
+        "local_set.spawn_local(run_selected_egress_actor(",
+        "enum PmSelectedEgressActorCommand {\n    Shutdown,\n}",
+        "pub(super) struct PmDeniedSelectedEgressActorSupervisor",
+        "pub(super) fn shutdown_and_join(",
+        "impl Drop for PmDeniedSelectedEgressActorSupervisor",
+        "std::process::abort();",
+        "_local_egress_custody: PmLinuxEgressLocalFactCustody",
+        "_selected_http_bundle: PmFixedSelectedEgressHttpBundle",
+    ] {
+        assert!(
+            production.contains(required),
+            "selected actor lost `{required}`"
+        );
+    }
+    assert!(
+        SELECTED_EGRESS
+            .contains("current_thread_local_set_actor_is_tid_confined_and_shutdown_is_joined")
+    );
+    assert!(
+        SELECTED_EGRESS.contains("failing_task_entry_returns_startup_error_without_a_supervisor")
+    );
+
+    let setup = between(
+        production,
+        "fn build_production_resources(",
+        "fn spawn_selected_egress_actor_thread<",
+    );
+    let capture = setup
+        .find("PmLinuxEgressLocalFactCustody::capture(")
+        .unwrap();
+    let revalidate = setup.find(".revalidate_for_current_runtime(").unwrap();
+    let selection = setup.find("PmLocalEgressSelection::production(").unwrap();
+    let clients = setup
+        .find("PmFixedSelectedEgressHttpBundle::build(")
+        .unwrap();
+    assert!(capture < revalidate && revalidate < selection && selection < clients);
+    assert_eq!(setup.matches(".revalidate_for_current_runtime(").count(), 2);
+    let post_constructor_revalidation = setup.rfind(".revalidate_for_current_runtime(").unwrap();
+    let resources_return = setup
+        .find("Ok(PmDeniedSelectedEgressActorResources {")
+        .unwrap();
+    assert!(clients < post_constructor_revalidation);
+    assert!(post_constructor_revalidation < resources_return);
+
+    let owned_resources = between(
+        production,
+        "struct PmDeniedSelectedEgressActorResources {",
+        "trait PmSelectedEgressActorResources",
+    );
+    let bundle_field = owned_resources
+        .find("_selected_http_bundle: PmFixedSelectedEgressHttpBundle")
+        .unwrap();
+    let selection_field = owned_resources
+        .find("_selected_local_egress: PmLocalEgressSelection")
+        .unwrap();
+    let custody_field = owned_resources
+        .find("_local_egress_custody: PmLinuxEgressLocalFactCustody")
+        .unwrap();
+    let authorization_field = owned_resources
+        .find("_online_authorization: CanonicalOnlineAuthorizationV2")
+        .unwrap();
+    assert!(bundle_field < selection_field);
+    assert!(selection_field < custody_field);
+    assert!(custody_field < authorization_field);
+
+    let thread_run = between(
+        production,
+        "fn run_selected_egress_actor_thread<",
+        "async fn run_selected_egress_actor<",
+    );
+    let resources = thread_run.find("let resources = setup()?").unwrap();
+    let runtime = thread_run
+        .find("TokioRuntimeBuilder::new_current_thread()")
+        .unwrap();
+    let local_set = thread_run.find("let local_set = LocalSet::new();").unwrap();
+    let generation = thread_run
+        .find("let generation = Rc::new(PmSelectedEgressActorGeneration::current());")
+        .unwrap();
+    let task = thread_run.find("local_set.spawn_local(").unwrap();
+    assert!(
+        resources < runtime && runtime < local_set && local_set < generation && generation < task
+    );
+    assert_eq!(
+        production
+            .matches("Rc::new(PmSelectedEgressActorGeneration")
+            .count(),
+        1
+    );
+    assert!(!production.contains("Rc::strong_count"));
+
+    let actor_state = between(
+        production,
+        "struct PmSelectedEgressActorState<R> {",
+        "enum PmSelectedEgressActorCommand",
+    );
+    let state_resources = actor_state.find("_resources: R").unwrap();
+    let state_generation = actor_state
+        .find("generation: Rc<PmSelectedEgressActorGeneration>")
+        .unwrap();
+    assert!(state_resources < state_generation);
+
+    let actor_task = production
+        .split_once("async fn run_selected_egress_actor<")
+        .map(|(_, actor_task)| actor_task)
+        .expect("selected actor task must remain in the production prefix");
+    let generation_revalidate = actor_task.find("state.generation.revalidate()?").unwrap();
+    let entered = actor_task
+        .find("state._resources.on_actor_task_enter()?")
+        .unwrap();
+    let ready = actor_task.find(".send(Ok(()))").unwrap();
+    let receive = actor_task.find("commands.recv().await").unwrap();
+    assert!(generation_revalidate < entered && entered < ready && ready < receive);
+    assert!(!thread_run.contains(".send(Ok(()))"));
+
+    for forbidden in [
+        "PmSelectedEgressGeoblockObservation",
+        "PmPhaseAOnlinePreflightWindow",
+        "PmDeniedOnlinePreflightCandidate",
+        "PmPhaseAOnlineRuntimeBurnedV2",
+        "PmReadOnlyCredentialInput",
+        "PmCredentialAuthoritySupervisor",
+        "reap_polymarket_auth",
+        "hmac::",
+        "PlaceHmacAdmission",
+        "AuthenticatedPlaceRequest",
+        "PmRetainedPlaceRequest",
+        "POST /order",
+        "DELETE /order",
+        ".status_observation(",
+        ".production_status_observation(",
+        ".ordered_announcement_observation(",
+        ".production_liveness_health_observation(",
+        ".finalized_authorization_cut(",
+        ".production_current_position_observation(",
+        "fn geoblock(",
+        "fn status(",
+        "fn health(",
+        "fn polygon(",
+        "fn position(",
+        "fn client(",
+        "fn config(",
+        "impl Clone for PmDeniedSelectedEgressActorSupervisor",
+        "impl Clone for PmDeniedSelectedEgressActorResources",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "selected actor gained forbidden `{forbidden}` capability",
+        );
+    }
+    assert!(!CURRENT_RUNTIME.contains("impl<T> PmSelectedEgressGeoblockObservation<T>"));
+    assert!(MANIFEST.contains("reap-polymarket-egress-binding.workspace = true"));
+    assert!(!MANIFEST.contains("reqwest"));
 }
 
 #[test]

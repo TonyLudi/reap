@@ -54,6 +54,8 @@ use super::{
     online_preflight::PmDeniedOnlinePreflightCandidate,
 };
 
+mod selected_egress;
+
 const PROC_ROOT_PATH: &str = "/proc";
 const PROC_SELF_EXE_ENTRY: &str = "self/exe";
 const PROC_BOOT_ID_ENTRY: &str = "sys/kernel/random/boot_id";
