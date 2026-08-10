@@ -9,6 +9,9 @@ fn authenticated_roles_and_owner_are_capability_narrow() {
     cases.compile_fail("tests/ui/metadata_pair_cannot_be_forged.rs");
     cases.compile_fail("tests/ui/public_ws_has_no_socket_escape.rs");
     cases.compile_fail("tests/ui/server_time_proofs_are_move_only.rs");
+    cases.compile_fail("tests/ui/deferred_mutation_clock_is_move_only.rs");
+    cases.compile_fail("tests/ui/deferred_mutation_clock_is_actor_local.rs");
+    cases.compile_fail("tests/ui/deferred_promoted_owner_has_no_public_split.rs");
     cases.compile_fail("tests/ui/production_read_evidence_is_move_only.rs");
     cases.compile_fail("tests/ui/mutation_time_purposes_cannot_cross.rs");
     cases.compile_fail("tests/ui/mutation_authentication_purposes_cannot_cross.rs");

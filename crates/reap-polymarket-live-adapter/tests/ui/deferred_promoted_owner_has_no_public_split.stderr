@@ -1,0 +1,5 @@
+error[E0599]: no method named `into_purpose_owners` found for struct `PmProductionSelectedPlaceCancelTimeOwner` in the current scope
+ --> tests/ui/deferred_promoted_owner_has_no_public_split.rs:4:19
+  |
+4 |     let _ = value.into_purpose_owners();
+  |                   ^^^^^^^^^^^^^^^^^^^ method not found in `PmProductionSelectedPlaceCancelTimeOwner`

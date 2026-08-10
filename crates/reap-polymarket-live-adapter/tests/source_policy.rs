@@ -3,6 +3,7 @@ const WORKSPACE_MANIFEST: &str = include_str!("../../../Cargo.toml");
 const LIB: &str = include_str!("../src/lib.rs");
 const CLOB_HEALTH_HTTP: &str = include_str!("../src/clob_health_http.rs");
 const CONFIG: &str = include_str!("../src/config.rs");
+const DEFERRED_MUTATION_TIME: &str = include_str!("../src/deferred_mutation_time.rs");
 const GEOBLOCK_HTTP: &str = include_str!("../src/geoblock_http.rs");
 const HTTP_TRANSPORT: &str = include_str!("../src/http_transport.rs");
 const LOOPBACK_MUTATION_CREDENTIALS: &str = include_str!("../src/loopback_mutation_credentials.rs");
@@ -2242,6 +2243,324 @@ fn observation_only_public_connectivity_has_no_write_authority_shape() {
         assert!(
             full_clock.contains(required),
             "existing full clock split lost authority: {required}"
+        );
+    }
+}
+
+#[test]
+fn deferred_mutation_clock_is_same_domain_opaque_and_allocated_only_on_selected_promotion() {
+    let custody = between(
+        PRODUCT_CLOCK,
+        "// BEGIN DEFERRED_MUTATION_CLOCK_CUSTODY",
+        "// END DEFERRED_MUTATION_CLOCK_CUSTODY",
+    );
+    let expansion = between(
+        PRODUCT_CLOCK,
+        "// BEGIN DEFERRED_MUTATION_CLOCK_EXPANSION",
+        "// END DEFERRED_MUTATION_CLOCK_EXPANSION",
+    );
+    let capsule = between(
+        DEFERRED_MUTATION_TIME,
+        "// BEGIN SELECTED_DEFERRED_MUTATION_CLOCK_CAPSULE",
+        "// END SELECTED_DEFERRED_MUTATION_CLOCK_CAPSULE",
+    );
+    let staging = between(
+        DEFERRED_MUTATION_TIME,
+        "// BEGIN DEFERRED_MUTATION_OBSERVATION_STAGING",
+        "// END DEFERRED_MUTATION_OBSERVATION_STAGING",
+    );
+    let promotion = between(
+        DEFERRED_MUTATION_TIME,
+        "// BEGIN DEFERRED_MUTATION_SELECTED_PROMOTION",
+        "// END DEFERRED_MUTATION_SELECTED_PROMOTION",
+    );
+
+    for required in [
+        "pub(crate) struct PmDeferredMutationClockDomain",
+        "domain: Arc<ProductClockDomain>",
+        "pub(crate) fn split_observation_with_deferred_mutation(",
+        "public_ws: PmPublicWsProductClock",
+        "user_ws: PmUserWsProductClock",
+        "public_http: PmPublicHttpProductClock",
+        "read_server_time_http: PmReadServerTimeProductClock",
+        "private_read: PmPrivateReadProductClock",
+        "actor: PmActorProductClock",
+        "okx: PmOkxProductClock",
+        "deferred_mutation: PmDeferredMutationClockDomain",
+        "domain: self.domain",
+    ] {
+        assert!(
+            custody.contains(required),
+            "missing deferred clock-custody invariant: {required}"
+        );
+    }
+    for forbidden in [
+        "MutationTimeAuthority",
+        "PmPlaceServerTimeProductClock",
+        "PmCancelServerTimeProductClock",
+        "PmPlaceMutationTimeProof",
+        "PmCancelMutationTimeProof",
+        "PmPlaceMutationTimeFinalizer",
+        "PmCancelMutationTimeFinalizer",
+        "#[derive(Clone",
+        "#[derive(Copy",
+        "Serialize",
+        "Deserialize",
+        "pub struct PmDeferredMutationClockCapsule",
+        "impl Clone for PmDeferredMutationClockDomain",
+        "impl Copy for PmDeferredMutationClockDomain",
+        "impl From<",
+        "impl Into<",
+        "Deref",
+        "AsRef",
+        "observe_rest_edge",
+        "sample(",
+    ] {
+        assert!(
+            !custody.contains(forbidden),
+            "deferred clock custody gained an early capability: {forbidden}"
+        );
+    }
+
+    for required in [
+        "pub(crate) fn into_purpose_closed_views(self)",
+        "let place_time_authority = Arc::new(MutationTimeAuthority",
+        "purpose: MutationTimePurpose::Place",
+        "let cancel_time_authority = Arc::new(MutationTimeAuthority",
+        "purpose: MutationTimePurpose::Cancel",
+        "place_server_time_http: PmPlaceServerTimeProductClock",
+        "place_mutation_time_finalizer: PmPlaceMutationTimeFinalizer",
+        "cancel_server_time_http: PmCancelServerTimeProductClock",
+        "cancel_mutation_time_finalizer: PmCancelMutationTimeFinalizer",
+    ] {
+        assert!(
+            expansion.contains(required),
+            "missing deferred clock-expansion invariant: {required}"
+        );
+    }
+    assert_eq!(
+        expansion.matches("Arc::new(MutationTimeAuthority").count(),
+        2,
+        "deferred expansion must allocate exactly one authority per purpose"
+    );
+    assert_eq!(
+        production_prefix(PRODUCT_CLOCK)
+            .matches("Arc::new(MutationTimeAuthority")
+            .count(),
+        4,
+        "only the compatible full split and deferred consuming expansion allocate purpose authorities"
+    );
+
+    for required in [
+        "pub struct PmDeferredMutationClockCapsule",
+        "clock_domain: PmDeferredMutationClockDomain",
+        "http_config: PmPublicHttpConfig",
+        "scope: PmWireScope",
+        "_actor_local: PhantomData<Rc<()>>",
+        "PmDeferredMutationClockCapsule(<non-authoritative; selected-route-scope-and-domain redacted>)",
+    ] {
+        assert!(
+            capsule.contains(required),
+            "missing selected deferred-capsule invariant: {required}"
+        );
+    }
+    for forbidden in [
+        "#[derive(Clone",
+        "#[derive(Copy",
+        "Serialize",
+        "Deserialize",
+        "pub fn",
+        "pub const fn",
+        "impl Clone",
+        "impl Copy",
+        "impl From<",
+        "impl Into<",
+        "Deref",
+        "AsRef",
+        "observe_",
+        "sample(",
+        "into_parts",
+        "into_purpose_closed_views",
+    ] {
+        assert!(
+            !capsule.contains(forbidden),
+            "selected deferred capsule gained an escape: {forbidden}"
+        );
+    }
+    assert!(
+        !production_prefix(PRODUCT_CLOCK).contains("pub struct PmDeferredMutationClockCapsule"),
+        "the bare domain capsule must never be public"
+    );
+
+    for required in [
+        "pub struct PmPublicObservationWithDeferredMutationClockOwner",
+        "observation: PmPublicObservationConnectivityOwner",
+        "deferred_mutation_clock: PmDeferredMutationClockCapsule",
+        "if !public_ws_config.is_production()",
+        "if parser_config.scope() != public_ws_config.scope()",
+        "PmPublicHttpConfig::production_on_fixed_tls_peer_and_selected_local_egress(",
+        "let deferred_http_config = http_config.clone()",
+        "let configured_scope = parser_config.scope()",
+        "clock_owner.split_observation_with_deferred_mutation()",
+        "PmPublicObservationConnectivityOwner::from_observation_clock_views(",
+        "let deferred_mutation_clock = PmDeferredMutationClockCapsule",
+        "clock_domain",
+        "http_config: deferred_http_config",
+        "scope: configured_scope",
+        "_actor_local: PhantomData",
+        "PmPublicObservationConnectivityRoles",
+        "PmDeferredMutationClockCapsule",
+        "pub const fn production_order_entry_authorized(&self) -> bool",
+        "false",
+    ] {
+        assert!(
+            staging.contains(required),
+            "missing deferred observation-staging invariant: {required}"
+        );
+    }
+    let ws_check = staging
+        .find("if !public_ws_config.is_production()")
+        .unwrap();
+    let scope_check = staging
+        .find("if parser_config.scope() != public_ws_config.scope()")
+        .unwrap();
+    let http_config = staging
+        .find("PmPublicHttpConfig::production_on_fixed_tls_peer_and_selected_local_egress(")
+        .unwrap();
+    let deferred_split = staging
+        .find("clock_owner.split_observation_with_deferred_mutation()")
+        .unwrap();
+    let observation_assembly = staging
+        .find("PmPublicObservationConnectivityOwner::from_observation_clock_views(")
+        .unwrap();
+    let bound_capsule = staging
+        .find("let deferred_mutation_clock = PmDeferredMutationClockCapsule")
+        .unwrap();
+    assert!(
+        ws_check < scope_check
+            && scope_check < http_config
+            && http_config < deferred_split
+            && deferred_split < observation_assembly
+            && observation_assembly < bound_capsule
+    );
+    for forbidden in [
+        "PmPlaceMutationTimeOwner",
+        "PmCancelMutationTimeOwner",
+        "PmPlaceServerTimeHttpRole",
+        "PmCancelServerTimeHttpRole",
+        "PmPlaceMutationTimeFinalizer",
+        "PmCancelMutationTimeFinalizer",
+        "into_purpose_closed_views",
+        ".await",
+    ] {
+        assert!(
+            !staging.contains(forbidden),
+            "deferred observation staging gained early mutation-time construction: {forbidden}"
+        );
+    }
+
+    for required in [
+        "pub struct PmProductionSelectedPlaceCancelTimeOwner",
+        "reason = \"sealed until a future purpose-specific runner-gated bridge consumes these owners\"",
+        "place: PmPlaceMutationTimeOwner",
+        "cancel: PmCancelMutationTimeOwner",
+        "scope: PmWireScope",
+        "_actor_local: PhantomData<Rc<()>>",
+        "pub fn from_deferred_clock(",
+        "deferred_clock: PmDeferredMutationClockCapsule",
+        "let PmDeferredMutationClockCapsule",
+        "clock_domain",
+        "http_config",
+        "scope",
+        "_actor_local: _",
+        ".into_purpose_closed_views()",
+        "PmPlaceMutationTimeOwner::with_product_clock(",
+        "PmCancelMutationTimeOwner::with_product_clock(",
+        "pub const fn configured_scope(&self) -> PmWireScope",
+        "#[cfg(test)]",
+        "pub(crate) fn into_purpose_owners(",
+        "Ok(Self {",
+        "pub const fn production_order_entry_authorized(&self) -> bool",
+        "false",
+    ] {
+        assert!(
+            promotion.contains(required),
+            "missing selected deferred-promotion invariant: {required}"
+        );
+    }
+    let bound_config = promotion
+        .find("let PmDeferredMutationClockCapsule")
+        .unwrap();
+    let authority_expansion = promotion.find(".into_purpose_closed_views()").unwrap();
+    let place_owner = promotion
+        .find("PmPlaceMutationTimeOwner::with_product_clock(")
+        .unwrap();
+    let cancel_owner = promotion
+        .find("PmCancelMutationTimeOwner::with_product_clock(")
+        .unwrap();
+    let atomic_return = promotion.find("Ok(Self {").unwrap();
+    assert!(
+        bound_config < authority_expansion
+            && authority_expansion < place_owner
+            && place_owner < cancel_owner
+            && cancel_owner < atomic_return
+    );
+    assert_eq!(
+        promotion.matches("    pub fn ").count(),
+        1,
+        "the selected promoter publicly exposes only its consuming capsule constructor"
+    );
+    assert_eq!(
+        promotion.matches("    pub const fn ").count(),
+        2,
+        "the selected promoter publicly exposes only scope and constant-false authority observations"
+    );
+    for forbidden in [
+        ".await",
+        "fresh_place_time",
+        "fresh_cancel_time",
+        "L2Credentials",
+        "authenticate_exact_place",
+        "authenticate_exact_owned_cancel",
+        "SerializedPlaceRequest",
+        "SerializedOwnedCancelRequest",
+        "reqwest",
+        "PmFixedTlsPeerSelection",
+        "PmLocalEgressSelection",
+        "connect_timeout",
+        "request_timeout",
+        "production_on_fixed_tls_peer_and_selected_local_egress",
+        "pub fn into_purpose_owners(",
+    ] {
+        assert!(
+            !promotion.contains(forbidden),
+            "selected deferred promotion gained request or credential authority: {forbidden}"
+        );
+    }
+
+    assert_eq!(
+        production_prefix(DEFERRED_MUTATION_TIME)
+            .matches("clock_owner.split_observation_with_deferred_mutation()")
+            .count(),
+        1,
+        "one selected staging path must mint deferred clock custody"
+    );
+    assert_eq!(
+        production_prefix(DEFERRED_MUTATION_TIME)
+            .matches(".into_purpose_closed_views()")
+            .count(),
+        1,
+        "one selected promotion path must consume deferred clock custody"
+    );
+    for required in [
+        "PmDeferredMutationClockCapsule",
+        "PmPublicObservationWithDeferredMutationClockOwner",
+        "PmProductionSelectedPlaceCancelTimeOwner",
+        "PmPublicConnectivityOwner",
+    ] {
+        assert!(
+            LIB.contains(required),
+            "missing compatible export: {required}"
         );
     }
 }

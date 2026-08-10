@@ -399,6 +399,128 @@ impl PmObservationClockViews {
 }
 // END OBSERVATION_ONLY_CLOCK_SPLIT
 
+// BEGIN DEFERRED_MUTATION_CLOCK_CUSTODY
+/// Crate-private, move-only custody of one product-clock domain reserved for
+/// later purpose-closed mutation-time construction. The public selected
+/// capsule that wraps this value also binds the exact staged HTTP route and
+/// scope; this bare domain can never leave the adapter.
+pub(crate) struct PmDeferredMutationClockDomain {
+    domain: Arc<ProductClockDomain>,
+}
+
+/// One same-domain observation split plus opaque future mutation custody.
+/// This carrier is crate-private and cannot expose clock views to callers.
+pub(crate) struct PmObservationWithDeferredMutationClockViews {
+    observation: PmObservationClockViews,
+    deferred_mutation: PmDeferredMutationClockDomain,
+}
+
+impl PmObservationWithDeferredMutationClockViews {
+    #[must_use]
+    pub(crate) fn into_parts(self) -> (PmObservationClockViews, PmDeferredMutationClockDomain) {
+        (self.observation, self.deferred_mutation)
+    }
+}
+
+impl PmProductClockOwner {
+    /// Release all observation views immediately while retaining the same
+    /// domain in one opaque, move-only capsule. No purpose authority is
+    /// allocated by this split.
+    #[must_use]
+    pub(crate) fn split_observation_with_deferred_mutation(
+        self,
+    ) -> PmObservationWithDeferredMutationClockViews {
+        PmObservationWithDeferredMutationClockViews {
+            observation: PmObservationClockViews {
+                public_ws: PmPublicWsProductClock {
+                    domain: Arc::clone(&self.domain),
+                },
+                user_ws: PmUserWsProductClock {
+                    domain: Arc::clone(&self.domain),
+                },
+                public_http: PmPublicHttpProductClock {
+                    domain: Arc::clone(&self.domain),
+                },
+                read_server_time_http: PmReadServerTimeProductClock {
+                    domain: Arc::clone(&self.domain),
+                },
+                private_read: PmPrivateReadProductClock {
+                    domain: Arc::clone(&self.domain),
+                },
+                actor: PmActorProductClock {
+                    domain: Arc::clone(&self.domain),
+                },
+                okx: PmOkxProductClock {
+                    domain: Arc::clone(&self.domain),
+                },
+            },
+            deferred_mutation: PmDeferredMutationClockDomain {
+                domain: self.domain,
+            },
+        }
+    }
+}
+// END DEFERRED_MUTATION_CLOCK_CUSTODY
+
+// BEGIN DEFERRED_MUTATION_CLOCK_EXPANSION
+/// Purpose-closed clock views created only when deferred custody is consumed.
+pub(crate) struct PmPurposeClosedMutationClockViews {
+    place_server_time_http: PmPlaceServerTimeProductClock,
+    place_mutation_time_finalizer: PmPlaceMutationTimeFinalizer,
+    cancel_server_time_http: PmCancelServerTimeProductClock,
+    cancel_mutation_time_finalizer: PmCancelMutationTimeFinalizer,
+}
+
+impl PmPurposeClosedMutationClockViews {
+    #[must_use]
+    pub(crate) fn into_views(
+        self,
+    ) -> (
+        PmPlaceServerTimeProductClock,
+        PmPlaceMutationTimeFinalizer,
+        PmCancelServerTimeProductClock,
+        PmCancelMutationTimeFinalizer,
+    ) {
+        (
+            self.place_server_time_http,
+            self.place_mutation_time_finalizer,
+            self.cancel_server_time_http,
+            self.cancel_mutation_time_finalizer,
+        )
+    }
+}
+
+impl PmDeferredMutationClockDomain {
+    /// Consume deferred custody and allocate exactly one place authority and
+    /// one cancel authority over the retained product-clock domain.
+    #[must_use]
+    pub(crate) fn into_purpose_closed_views(self) -> PmPurposeClosedMutationClockViews {
+        let place_time_authority = Arc::new(MutationTimeAuthority {
+            domain: Arc::clone(&self.domain),
+            purpose: MutationTimePurpose::Place,
+        });
+        let cancel_time_authority = Arc::new(MutationTimeAuthority {
+            domain: self.domain,
+            purpose: MutationTimePurpose::Cancel,
+        });
+        PmPurposeClosedMutationClockViews {
+            place_server_time_http: PmPlaceServerTimeProductClock {
+                authority: Arc::clone(&place_time_authority),
+            },
+            place_mutation_time_finalizer: PmPlaceMutationTimeFinalizer {
+                authority: place_time_authority,
+            },
+            cancel_server_time_http: PmCancelServerTimeProductClock {
+                authority: Arc::clone(&cancel_time_authority),
+            },
+            cancel_mutation_time_finalizer: PmCancelMutationTimeFinalizer {
+                authority: cancel_time_authority,
+            },
+        }
+    }
+}
+// END DEFERRED_MUTATION_CLOCK_EXPANSION
+
 pub struct PmPublicWsProductClock {
     domain: Arc<ProductClockDomain>,
 }
@@ -1301,6 +1423,64 @@ mod tests {
             15
         );
         assert_eq!(okx.observe_okx_edge().unwrap().monotonic_receive_ns(), 16);
+    }
+
+    #[test]
+    fn deferred_mutation_views_preserve_the_exact_observation_clock_domain() {
+        let owner = PmProductClockOwner::test_support_scripted(&[
+            (1_000, 10),
+            (1_001, 11),
+            (1_002, 12),
+            (1_003, 13),
+            (1_004, 14),
+            (1_005, 15),
+            (1_006, 16),
+            (1_007, 17),
+            (1_008, 18),
+        ])
+        .unwrap();
+        let (observation, deferred) = owner
+            .split_observation_with_deferred_mutation()
+            .into_parts();
+        let (mut public_ws, _, _, _, mut private_read, mut actor, _) = observation.into_views();
+        assert_eq!(
+            public_ws
+                .observe_public_ws_edge()
+                .unwrap()
+                .monotonic_receive_ns(),
+            10
+        );
+        assert_eq!(
+            private_read
+                .observe_authenticated_read_complete()
+                .unwrap()
+                .monotonic_receive_ns(),
+            11
+        );
+        assert_eq!(
+            actor
+                .observe_control_edge()
+                .unwrap()
+                .received_clock()
+                .monotonic_receive_ns(),
+            12
+        );
+        let (place_time, mut place_finalizer, cancel_time, mut cancel_finalizer) =
+            deferred.into_purpose_closed_views().into_views();
+        let timestamp = L2Timestamp::from_unix_seconds(1_700_000_000).unwrap();
+        let place = place_time.place_time_proof(timestamp, place_time.observe_rest_edge().unwrap());
+        let mut place_provider = PlaceProvider::default();
+        place_finalizer
+            .consume_with(place, &mut place_provider)
+            .unwrap();
+        let cancel =
+            cancel_time.cancel_time_proof(timestamp, cancel_time.observe_rest_edge().unwrap());
+        let mut cancel_provider = CancelProvider::default();
+        cancel_finalizer
+            .consume_with(cancel, &mut cancel_provider)
+            .unwrap();
+        assert_eq!(place_provider.timestamp, Some(timestamp));
+        assert_eq!(cancel_provider.timestamp, Some(timestamp));
     }
 
     #[test]

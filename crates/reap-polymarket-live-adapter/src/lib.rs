@@ -12,6 +12,7 @@
 mod account;
 mod clob_health_http;
 mod config;
+mod deferred_mutation_time;
 mod error;
 mod geoblock_http;
 mod http_transport;
@@ -49,6 +50,10 @@ pub use clob_health_http::{
 pub use config::{
     PM_CLOB_PRODUCTION_ORIGIN, PM_GEOBLOCK_PRODUCTION_ORIGIN, PM_STATUS_PRODUCTION_ORIGIN,
     PmGeoblockHttpConfig, PmPrivateHttpConfig, PmPublicHttpConfig,
+};
+pub use deferred_mutation_time::{
+    PmDeferredMutationClockCapsule, PmProductionSelectedPlaceCancelTimeOwner,
+    PmPublicObservationWithDeferredMutationClockOwner,
 };
 pub use error::{PmLiveAdapterError, PmPublicMetadataDeliveryError, PmRestBookDeliveryError};
 pub use geoblock_http::{
