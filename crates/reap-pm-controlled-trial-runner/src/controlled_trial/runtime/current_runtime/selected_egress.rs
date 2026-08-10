@@ -2,19 +2,24 @@
 //!
 //! This child is intentionally private to `current_runtime`. It starts one
 //! named OS thread, captures and immediately revalidates the exact authorized
-//! Linux local-egress facts on that thread, and only then constructs five
-//! fixed-purpose HTTP clients. The clients are retained without making any
-//! source call. Construction finishes synchronously on that dedicated thread
-//! before a runtime exists. A current-thread Tokio runtime and `LocalSet` then
-//! confine the move-only actor task, its clients, custody, and one private `Rc`
-//! generation to the same thread until an explicit shutdown is joined.
+//! Linux local-egress facts on that thread, and only then derives the six exact
+//! reviewed fixed TLS peers and constructs five fixed-purpose HTTP clients.
+//! The WebSocket peer remains inert; all peers, clients, and their exact
+//! canonical policy, authorization, and destination-profile owners are
+//! retained without making any source call. Construction finishes
+//! synchronously on that dedicated thread before a runtime exists. A
+//! current-thread Tokio runtime and `LocalSet` then confine the move-only actor
+//! task, its resources, custody, and one private `Rc` generation to the same
+//! thread until an explicit shutdown is joined.
 //!
 //! This is only a permanently denied bootstrap-topology milestone. Because its
 //! custody predates any outer preflight window, it can never be reused by a
 //! positive preflight. A later positive flow must begin, capture, finish, and
-//! consume its window on this actor thread. This slice has no credentials, WebSocket,
-//! observation, selected-observation wrapper, window, candidate, seal, HMAC,
-//! request, mutation, or order-entry capability.
+//! consume its window on this actor thread. The reviewed profile's time
+//! envelope remains denied reviewer evidence: startup makes no caller-time or
+//! current-time freshness claim. This slice has no credentials, WebSocket
+//! transport, observation, selected-observation wrapper, window, candidate,
+//! seal, HMAC, request, mutation, or order-entry capability.
 
 use std::{
     fmt,
@@ -26,13 +31,16 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use reap_pm_controlled_trial::{CanonicalOnlineAuthorizationV2, CanonicalTrialConfig, TrialPhase};
+use reap_pm_controlled_trial::{
+    CanonicalOnlineAuthorizationV2, CanonicalOnlinePolicyV2,
+    CanonicalReviewedProductionDestinationProfileV1, CanonicalTrialConfig,
+    OfflineAuthorizationState, TrialPhase, verify_reviewed_production_destination_profile_v1,
+};
 use reap_pm_core::{EvmAddress, PmConditionId, PmTokenId, U256};
 use reap_polymarket_chain_source::PmPolygonAuthorizationSource;
-use reap_polymarket_egress_binding::PmLocalEgressSelection;
+use reap_polymarket_egress_binding::{PmFixedTlsPeerSelection, PmLocalEgressSelection};
 use reap_polymarket_live_adapter::{
-    PmClobLivenessHealthHttpRole, PmGeoblockHttpConfig, PmGeoblockHttpRole,
-    PmStatusAnnouncementHttpRole,
+    PmClobLivenessHealthHttpRole, PmGeoblockHttpRole, PmStatusAnnouncementHttpRole,
 };
 use reap_polymarket_public_source::{PmDataApiCurrentPositionSource, PmDataApiPositionScope};
 use thiserror::Error;
@@ -48,6 +56,8 @@ const FIXED_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) enum PmDeniedSelectedEgressActorError {
     #[error("selected-egress actor inputs are not the exact authorized Phase-A config")]
     AuthorizationConfigBinding,
+    #[error("selected-egress actor reviewed destination profile binding is invalid")]
+    ReviewedDestinationProfileBinding,
     #[error("selected-egress actor could not derive the exact position scope")]
     InvalidPositionScope,
     #[error("selected-egress actor OS thread could not be spawned")]
@@ -58,6 +68,10 @@ pub(super) enum PmDeniedSelectedEgressActorError {
     LocalFactRevalidation,
     #[error("selected-egress actor local selection could not be constructed")]
     LocalSelection,
+    #[error("selected-egress actor fixed TLS peer could not be constructed")]
+    FixedPeerSelection,
+    #[error("selected-egress actor fixed TLS peer differs from the local address family")]
+    FixedPeerAddressFamily,
     #[error("selected-egress geoblock client could not be constructed")]
     GeoblockClient,
     #[error("selected-egress official-status client could not be constructed")]
@@ -87,7 +101,9 @@ pub(super) enum PmDeniedSelectedEgressActorError {
 /// Inputs derived from exact canonical config before entering the actor
 /// thread. No local-egress fact is accepted from the caller.
 struct PmDeniedSelectedEgressActorStartup {
+    online_policy: CanonicalOnlinePolicyV2,
     online_authorization: CanonicalOnlineAuthorizationV2,
+    reviewed_destination_profile: CanonicalReviewedProductionDestinationProfileV1,
     reviewed_nonsecret_profile_path: PathBuf,
     position_scope: PmDataApiPositionScope,
     maximum_fact_age: Duration,
@@ -96,9 +112,29 @@ struct PmDeniedSelectedEgressActorStartup {
 impl PmDeniedSelectedEgressActorStartup {
     fn from_exact_config(
         config: &CanonicalTrialConfig,
+        online_policy: CanonicalOnlinePolicyV2,
         online_authorization: CanonicalOnlineAuthorizationV2,
+        reviewed_destination_profile: CanonicalReviewedProductionDestinationProfileV1,
         reviewed_nonsecret_profile_path: &Path,
     ) -> Result<Self, PmDeniedSelectedEgressActorError> {
+        // This is exact, clock-free reviewer-record verification only. It does
+        // not claim that the profile or authorization is fresh at startup.
+        let verification = verify_reviewed_production_destination_profile_v1(
+            config,
+            &online_policy,
+            &online_authorization,
+            &reviewed_destination_profile,
+        )
+        .map_err(|_| PmDeniedSelectedEgressActorError::ReviewedDestinationProfileBinding)?;
+        if !verification.exact_v2_bindings_structurally_valid
+            || !verification.fixed_six_destination_profile_structurally_valid
+            || verification.live_dns_observation_checked
+            || verification.destination_nat_equivalence_checked
+            || verification.authorization_consumption_checked
+            || verification.authorization != OfflineAuthorizationState::DENIED
+        {
+            return Err(PmDeniedSelectedEgressActorError::ReviewedDestinationProfileBinding);
+        }
         let pins = &online_authorization.value().v1_config;
         if config.value().phase != TrialPhase::APlaceCancel
             || pins.canonical_config_sha256 != config.canonical_sha256()
@@ -120,12 +156,93 @@ impl PmDeniedSelectedEgressActorStartup {
         .map_err(|_| PmDeniedSelectedEgressActorError::InvalidPositionScope)?;
 
         Ok(Self {
+            online_policy,
             online_authorization,
+            reviewed_destination_profile,
             reviewed_nonsecret_profile_path: reviewed_nonsecret_profile_path.to_path_buf(),
             position_scope: PmDataApiPositionScope::new(proxy_funder, condition, token),
             maximum_fact_age: Duration::from_millis(
                 value.time_limits.maximum_preflight_observation_age_ms,
             ),
+        })
+    }
+}
+
+/// Six capability-free fixed TLS peer selections derived solely from the
+/// exact canonical reviewed destination profile. The WebSocket peer has no
+/// transport owner in this milestone and is retained as inert reviewer input.
+struct PmReviewedFixedTlsPeerBundle {
+    geoblock_https: PmFixedTlsPeerSelection,
+    clob_https: PmFixedTlsPeerSelection,
+    status_https: PmFixedTlsPeerSelection,
+    data_api_https: PmFixedTlsPeerSelection,
+    polygon_rpc_https: PmFixedTlsPeerSelection,
+    _clob_websocket_wss: PmFixedTlsPeerSelection,
+}
+
+impl PmReviewedFixedTlsPeerBundle {
+    fn from_canonical_profile(
+        profile: &CanonicalReviewedProductionDestinationProfileV1,
+        selected_local_egress: &PmLocalEgressSelection,
+    ) -> Result<Self, PmDeniedSelectedEgressActorError> {
+        let destinations = &profile.value().destinations;
+        let geoblock_https = PmFixedTlsPeerSelection::production(
+            &destinations.geoblock_https.dns_name,
+            &destinations.geoblock_https.peer_ip,
+        )
+        .map_err(|_| PmDeniedSelectedEgressActorError::FixedPeerSelection)?;
+        let clob_https = PmFixedTlsPeerSelection::production(
+            &destinations.clob_https.dns_name,
+            &destinations.clob_https.peer_ip,
+        )
+        .map_err(|_| PmDeniedSelectedEgressActorError::FixedPeerSelection)?;
+        let status_https = PmFixedTlsPeerSelection::production(
+            &destinations.status_https.dns_name,
+            &destinations.status_https.peer_ip,
+        )
+        .map_err(|_| PmDeniedSelectedEgressActorError::FixedPeerSelection)?;
+        let data_api_https = PmFixedTlsPeerSelection::production(
+            &destinations.data_api_https.dns_name,
+            &destinations.data_api_https.peer_ip,
+        )
+        .map_err(|_| PmDeniedSelectedEgressActorError::FixedPeerSelection)?;
+        let polygon_rpc_https = PmFixedTlsPeerSelection::production(
+            &destinations.polygon_rpc_https.dns_name,
+            &destinations.polygon_rpc_https.peer_ip,
+        )
+        .map_err(|_| PmDeniedSelectedEgressActorError::FixedPeerSelection)?;
+        let clob_websocket_wss = PmFixedTlsPeerSelection::production(
+            &destinations.clob_websocket_wss.dns_name,
+            &destinations.clob_websocket_wss.peer_ip,
+        )
+        .map_err(|_| PmDeniedSelectedEgressActorError::FixedPeerSelection)?;
+
+        geoblock_https
+            .require_same_address_family(selected_local_egress)
+            .map_err(|_| PmDeniedSelectedEgressActorError::FixedPeerAddressFamily)?;
+        clob_https
+            .require_same_address_family(selected_local_egress)
+            .map_err(|_| PmDeniedSelectedEgressActorError::FixedPeerAddressFamily)?;
+        status_https
+            .require_same_address_family(selected_local_egress)
+            .map_err(|_| PmDeniedSelectedEgressActorError::FixedPeerAddressFamily)?;
+        data_api_https
+            .require_same_address_family(selected_local_egress)
+            .map_err(|_| PmDeniedSelectedEgressActorError::FixedPeerAddressFamily)?;
+        polygon_rpc_https
+            .require_same_address_family(selected_local_egress)
+            .map_err(|_| PmDeniedSelectedEgressActorError::FixedPeerAddressFamily)?;
+        clob_websocket_wss
+            .require_same_address_family(selected_local_egress)
+            .map_err(|_| PmDeniedSelectedEgressActorError::FixedPeerAddressFamily)?;
+
+        Ok(Self {
+            geoblock_https,
+            clob_https,
+            status_https,
+            data_api_https,
+            polygon_rpc_https,
+            _clob_websocket_wss: clob_websocket_wss,
         })
     }
 }
@@ -143,36 +260,44 @@ struct PmFixedSelectedEgressHttpBundle {
 impl PmFixedSelectedEgressHttpBundle {
     fn build(
         selection: &PmLocalEgressSelection,
+        fixed_peers: &PmReviewedFixedTlsPeerBundle,
         position_scope: PmDataApiPositionScope,
     ) -> Result<Self, PmDeniedSelectedEgressActorError> {
-        let geoblock_config = PmGeoblockHttpConfig::production_on_selected_local_egress(
+        let geoblock = PmGeoblockHttpRole::production_on_fixed_tls_peer_and_selected_local_egress(
             FIXED_HTTP_CONNECT_TIMEOUT,
             FIXED_HTTP_REQUEST_TIMEOUT,
+            fixed_peers.geoblock_https.clone(),
             selection.clone(),
         )
         .map_err(|_| PmDeniedSelectedEgressActorError::GeoblockClient)?;
-        let geoblock = PmGeoblockHttpRole::new(geoblock_config)
-            .map_err(|_| PmDeniedSelectedEgressActorError::GeoblockClient)?;
-        let official_status = PmStatusAnnouncementHttpRole::production_on_selected_local_egress(
-            FIXED_HTTP_CONNECT_TIMEOUT,
-            FIXED_HTTP_REQUEST_TIMEOUT,
-            selection.clone(),
-        )
-        .map_err(|_| PmDeniedSelectedEgressActorError::StatusClient)?;
-        let clob_health = PmClobLivenessHealthHttpRole::production_on_selected_local_egress(
-            FIXED_HTTP_CONNECT_TIMEOUT,
-            FIXED_HTTP_REQUEST_TIMEOUT,
-            selection.clone(),
-        )
-        .map_err(|_| PmDeniedSelectedEgressActorError::ClobHealthClient)?;
+        let official_status =
+            PmStatusAnnouncementHttpRole::production_on_fixed_tls_peer_and_selected_local_egress(
+                FIXED_HTTP_CONNECT_TIMEOUT,
+                FIXED_HTTP_REQUEST_TIMEOUT,
+                fixed_peers.status_https.clone(),
+                selection.clone(),
+            )
+            .map_err(|_| PmDeniedSelectedEgressActorError::StatusClient)?;
+        let clob_health =
+            PmClobLivenessHealthHttpRole::production_on_fixed_tls_peer_and_selected_local_egress(
+                FIXED_HTTP_CONNECT_TIMEOUT,
+                FIXED_HTTP_REQUEST_TIMEOUT,
+                fixed_peers.clob_https.clone(),
+                selection.clone(),
+            )
+            .map_err(|_| PmDeniedSelectedEgressActorError::ClobHealthClient)?;
         let polygon_authorization =
-            PmPolygonAuthorizationSource::production_on_selected_local_egress(selection)
-                .map_err(|_| PmDeniedSelectedEgressActorError::PolygonClient)?;
+            PmPolygonAuthorizationSource::production_on_fixed_tls_peer_and_selected_local_egress(
+                &fixed_peers.polygon_rpc_https,
+                selection,
+            )
+            .map_err(|_| PmDeniedSelectedEgressActorError::PolygonClient)?;
         let data_api_position =
-            PmDataApiCurrentPositionSource::production_on_selected_local_egress(
+            PmDataApiCurrentPositionSource::production_on_fixed_tls_peer_and_selected_local_egress(
                 position_scope,
                 FIXED_HTTP_CONNECT_TIMEOUT,
                 FIXED_HTTP_REQUEST_TIMEOUT,
+                &fixed_peers.data_api_https,
                 selection,
             )
             .map_err(|_| PmDeniedSelectedEgressActorError::PositionClient)?;
@@ -191,9 +316,12 @@ impl PmFixedSelectedEgressHttpBundle {
 /// to prove the intended lifetime and teardown topology.
 struct PmDeniedSelectedEgressActorResources {
     _selected_http_bundle: PmFixedSelectedEgressHttpBundle,
+    _reviewed_fixed_tls_peers: PmReviewedFixedTlsPeerBundle,
     _selected_local_egress: PmLocalEgressSelection,
     _local_egress_custody: PmLinuxEgressLocalFactCustody,
     _online_authorization: CanonicalOnlineAuthorizationV2,
+    _online_policy: CanonicalOnlinePolicyV2,
+    _reviewed_destination_profile: CanonicalReviewedProductionDestinationProfileV1,
     _reviewed_nonsecret_profile_path: PathBuf,
 }
 
@@ -247,12 +375,16 @@ pub(super) struct PmDeniedSelectedEgressActorSupervisor {
 impl PmDeniedSelectedEgressActorSupervisor {
     pub(super) fn spawn(
         config: &CanonicalTrialConfig,
+        online_policy: CanonicalOnlinePolicyV2,
         online_authorization: CanonicalOnlineAuthorizationV2,
+        reviewed_destination_profile: CanonicalReviewedProductionDestinationProfileV1,
         reviewed_nonsecret_profile_path: &Path,
     ) -> Result<Self, PmDeniedSelectedEgressActorError> {
         let startup = PmDeniedSelectedEgressActorStartup::from_exact_config(
             config,
+            online_policy,
             online_authorization,
+            reviewed_destination_profile,
             reviewed_nonsecret_profile_path,
         )?;
         spawn_selected_egress_actor_thread(move || build_production_resources(startup))
@@ -298,7 +430,9 @@ fn build_production_resources(
     startup: PmDeniedSelectedEgressActorStartup,
 ) -> Result<PmDeniedSelectedEgressActorResources, PmDeniedSelectedEgressActorError> {
     let PmDeniedSelectedEgressActorStartup {
+        online_policy,
         online_authorization,
+        reviewed_destination_profile,
         reviewed_nonsecret_profile_path,
         position_scope,
         maximum_fact_age,
@@ -312,7 +446,7 @@ fn build_production_resources(
     .map_err(|_| PmDeniedSelectedEgressActorError::LocalFactCapture)?;
     let window_wall_completed = SystemTime::now();
     let window_monotonic_completed = Instant::now();
-    let (selected_local_egress, selected_http_bundle) = {
+    let (selected_local_egress, reviewed_fixed_tls_peers, selected_http_bundle) = {
         let revalidated_local_egress = local_egress_custody
             .revalidate_for_current_runtime(
                 &online_authorization,
@@ -328,14 +462,20 @@ fn build_production_resources(
             revalidated_local_egress.local_source_ip(),
         )
         .map_err(|_| PmDeniedSelectedEgressActorError::LocalSelection)?;
-        // Keep the borrowed revalidation view live across every constructor.
-        let bundle = PmFixedSelectedEgressHttpBundle::build(&selection, position_scope)?;
+        let fixed_peers = PmReviewedFixedTlsPeerBundle::from_canonical_profile(
+            &reviewed_destination_profile,
+            &selection,
+        )?;
+        // Keep the borrowed revalidation view live across all six peer and all
+        // five HTTP constructors.
+        let bundle =
+            PmFixedSelectedEgressHttpBundle::build(&selection, &fixed_peers, position_scope)?;
         if selection.interface_name() != revalidated_local_egress.interface_name()
             || selection.local_source_ip() != revalidated_local_egress.local_source_ip()
         {
             return Err(PmDeniedSelectedEgressActorError::LocalSelection);
         }
-        (selection, bundle)
+        (selection, fixed_peers, bundle)
     };
     // Close client-construction drift before Ready. This remains denied:
     // bootstrap capture is outside any later positive outer window.
@@ -358,9 +498,12 @@ fn build_production_resources(
     drop(post_constructor_local_egress);
     Ok(PmDeniedSelectedEgressActorResources {
         _selected_http_bundle: selected_http_bundle,
+        _reviewed_fixed_tls_peers: reviewed_fixed_tls_peers,
         _selected_local_egress: selected_local_egress,
         _local_egress_custody: local_egress_custody,
         _online_authorization: online_authorization,
+        _online_policy: online_policy,
+        _reviewed_destination_profile: reviewed_destination_profile,
         _reviewed_nonsecret_profile_path: reviewed_nonsecret_profile_path,
     })
 }

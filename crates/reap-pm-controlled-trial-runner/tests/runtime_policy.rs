@@ -75,14 +75,21 @@ fn runtime_is_binary_private_read_only_evidence_without_a_transport_escape() {
 fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
     let production = production_prefix(SELECTED_EGRESS);
     for required in [
+        "CanonicalOnlinePolicyV2",
+        "CanonicalReviewedProductionDestinationProfileV1",
+        "verify_reviewed_production_destination_profile_v1(",
+        "verification.authorization != OfflineAuthorizationState::DENIED",
         "PmLinuxEgressLocalFactCustody::capture(",
         ".revalidate_for_current_runtime(",
         "PmLocalEgressSelection::production(",
-        "PmGeoblockHttpConfig::production_on_selected_local_egress(",
-        "PmStatusAnnouncementHttpRole::production_on_selected_local_egress(",
-        "PmClobLivenessHealthHttpRole::production_on_selected_local_egress(",
-        "PmPolygonAuthorizationSource::production_on_selected_local_egress(selection)",
-        "PmDataApiCurrentPositionSource::production_on_selected_local_egress(",
+        "struct PmReviewedFixedTlsPeerBundle",
+        "PmFixedTlsPeerSelection::production(",
+        ".require_same_address_family(selected_local_egress)",
+        "PmGeoblockHttpRole::production_on_fixed_tls_peer_and_selected_local_egress(",
+        "PmStatusAnnouncementHttpRole::production_on_fixed_tls_peer_and_selected_local_egress(",
+        "PmClobLivenessHealthHttpRole::production_on_fixed_tls_peer_and_selected_local_egress(",
+        "PmPolygonAuthorizationSource::production_on_fixed_tls_peer_and_selected_local_egress(",
+        "PmDataApiCurrentPositionSource::production_on_fixed_tls_peer_and_selected_local_egress(",
         "thread::Builder::new()",
         ".name(SELECTED_EGRESS_ACTOR_THREAD_NAME.to_owned())",
         "TokioRuntimeBuilder::new_current_thread()",
@@ -96,6 +103,12 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
         "std::process::abort();",
         "_local_egress_custody: PmLinuxEgressLocalFactCustody",
         "_selected_http_bundle: PmFixedSelectedEgressHttpBundle",
+        "_reviewed_fixed_tls_peers: PmReviewedFixedTlsPeerBundle",
+        "_online_policy: CanonicalOnlinePolicyV2",
+        "_online_authorization: CanonicalOnlineAuthorizationV2",
+        "_reviewed_destination_profile: CanonicalReviewedProductionDestinationProfileV1",
+        "The WebSocket peer remains inert",
+        "startup makes no caller-time or\n//! current-time freshness claim",
     ] {
         assert!(
             production.contains(required),
@@ -110,6 +123,70 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
         SELECTED_EGRESS.contains("failing_task_entry_returns_startup_error_without_a_supervisor")
     );
 
+    let startup_inputs = between(
+        production,
+        "impl PmDeniedSelectedEgressActorStartup {",
+        "struct PmReviewedFixedTlsPeerBundle",
+    );
+    let profile_verification = startup_inputs
+        .find("verify_reviewed_production_destination_profile_v1(")
+        .unwrap();
+    let position_scope = startup_inputs.find("let proxy_funder =").unwrap();
+    assert!(profile_verification < position_scope);
+    for owned in [
+        "online_policy: CanonicalOnlinePolicyV2",
+        "online_authorization: CanonicalOnlineAuthorizationV2",
+        "reviewed_destination_profile: CanonicalReviewedProductionDestinationProfileV1",
+    ] {
+        assert!(startup_inputs.contains(owned));
+    }
+
+    let fixed_peers = between(
+        production,
+        "impl PmReviewedFixedTlsPeerBundle {",
+        "struct PmFixedSelectedEgressHttpBundle",
+    );
+    assert_eq!(
+        fixed_peers
+            .matches("PmFixedTlsPeerSelection::production(")
+            .count(),
+        6
+    );
+    assert_eq!(
+        fixed_peers
+            .matches(".require_same_address_family(selected_local_egress)")
+            .count(),
+        6
+    );
+    for reviewed_role in [
+        "destinations.geoblock_https",
+        "destinations.clob_https",
+        "destinations.status_https",
+        "destinations.data_api_https",
+        "destinations.polygon_rpc_https",
+        "destinations.clob_websocket_wss",
+        "_clob_websocket_wss: clob_websocket_wss",
+    ] {
+        assert!(
+            fixed_peers.contains(reviewed_role),
+            "fixed peer bundle lost `{reviewed_role}`",
+        );
+    }
+
+    let http_bundle = between(
+        production,
+        "impl PmFixedSelectedEgressHttpBundle {",
+        "struct PmDeniedSelectedEgressActorResources",
+    );
+    assert_eq!(
+        http_bundle
+            .matches("production_on_fixed_tls_peer_and_selected_local_egress(")
+            .count(),
+        5
+    );
+    assert!(!http_bundle.contains("production_on_selected_local_egress("));
+    assert!(!http_bundle.contains("clob_websocket_wss"));
+
     let setup = between(
         production,
         "fn build_production_resources(",
@@ -120,10 +197,18 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
         .unwrap();
     let revalidate = setup.find(".revalidate_for_current_runtime(").unwrap();
     let selection = setup.find("PmLocalEgressSelection::production(").unwrap();
+    let reviewed_peers = setup
+        .find("PmReviewedFixedTlsPeerBundle::from_canonical_profile(")
+        .unwrap();
     let clients = setup
         .find("PmFixedSelectedEgressHttpBundle::build(")
         .unwrap();
-    assert!(capture < revalidate && revalidate < selection && selection < clients);
+    assert!(
+        capture < revalidate
+            && revalidate < selection
+            && selection < reviewed_peers
+            && reviewed_peers < clients
+    );
     assert_eq!(setup.matches(".revalidate_for_current_runtime(").count(), 2);
     let post_constructor_revalidation = setup.rfind(".revalidate_for_current_runtime(").unwrap();
     let resources_return = setup
@@ -140,6 +225,9 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
     let bundle_field = owned_resources
         .find("_selected_http_bundle: PmFixedSelectedEgressHttpBundle")
         .unwrap();
+    let peer_field = owned_resources
+        .find("_reviewed_fixed_tls_peers: PmReviewedFixedTlsPeerBundle")
+        .unwrap();
     let selection_field = owned_resources
         .find("_selected_local_egress: PmLocalEgressSelection")
         .unwrap();
@@ -149,9 +237,31 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
     let authorization_field = owned_resources
         .find("_online_authorization: CanonicalOnlineAuthorizationV2")
         .unwrap();
-    assert!(bundle_field < selection_field);
+    let policy_field = owned_resources
+        .find("_online_policy: CanonicalOnlinePolicyV2")
+        .unwrap();
+    let profile_field = owned_resources
+        .find("_reviewed_destination_profile: CanonicalReviewedProductionDestinationProfileV1")
+        .unwrap();
+    assert!(bundle_field < peer_field);
+    assert!(peer_field < selection_field);
     assert!(selection_field < custody_field);
     assert!(custody_field < authorization_field);
+    assert!(authorization_field < policy_field);
+    assert!(policy_field < profile_field);
+
+    let supervisor_spawn = between(
+        production,
+        "impl PmDeniedSelectedEgressActorSupervisor {",
+        "pub(super) fn shutdown_and_join(",
+    );
+    let exact_inputs = supervisor_spawn
+        .find("PmDeniedSelectedEgressActorStartup::from_exact_config(")
+        .unwrap();
+    let thread_spawn = supervisor_spawn
+        .find("spawn_selected_egress_actor_thread(")
+        .unwrap();
+    assert!(exact_inputs < thread_spawn);
 
     let thread_run = between(
         production,
@@ -209,6 +319,9 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
         "PmPhaseAOnlineRuntimeBurnedV2",
         "PmReadOnlyCredentialInput",
         "PmCredentialAuthoritySupervisor",
+        "PmClobWebSocket",
+        "PmUserWebSocket",
+        "PmPublicBookWebSocket",
         "reap_polymarket_auth",
         "hmac::",
         "PlaceHmacAdmission",
@@ -222,6 +335,11 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
         ".production_liveness_health_observation(",
         ".finalized_authorization_cut(",
         ".production_current_position_observation(",
+        ".status().await",
+        ".get_ok().await",
+        ".connect().await",
+        "verify_online_authorization_v2(",
+        "PmSelectedEgressHttpBundle",
         "fn geoblock(",
         "fn status(",
         "fn health(",
