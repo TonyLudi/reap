@@ -227,13 +227,21 @@ fn selected_local_http_egress_is_configuration_only_and_never_a_combined_owner_c
     assert!(
         GEOBLOCK_HTTP.contains("pub fn production_on_fixed_tls_peer_and_selected_local_egress(")
     );
-    for combined_owner in [PUBLIC_CONNECTIVITY, READ_ONLY_PRIVATE] {
+    let full_public_connectivity = between(
+        PUBLIC_CONNECTIVITY,
+        "pub struct PmPublicConnectivityOwner",
+        "// BEGIN OBSERVATION_ONLY_PUBLIC_CONNECTIVITY",
+    );
+    for combined_owner in [
+        full_public_connectivity,
+        production_prefix(READ_ONLY_PRIVATE),
+    ] {
         assert!(
-            !production_prefix(combined_owner).contains("production_on_selected_local_egress"),
+            !combined_owner.contains("production_on_selected_local_egress"),
             "an owner containing a generic WebSocket must not claim selected egress"
         );
         assert!(
-            !production_prefix(combined_owner).contains("PmFixedTlsPeerSelection"),
+            !combined_owner.contains("PmFixedTlsPeerSelection"),
             "an owner containing a generic WebSocket must not claim a fixed HTTP peer"
         );
     }
@@ -303,7 +311,7 @@ fn selected_local_http_egress_is_configuration_only_and_never_a_combined_owner_c
     assert!(
         CONFIG.contains("pub(crate) fn production_on_fixed_tls_peer_and_selected_local_egress(")
     );
-    assert!(!production_prefix(PUBLIC_CONNECTIVITY).contains("selected_local_egress"));
+    assert!(!full_public_connectivity.contains("selected_local_egress"));
     for (consumer, purpose) in [
         (READ_AUTHORITY, "loopback external read owner"),
         (LOOPBACK_MUTATION_CREDENTIALS, "loopback mutation authority"),
@@ -2066,6 +2074,174 @@ fn authenticated_public_bundle_owns_one_clock_domain_and_no_default_clock_escape
         assert!(
             !source.contains(forbidden),
             "raw clock/time capability escape: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn observation_only_public_connectivity_has_no_write_authority_shape() {
+    let clock = between(
+        PRODUCT_CLOCK,
+        "// BEGIN OBSERVATION_ONLY_CLOCK_SPLIT",
+        "// END OBSERVATION_ONLY_CLOCK_SPLIT",
+    );
+    let connectivity = between(
+        PUBLIC_CONNECTIVITY,
+        "// BEGIN OBSERVATION_ONLY_PUBLIC_CONNECTIVITY",
+        "// END OBSERVATION_ONLY_PUBLIC_CONNECTIVITY",
+    );
+
+    for required in [
+        "pub(crate) fn split_observation_only(self) -> PmObservationClockViews",
+        "pub(crate) struct PmObservationClockViews",
+        "public_ws: PmPublicWsProductClock",
+        "user_ws: PmUserWsProductClock",
+        "public_http: PmPublicHttpProductClock",
+        "read_server_time_http: PmReadServerTimeProductClock",
+        "private_read: PmPrivateReadProductClock",
+        "actor: PmActorProductClock",
+        "okx: PmOkxProductClock",
+    ] {
+        assert!(
+            clock.contains(required),
+            "missing observation-only clock invariant: {required}"
+        );
+    }
+    for required in [
+        "pub struct PmPublicObservationConnectivityOwner",
+        "pub struct PmPublicObservationConnectivityRoles",
+        "PmPublicMetadataHttpRole",
+        "PmPublicHttpRole",
+        "PmReadServerTimeHttpRole",
+        "PmPrivateReadProductClock",
+        "PmPublicMarketWsRole",
+        "PmUserWsProductClock",
+        "PmActorProductClock",
+        "PmOkxProductClock",
+        "if parser_config.scope() != public_ws_config.scope()",
+        "clock_owner.split_observation_only().into_views()",
+        "pub fn production_on_fixed_tls_peer_and_selected_local_egress(",
+        "if !public_ws_config.is_production()",
+        "selected production observation connectivity requires a production public WebSocket configuration",
+        "caller-provided fixed TLS peer",
+        "Both values remain non-authoritative configuration.",
+        "PmPublicHttpConfig::production_on_fixed_tls_peer_and_selected_local_egress(",
+        "Self::new(",
+        "PmPublicObservationConnectivityOwner(<observation-only; scope-and-clock-bound>)",
+        "PmPublicObservationConnectivityRoles(<observation-only; move-only>)",
+    ] {
+        assert!(
+            connectivity.contains(required),
+            "missing observation-only connectivity invariant: {required}"
+        );
+    }
+    let selected_constructor = between(
+        connectivity,
+        "pub fn production_on_fixed_tls_peer_and_selected_local_egress(",
+        "    #[must_use]\n    pub const fn configured_scope",
+    );
+    let ws_mode_check = selected_constructor
+        .find("if !public_ws_config.is_production()")
+        .expect("selected observation owner must check the WebSocket mode");
+    let fixed_http_construction = selected_constructor
+        .find("PmPublicHttpConfig::production_on_fixed_tls_peer_and_selected_local_egress(")
+        .expect("selected observation owner must construct fixed HTTP configuration");
+    assert!(
+        ws_mode_check < fixed_http_construction,
+        "selected observation owner must reject WebSocket mode crossing before HTTP construction"
+    );
+    for required in [
+        "PmPublicObservationConnectivityOwner",
+        "PmPublicObservationConnectivityRoles",
+    ] {
+        assert!(
+            LIB.contains(required),
+            "observation-only connectivity is not exported: {required}"
+        );
+    }
+    assert_eq!(
+        clock
+            .matches("pub(crate) fn split_observation_only(self) -> PmObservationClockViews")
+            .count(),
+        1,
+        "observation clock owner must expose exactly one direct narrow split"
+    );
+    assert_eq!(
+        connectivity
+            .matches("clock_owner.split_observation_only().into_views()")
+            .count(),
+        1,
+        "observation connectivity must consume exactly one direct narrow split"
+    );
+
+    for forbidden in ["place", "cancel", "mutation"] {
+        assert!(
+            !clock.to_ascii_lowercase().contains(forbidden),
+            "observation-only clock split gained forbidden authority term: {forbidden}"
+        );
+        assert!(
+            !connectivity.to_ascii_lowercase().contains(forbidden),
+            "observation-only connectivity gained forbidden authority term: {forbidden}"
+        );
+    }
+    for forbidden in ["PmProductClockViews", ".split()", "drop("] {
+        assert!(
+            !clock.contains(forbidden),
+            "observation-only clock split delegated through the full path: {forbidden}"
+        );
+    }
+    for forbidden in [
+        "#[derive(Clone",
+        "impl Clone for PmPublicObservation",
+        "Serialize",
+        "Deserialize",
+        "impl From<",
+        "impl Into<",
+        "PmProductionSelectedWsOwner",
+        "PmProductionSelectedPublicWsRole",
+        "PmProductionSelectedUserWsRole",
+        "PmPublicConnectivityOwner",
+        "PmPublicConnectivityRoles",
+        "PmProductClockViews",
+        ".split()",
+        ".into_roles().into_roles()",
+        "drop(",
+    ] {
+        assert!(
+            !connectivity.contains(forbidden),
+            "observation-only connectivity gained an escape: {forbidden}"
+        );
+    }
+
+    let full_connectivity = between(
+        PUBLIC_CONNECTIVITY,
+        "pub struct PmPublicConnectivityOwner",
+        "// BEGIN OBSERVATION_ONLY_PUBLIC_CONNECTIVITY",
+    );
+    let full_clock = PRODUCT_CLOCK
+        .split_once("// BEGIN OBSERVATION_ONLY_CLOCK_SPLIT")
+        .map(|(source, _)| source)
+        .expect("observation-only clock marker must follow the full split");
+    for required in [
+        "place_mutation_time: PmPlaceMutationTimeOwner",
+        "cancel_mutation_time: PmCancelMutationTimeOwner",
+        "PmPlaceMutationTimeOwner::with_product_clock(",
+        "PmCancelMutationTimeOwner::with_product_clock(",
+    ] {
+        assert!(
+            full_connectivity.contains(required),
+            "existing full connectivity lost authority: {required}"
+        );
+    }
+    for required in [
+        "let place_time_authority = Arc::new(MutationTimeAuthority",
+        "let cancel_time_authority = Arc::new(MutationTimeAuthority",
+        "place_mutation_time_finalizer: PmPlaceMutationTimeFinalizer",
+        "cancel_mutation_time_finalizer: PmCancelMutationTimeFinalizer",
+    ] {
+        assert!(
+            full_clock.contains(required),
+            "existing full clock split lost authority: {required}"
         );
     }
 }

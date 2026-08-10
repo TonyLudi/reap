@@ -101,7 +101,10 @@ pub use product_clock::{
     PmAuthorizedMutationServerTime, PmMutationServerTimeProductClock,
     PmMutationServerTimeValidator, PmPendingMutationServerTime,
 };
-pub use public_connectivity::{PmPublicConnectivityOwner, PmPublicConnectivityRoles};
+pub use public_connectivity::{
+    PmPublicConnectivityOwner, PmPublicConnectivityRoles, PmPublicObservationConnectivityOwner,
+    PmPublicObservationConnectivityRoles,
+};
 pub use public_http::{
     PmCancelMutationTimeOwner, PmCancelServerTimeHttpRole, PmCancelServerTimeObservation,
     PmCancelServerTimeObservationCommitment, PmPlaceMutationTimeOwner, PmPlaceServerTimeHttpRole,

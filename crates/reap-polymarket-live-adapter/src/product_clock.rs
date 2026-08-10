@@ -330,6 +330,75 @@ impl PmProductClockViews {
     }
 }
 
+// BEGIN OBSERVATION_ONLY_CLOCK_SPLIT
+impl PmProductClockOwner {
+    /// Split one clock domain into only the receive and control views needed
+    /// by read-only product observation.
+    #[must_use]
+    pub(crate) fn split_observation_only(self) -> PmObservationClockViews {
+        PmObservationClockViews {
+            public_ws: PmPublicWsProductClock {
+                domain: Arc::clone(&self.domain),
+            },
+            user_ws: PmUserWsProductClock {
+                domain: Arc::clone(&self.domain),
+            },
+            public_http: PmPublicHttpProductClock {
+                domain: Arc::clone(&self.domain),
+            },
+            read_server_time_http: PmReadServerTimeProductClock {
+                domain: Arc::clone(&self.domain),
+            },
+            private_read: PmPrivateReadProductClock {
+                domain: Arc::clone(&self.domain),
+            },
+            actor: PmActorProductClock {
+                domain: Arc::clone(&self.domain),
+            },
+            okx: PmOkxProductClock {
+                domain: self.domain,
+            },
+        }
+    }
+}
+
+/// Move-only read-observation views from one product clock domain.
+pub(crate) struct PmObservationClockViews {
+    public_ws: PmPublicWsProductClock,
+    user_ws: PmUserWsProductClock,
+    public_http: PmPublicHttpProductClock,
+    read_server_time_http: PmReadServerTimeProductClock,
+    private_read: PmPrivateReadProductClock,
+    actor: PmActorProductClock,
+    okx: PmOkxProductClock,
+}
+
+impl PmObservationClockViews {
+    #[must_use]
+    pub(crate) fn into_views(
+        self,
+    ) -> (
+        PmPublicWsProductClock,
+        PmUserWsProductClock,
+        PmPublicHttpProductClock,
+        PmReadServerTimeProductClock,
+        PmPrivateReadProductClock,
+        PmActorProductClock,
+        PmOkxProductClock,
+    ) {
+        (
+            self.public_ws,
+            self.user_ws,
+            self.public_http,
+            self.read_server_time_http,
+            self.private_read,
+            self.actor,
+            self.okx,
+        )
+    }
+}
+// END OBSERVATION_ONLY_CLOCK_SPLIT
+
 pub struct PmPublicWsProductClock {
     domain: Arc<ProductClockDomain>,
 }
@@ -1165,6 +1234,73 @@ mod tests {
                 .monotonic_receive_ns(),
             13
         );
+    }
+
+    #[test]
+    fn observation_only_views_share_one_strictly_ordered_domain() {
+        let owner = PmProductClockOwner::test_support_scripted(&[
+            (1_000, 10),
+            (1_001, 11),
+            (1_002, 12),
+            (1_003, 13),
+            (1_004, 14),
+            (1_005, 15),
+            (1_006, 16),
+        ])
+        .unwrap();
+        let (
+            mut public_ws,
+            mut user_ws,
+            public_http,
+            read_server_time_http,
+            mut private_read,
+            mut actor,
+            mut okx,
+        ) = owner.split_observation_only().into_views();
+        assert_eq!(
+            public_ws
+                .observe_public_ws_edge()
+                .unwrap()
+                .monotonic_receive_ns(),
+            10
+        );
+        assert_eq!(
+            user_ws
+                .observe_user_ws_edge()
+                .unwrap()
+                .monotonic_receive_ns(),
+            11
+        );
+        assert_eq!(
+            public_http
+                .observe_rest_edge()
+                .unwrap()
+                .monotonic_receive_ns(),
+            12
+        );
+        assert_eq!(
+            read_server_time_http
+                .observe_rest_edge()
+                .unwrap()
+                .monotonic_receive_ns(),
+            13
+        );
+        assert_eq!(
+            private_read
+                .observe_authenticated_read_complete()
+                .unwrap()
+                .monotonic_receive_ns(),
+            14
+        );
+        assert_eq!(
+            actor
+                .observe_control_edge()
+                .unwrap()
+                .received_clock()
+                .monotonic_receive_ns(),
+            15
+        );
+        assert_eq!(okx.observe_okx_edge().unwrap().monotonic_receive_ns(), 16);
     }
 
     #[test]
