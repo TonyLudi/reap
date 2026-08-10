@@ -30,6 +30,7 @@ mod public_ws_config;
 mod read_authority;
 mod read_only_private;
 mod reconciliation;
+mod selected_ws;
 mod status_announcement_http;
 mod task_guard;
 mod user_ws;
@@ -114,12 +115,12 @@ pub use public_http::{
     PmMutationServerTimeObservationCommitment,
 };
 pub use public_ws::{
-    PmPublicMarketWsRole, PmPublicWsActivityView, PmPublicWsClockError, PmPublicWsClockSource,
-    PmPublicWsConnection, PmPublicWsDisconnectReason, PmPublicWsEdgeClock, PmPublicWsEvent,
-    PmPublicWsEventSink, PmPublicWsObservation, PmPublicWsRawData, PmPublicWsReconnect,
-    PmPublicWsReconnectDirective, PmPublicWsRetirement, PmPublicWsRunError,
-    PmPublicWsShutdownHandle, PmPublicWsShutdownSignal, PmPublicWsTransportError,
-    pm_public_ws_shutdown_channel,
+    PmProductionSelectedPublicWsRole, PmPublicMarketWsRole, PmPublicWsActivityView,
+    PmPublicWsClockError, PmPublicWsClockSource, PmPublicWsConnection, PmPublicWsDisconnectReason,
+    PmPublicWsEdgeClock, PmPublicWsEvent, PmPublicWsEventSink, PmPublicWsObservation,
+    PmPublicWsRawData, PmPublicWsReconnect, PmPublicWsReconnectDirective, PmPublicWsRetirement,
+    PmPublicWsRunError, PmPublicWsShutdownHandle, PmPublicWsShutdownSignal,
+    PmPublicWsTransportError, pm_public_ws_shutdown_channel,
 };
 pub use public_ws_config::{
     PM_PUBLIC_MARKET_WS_ENDPOINT, PM_PUBLIC_WS_HEARTBEAT_INTERVAL, PmPublicWsBounds,
@@ -142,6 +143,7 @@ pub use reconciliation::{
     PmExactOrderDetailObservationCommitment, PmExactOrderObservation, PmOpenOrdersAssembly,
     PmOpenOrdersCutProgress, PmReconciliationHttpRole, PmTradesAssembly, PmTradesCutProgress,
 };
+pub use selected_ws::{PmProductionSelectedWsOwner, PmSelectedWsSocketFacts};
 pub use status_announcement_http::{
     MAX_PM_STATUS_ACTIVE_INCIDENTS, MAX_PM_STATUS_ACTIVE_MAINTENANCES, MAX_PM_STATUS_COMPONENTS,
     MAX_PM_STATUS_COMPONENTS_BODY_BYTES, MAX_PM_STATUS_SUMMARY_BODY_BYTES,
@@ -152,10 +154,11 @@ pub use status_announcement_http::{
     PmStatusMaintenanceState, PmStatusPageAnnouncement, PmStatusPageState,
 };
 pub use user_ws::{
-    PmAuthenticatedUserWsRole, PmUserWsActivityView, PmUserWsBoundFrame, PmUserWsClockError,
-    PmUserWsClockSource, PmUserWsConnection, PmUserWsDisconnectReason, PmUserWsEdgeClock,
-    PmUserWsEvent, PmUserWsEventSink, PmUserWsObservation, PmUserWsReconnect, PmUserWsRetirement,
-    PmUserWsRunError, PmUserWsShutdownHandle, PmUserWsShutdownSignal, PmUserWsTransportError,
+    PmAuthenticatedUserWsRole, PmProductionSelectedUserWsRole, PmUserWsActivityView,
+    PmUserWsBoundFrame, PmUserWsClockError, PmUserWsClockSource, PmUserWsConnection,
+    PmUserWsDisconnectReason, PmUserWsEdgeClock, PmUserWsEvent, PmUserWsEventSink,
+    PmUserWsObservation, PmUserWsReconnect, PmUserWsRetirement, PmUserWsRunError,
+    PmUserWsShutdownHandle, PmUserWsShutdownSignal, PmUserWsTransportError,
     pm_user_ws_shutdown_channel,
 };
 pub use user_ws_config::{

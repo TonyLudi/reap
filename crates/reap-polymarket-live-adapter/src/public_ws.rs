@@ -1,9 +1,9 @@
-use std::fmt;
 use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicU64, Ordering as AtomicOrdering},
 };
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
+use std::{fmt, future::Future, pin::Pin};
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -15,10 +15,12 @@ use tokio::time::{Instant, sleep_until, timeout};
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message, protocol::WebSocketConfig};
 
 use crate::{
-    PmLiveAdapterError, PmPublicWsConfig,
+    PmLiveAdapterError, PmPublicWsConfig, PmSelectedWsSocketFacts,
+    selected_ws::PmProductionSelectedWsRouteBinding,
     task_guard::AbortOnDropTask,
     ws_transport::{
-        PmDefaultWsDialer, PmFixedWsRoute, PmWsDialRequest, PmWsDialStrategy, PmWsSocket,
+        PmDefaultWsDialer, PmFixedWsRoute, PmProductionSelectedWsDialer, PmWsDialFailure,
+        PmWsDialRequest, PmWsDialStrategy, PmWsSocket,
     },
 };
 
@@ -148,6 +150,7 @@ impl PmPublicWsClockSource for SystemPublicWsClock {
 pub struct PmPublicWsConnection {
     scope: PmWireScope,
     connection_epoch: ConnectionEpoch,
+    selected_socket_facts: Option<PmSelectedWsSocketFacts>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +186,13 @@ impl PmPublicWsConnection {
     #[must_use]
     pub const fn connection_epoch(self) -> ConnectionEpoch {
         self.connection_epoch
+    }
+
+    /// Socket facts are present only after a production-selected or explicit
+    /// loopback-evidence dial completed its full post-handshake validation.
+    #[must_use]
+    pub const fn selected_socket_facts(self) -> Option<PmSelectedWsSocketFacts> {
+        self.selected_socket_facts
     }
 }
 
@@ -525,6 +535,10 @@ impl PmPublicMarketWsRole {
         self.activity_view.clone()
     }
 
+    pub(crate) const fn is_production(&self) -> bool {
+        self.config.is_production()
+    }
+
     pub async fn run<S>(
         self,
         shutdown: PmPublicWsShutdownSignal,
@@ -553,6 +567,179 @@ impl PmPublicMarketWsRole {
         }));
 
         serve_worker_events(worker, &mut event_receiver, sink).await
+    }
+}
+
+/// Public market WebSocket role fixed to one production peer and selected
+/// Linux interface/source pair by [`crate::PmProductionSelectedWsOwner`].
+///
+/// This move-only value is thread-confined configuration and transport
+/// custody. It is not actor-generation, namespace, DNS, NAT, or authorization
+/// evidence.
+pub struct PmProductionSelectedPublicWsRole {
+    role: PmPublicMarketWsRole,
+    binding: PmProductionSelectedWsRouteBinding,
+}
+
+impl PmProductionSelectedPublicWsRole {
+    pub(crate) const fn from_role_and_binding(
+        role: PmPublicMarketWsRole,
+        binding: PmProductionSelectedWsRouteBinding,
+    ) -> Self {
+        Self { role, binding }
+    }
+
+    #[must_use]
+    pub const fn scope(&self) -> PmWireScope {
+        self.role.scope()
+    }
+
+    #[must_use]
+    pub const fn transport_policy(&self) -> crate::PmPublicWsTransportPolicy {
+        self.role.transport_policy()
+    }
+
+    #[must_use]
+    pub fn activity_view(&self) -> PmPublicWsActivityView {
+        self.role.activity_view()
+    }
+
+    /// A selected public read transport never authorizes order entry.
+    #[must_use]
+    pub const fn production_order_entry_authorized(&self) -> bool {
+        false
+    }
+
+    pub async fn run<S>(
+        self,
+        shutdown: PmPublicWsShutdownSignal,
+        sink: &mut S,
+    ) -> Result<(), PmPublicWsRunError<S::Error>>
+    where
+        S: PmPublicWsEventSink,
+    {
+        let Self { role, binding } = self;
+        let PmPublicMarketWsRole {
+            config,
+            subscription,
+            clock,
+            activity_source,
+            activity_view: _,
+        } = role;
+        let (event_sender, mut event_receiver) = mpsc::channel(config.event_channel_capacity());
+        let worker = run_worker(
+            config,
+            subscription,
+            clock,
+            activity_source,
+            shutdown.receiver,
+            event_sender,
+            PmProductionSelectedWsDialer::new(binding),
+        );
+        serve_inline_worker_events(worker, &mut event_receiver, sink).await
+    }
+}
+
+impl fmt::Debug for PmProductionSelectedPublicWsRole {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PmProductionSelectedPublicWsRole")
+            .field("scope", &self.scope())
+            .finish_non_exhaustive()
+    }
+}
+
+async fn serve_inline_worker_events<F, S>(
+    worker: F,
+    event_receiver: &mut mpsc::Receiver<WorkerEvent>,
+    sink: &mut S,
+) -> Result<(), PmPublicWsRunError<S::Error>>
+where
+    F: Future<Output = Result<(), PmPublicWsTransportError>>,
+    S: PmPublicWsEventSink,
+{
+    tokio::pin!(worker);
+    loop {
+        tokio::select! {
+            event = event_receiver.recv() => {
+                let Some(event) = event else {
+                    return worker.await.map_err(PmPublicWsRunError::Transport);
+                };
+                if let InlineWorkerCompletion::Completed(result) = deliver_inline_worker_event_while_polling(
+                    worker.as_mut(),
+                    event,
+                    sink,
+                )
+                .await?
+                {
+                    while let Some(event) = event_receiver.recv().await {
+                        deliver_inline_worker_event(event, sink).await?;
+                    }
+                    return result.map_err(PmPublicWsRunError::Transport);
+                }
+            }
+            result = &mut worker => {
+                while let Some(event) = event_receiver.recv().await {
+                    deliver_inline_worker_event(event, sink).await?;
+                }
+                return result.map_err(PmPublicWsRunError::Transport);
+            }
+        }
+    }
+}
+
+enum InlineWorkerCompletion {
+    Running,
+    Completed(Result<(), PmPublicWsTransportError>),
+}
+
+async fn deliver_inline_worker_event_while_polling<F, S>(
+    mut worker: Pin<&mut F>,
+    event: WorkerEvent,
+    sink: &mut S,
+) -> Result<InlineWorkerCompletion, PmPublicWsRunError<S::Error>>
+where
+    F: Future<Output = Result<(), PmPublicWsTransportError>>,
+    S: PmPublicWsEventSink,
+{
+    // Keep the source-owned worker live while admission is pending. If it
+    // finishes first, retain that result without cancelling the already
+    // admitted delivery; the caller drains all queued evidence afterward.
+    let delivery = deliver_inline_worker_event(event, sink);
+    tokio::pin!(delivery);
+    tokio::select! {
+        result = delivery.as_mut() => {
+            result?;
+            Ok(InlineWorkerCompletion::Running)
+        }
+        worker_result = worker.as_mut() => {
+            delivery.await?;
+            Ok(InlineWorkerCompletion::Completed(worker_result))
+        }
+    }
+}
+
+async fn deliver_inline_worker_event<S>(
+    event: WorkerEvent,
+    sink: &mut S,
+) -> Result<(), PmPublicWsRunError<S::Error>>
+where
+    S: PmPublicWsEventSink,
+{
+    match event {
+        WorkerEvent::Evidence(event) => sink
+            .deliver_public_ws_event(event)
+            .await
+            .map_err(PmPublicWsRunError::Sink),
+        WorkerEvent::ReconnectAuthority { retired, response } => {
+            let directive = sink
+                .authorize_public_ws_reconnect(retired)
+                .await
+                .map_err(PmPublicWsRunError::Sink)?;
+            response
+                .send(directive)
+                .map_err(|_| PmPublicWsRunError::Transport(PmPublicWsTransportError::WorkerFailed))
+        }
     }
 }
 
@@ -617,6 +804,7 @@ where
         let connection = PmPublicWsConnection {
             scope: config.scope(),
             connection_epoch,
+            selected_socket_facts: None,
         };
         let outcome = run_attempt(
             &config,
@@ -631,14 +819,25 @@ where
             &mut dialer,
         )
         .await?;
-        let retired = match outcome {
+        let (retired, terminal) = match outcome {
             AttemptOutcome::Shutdown(observation) => {
                 emit(&events, PmPublicWsEvent::Shutdown(observation)).await?;
                 return Ok(());
             }
-            AttemptOutcome::Retired(retired) => retired,
+            AttemptOutcome::Retired(retired) => (
+                retired,
+                dialer.uses_selected_reconnect_classification()
+                    && selected_public_retirement_is_terminal(retired.reason()),
+            ),
+            AttemptOutcome::Terminal(retired) => (retired, true),
         };
         emit(&events, PmPublicWsEvent::ConnectionRetired(retired)).await?;
+
+        if terminal {
+            let stopped = restamp_retirement(&activity, retired)?;
+            emit(&events, PmPublicWsEvent::ReconnectStopped(stopped)).await?;
+            return Err(PmPublicWsTransportError::WorkerFailed);
+        }
 
         let directive = request_reconnect_authority(&activity, &events, retired).await?;
         let PmPublicWsReconnectDirective::Reconnect {
@@ -682,7 +881,7 @@ where
                     &events,
                     PmPublicWsEvent::Shutdown(source_observation(
                         &activity,
-                        connection,
+                        retired.connection(),
                         clock.as_mut(),
                     )?),
                 )
@@ -698,6 +897,7 @@ where
 enum AttemptOutcome {
     Shutdown(PmPublicWsObservation),
     Retired(PmPublicWsRetirement),
+    Terminal(PmPublicWsRetirement),
 }
 
 struct AttemptControl<'a> {
@@ -729,7 +929,7 @@ where
         config.endpoint().as_str(),
         websocket_config,
     ));
-    let socket = tokio::select! {
+    let dial_outcome = tokio::select! {
         () = wait_for_shutdown(shutdown) => {
             return Ok(AttemptOutcome::Shutdown(source_observation(
                 activity,
@@ -739,9 +939,24 @@ where
         }
         result = timeout(config.connect_timeout(), connect) => match result {
             Err(_) => return retired(activity, clock, connection, PmPublicWsDisconnectReason::ConnectTimeout),
-            Ok(Err(_)) => return retired(activity, clock, connection, PmPublicWsDisconnectReason::ConnectFailed),
-            Ok(Ok(socket)) => socket,
+            Ok(Err(PmWsDialFailure::RetryableConnect)) => {
+                return retired(activity, clock, connection, PmPublicWsDisconnectReason::ConnectFailed);
+            }
+            Ok(Err(PmWsDialFailure::TerminalInvariant)) => {
+                return terminal_retired(
+                    activity,
+                    clock,
+                    connection,
+                    PmPublicWsDisconnectReason::ConnectFailed,
+                );
+            }
+            Ok(Ok(outcome)) => outcome,
         },
+    };
+    let (socket, selected_socket_facts) = dial_outcome.into_parts();
+    let connection = PmPublicWsConnection {
+        selected_socket_facts,
+        ..connection
     };
 
     emit(
@@ -930,7 +1145,7 @@ impl PmPublicMarketWsRole {
     {
         let (event_sender, mut event_receiver) =
             mpsc::channel(self.config.event_channel_capacity());
-        let worker = AbortOnDropTask::new(tokio::task::spawn_local(run_worker(
+        let worker = run_worker(
             self.config,
             self.subscription,
             self.clock,
@@ -938,8 +1153,8 @@ impl PmPublicMarketWsRole {
             shutdown.receiver,
             event_sender,
             dialer,
-        )));
-        serve_worker_events(worker, &mut event_receiver, sink).await
+        );
+        serve_inline_worker_events(worker, &mut event_receiver, sink).await
     }
 }
 
@@ -991,6 +1206,27 @@ fn retired(
         observation: source_observation(activity, connection, clock)?,
         reason,
     }))
+}
+
+fn terminal_retired(
+    activity: &PmPublicWsActivitySource,
+    clock: &mut dyn PmPublicWsClockSource,
+    connection: PmPublicWsConnection,
+    reason: PmPublicWsDisconnectReason,
+) -> Result<AttemptOutcome, PmPublicWsTransportError> {
+    Ok(AttemptOutcome::Terminal(PmPublicWsRetirement {
+        observation: source_observation(activity, connection, clock)?,
+        reason,
+    }))
+}
+
+const fn selected_public_retirement_is_terminal(reason: PmPublicWsDisconnectReason) -> bool {
+    matches!(
+        reason,
+        PmPublicWsDisconnectReason::BinaryFrame
+            | PmPublicWsDisconnectReason::FrameTooLarge
+            | PmPublicWsDisconnectReason::UnexpectedProtocolFrame
+    )
 }
 
 async fn emit(
@@ -1069,14 +1305,14 @@ mod tests {
     use reap_polymarket_wire::PmBookParserConfig;
     use reap_transport::ReconnectPolicy;
     use tokio::net::TcpListener;
-    use tokio::{
-        sync::Notify,
-        task::{JoinHandle, LocalSet},
-    };
+    #[cfg(target_os = "linux")]
+    use tokio::task::LocalSet;
+    use tokio::{sync::Notify, task::JoinHandle};
     use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
     use tokio_tungstenite::{WebSocketStream, accept_async, accept_hdr_async};
 
     use super::*;
+    #[cfg(target_os = "linux")]
     use crate::ws_transport::PmTestSelectedLoopbackWsDialer;
 
     const CURRENT_SUBSCRIPTION: &str =
@@ -1167,6 +1403,13 @@ mod tests {
         release: Arc<Notify>,
     }
 
+    #[cfg(target_os = "linux")]
+    struct BlockingSelectedInlineSink {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        delivered: Arc<Mutex<Vec<&'static str>>>,
+    }
+
     struct BlockingRawDeliverySink {
         entered: Arc<Notify>,
         release: Arc<Notify>,
@@ -1189,6 +1432,35 @@ mod tests {
                 self.entered.notify_one();
                 self.release.notified().await;
             }
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[async_trait]
+    impl PmPublicWsEventSink for BlockingSelectedInlineSink {
+        type Error = &'static str;
+
+        async fn deliver_public_ws_event(
+            &mut self,
+            event: PmPublicWsEvent,
+        ) -> Result<(), Self::Error> {
+            let edge = match &event {
+                PmPublicWsEvent::ConnectionOpened(_) => "opened",
+                PmPublicWsEvent::SubscriptionSent(_) => "subscription",
+                PmPublicWsEvent::RawData(_) => "raw",
+                PmPublicWsEvent::PingSent(_) => "ping",
+                PmPublicWsEvent::Pong(_) => "pong",
+                PmPublicWsEvent::ConnectionRetired(_) => "retired",
+                PmPublicWsEvent::ReconnectScheduled(_) => "reconnect",
+                PmPublicWsEvent::ReconnectStopped(_) => "stopped",
+                PmPublicWsEvent::Shutdown(_) => "shutdown",
+            };
+            if matches!(event, PmPublicWsEvent::ConnectionOpened(_)) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            self.delivered.lock().unwrap().push(edge);
             Ok(())
         }
     }
@@ -1258,11 +1530,15 @@ mod tests {
         }
     }
 
+    type SelectedSocketFactsLog = Arc<Mutex<Vec<(u64, Option<PmSelectedWsSocketFacts>)>>>;
+
     struct TestSink {
         sender: mpsc::UnboundedSender<Seen>,
         clocks: Arc<Mutex<Vec<SeenClock>>>,
+        selected_facts: Option<SelectedSocketFactsLog>,
         fail_at: Option<usize>,
         delivered: usize,
+        reconnect_authority_calls: u64,
         authorized_reconnects: u8,
         max_authorized_reconnects: u8,
         authorized_backoff: Duration,
@@ -1294,6 +1570,23 @@ mod tests {
                 return Err("synthetic sink rejection");
             }
             self.delivered += 1;
+            let connection = match &event {
+                PmPublicWsEvent::ConnectionOpened(observation)
+                | PmPublicWsEvent::SubscriptionSent(observation)
+                | PmPublicWsEvent::PingSent(observation)
+                | PmPublicWsEvent::Pong(observation)
+                | PmPublicWsEvent::Shutdown(observation) => observation.connection(),
+                PmPublicWsEvent::RawData(data) => data.connection(),
+                PmPublicWsEvent::ConnectionRetired(retired)
+                | PmPublicWsEvent::ReconnectStopped(retired) => retired.connection(),
+                PmPublicWsEvent::ReconnectScheduled(reconnect) => reconnect.retired().connection(),
+            };
+            if let Some(selected_facts) = &self.selected_facts {
+                selected_facts.lock().unwrap().push((
+                    connection.connection_epoch().value(),
+                    connection.selected_socket_facts(),
+                ));
+            }
             let activity_generation = event.activity_generation();
             let (edge, clock) = match &event {
                 PmPublicWsEvent::ConnectionOpened(observation) => ("opened", observation.clock()),
@@ -1359,6 +1652,7 @@ mod tests {
             &mut self,
             retired: PmPublicWsRetirement,
         ) -> Result<PmPublicWsReconnectDirective, Self::Error> {
+            self.reconnect_authority_calls += 1;
             if let Some(directives) = &mut self.planned_directives {
                 return Ok(directives
                     .pop_front()
@@ -1608,8 +1902,10 @@ mod tests {
             let mut sink = TestSink {
                 sender,
                 clocks: sink_clocks,
+                selected_facts: None,
                 fail_at,
                 delivered: 0,
+                reconnect_authority_calls: 0,
                 authorized_reconnects: 0,
                 max_authorized_reconnects,
                 authorized_backoff,
@@ -1634,8 +1930,10 @@ mod tests {
             let mut sink = TestSink {
                 sender,
                 clocks: sink_clocks,
+                selected_facts: None,
                 fail_at: None,
                 delivered: 0,
+                reconnect_authority_calls: 0,
                 authorized_reconnects: 0,
                 max_authorized_reconnects: 0,
                 authorized_backoff: Duration::from_millis(1),
@@ -1690,15 +1988,25 @@ mod tests {
         assert!(!text.contains("operation"));
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "current_thread")]
     async fn selected_loopback_dialer_preserves_public_worker_protocol_across_reconnect() {
         LocalSet::new()
             .run_until(async {
                 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let address = listener.local_addr().unwrap();
+                let exact_peer_ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+                let selected_source: std::net::IpAddr = "127.0.0.2".parse().unwrap();
+                let decoy_ip: std::net::IpAddr = "127.0.0.3".parse().unwrap();
+                let decoy = TcpListener::bind(format!("127.0.0.3:{}", address.port()))
+                    .await
+                    .unwrap();
+                assert_eq!(address.ip(), exact_peer_ip);
+                assert_eq!(decoy.local_addr().unwrap().ip(), decoy_ip);
                 let server = tokio::task::spawn_local(async move {
                     for attempt in 0..2 {
-                        let (stream, _) = listener.accept().await.unwrap();
+                        let (stream, accepted_peer) = listener.accept().await.unwrap();
+                        assert_eq!(accepted_peer.ip(), selected_source);
                         let mut socket = accept_async(stream).await.unwrap();
                         read_subscription(&mut socket).await;
                         if attempt == 0 {
@@ -1722,19 +2030,24 @@ mod tests {
                     PmFixedWsRoute::PublicMarket,
                     &endpoint,
                     address,
-                    address.ip(),
+                    "lo",
+                    selected_source,
                 )
                 .unwrap();
                 let (shutdown, signal) = pm_public_ws_shutdown_channel();
                 let (sender, mut receiver) = mpsc::unbounded_channel();
                 let clocks = Arc::new(Mutex::new(Vec::new()));
                 let sink_clocks = Arc::clone(&clocks);
+                let selected_facts = Arc::new(Mutex::new(Vec::new()));
+                let sink_selected_facts = Arc::clone(&selected_facts);
                 let task = tokio::task::spawn_local(async move {
                     let mut sink = TestSink {
                         sender,
                         clocks: sink_clocks,
+                        selected_facts: Some(sink_selected_facts),
                         fail_at: None,
                         delivered: 0,
+                        reconnect_authority_calls: 0,
                         authorized_reconnects: 0,
                         max_authorized_reconnects: 1,
                         authorized_backoff: Duration::from_millis(1),
@@ -1757,6 +2070,33 @@ mod tests {
                 assert_eq!(next_seen(&mut receiver).await, Seen::Shutdown(92));
                 task.await.unwrap().unwrap();
                 server.await.unwrap();
+                assert!(
+                    timeout(Duration::from_millis(50), decoy.accept())
+                        .await
+                        .is_err(),
+                    "selected WebSocket dialer must leave the same-port decoy idle"
+                );
+                let selected_facts = selected_facts.lock().unwrap();
+                assert_eq!(selected_facts.len(), 7);
+                assert!(selected_facts.iter().all(|(_, facts)| facts.is_some()));
+                let first_epoch_facts = selected_facts[0].1.unwrap();
+                assert!(
+                    selected_facts[..4]
+                        .iter()
+                        .all(|(epoch, facts)| *epoch == 91 && *facts == Some(first_epoch_facts))
+                );
+                let second_epoch_facts = selected_facts[4].1.unwrap();
+                assert!(
+                    selected_facts[4..]
+                        .iter()
+                        .all(|(epoch, facts)| *epoch == 92 && *facts == Some(second_epoch_facts))
+                );
+                assert_eq!(first_epoch_facts.interface_name(), "lo");
+                assert_eq!(first_epoch_facts.peer_addr(), address);
+                assert_eq!(first_epoch_facts.local_addr().ip(), selected_source);
+                assert_eq!(second_epoch_facts.interface_name(), "lo");
+                assert_eq!(second_epoch_facts.peer_addr(), address);
+                assert_eq!(second_epoch_facts.local_addr().ip(), selected_source);
                 assert_eq!(
                     clocks
                         .lock()
@@ -1776,6 +2116,300 @@ mod tests {
                 );
             })
             .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn selected_inline_public_sink_keeps_worker_live_and_drains_after_completion() {
+        LocalSet::new()
+            .run_until(async {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let selected_source: std::net::IpAddr = "127.0.0.2".parse().unwrap();
+                let allow_worker_progress = Arc::new(Notify::new());
+                let server_allow_worker_progress = Arc::clone(&allow_worker_progress);
+                let worker_completed = Arc::new(Notify::new());
+                let server_completed = Arc::clone(&worker_completed);
+                let server = tokio::task::spawn_local(async move {
+                    let (stream, accepted_peer) = listener.accept().await.unwrap();
+                    assert_eq!(accepted_peer.ip(), selected_source);
+                    let mut socket = accept_async(stream).await.unwrap();
+                    read_subscription(&mut socket).await;
+                    server_allow_worker_progress.notified().await;
+                    socket.feed(Message::text(r#"{"inline":1}"#)).await.unwrap();
+                    socket.feed(Message::text(r#"{"inline":2}"#)).await.unwrap();
+                    socket.flush().await.unwrap();
+                    timeout(Duration::from_secs(2), async {
+                        loop {
+                            match socket.next().await {
+                                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                                Some(Ok(_)) => {}
+                            }
+                        }
+                    })
+                    .await
+                    .expect("selected public worker did not close after saturated handoff");
+                    server_completed.notify_one();
+                });
+
+                let endpoint = format!("ws://{address}/ws/market");
+                let config = PmPublicWsConfig::local_evidence(
+                    &endpoint,
+                    scope(),
+                    Duration::from_millis(200),
+                    Duration::from_secs(30),
+                    Duration::from_secs(10),
+                    Duration::from_secs(2),
+                    1_024,
+                    0,
+                    Duration::from_millis(5),
+                    2,
+                    ConnectionEpoch::new(131),
+                )
+                .unwrap();
+                let role =
+                    PmPublicMarketWsRole::with_clock_source(config, TestClock { next: 1 }).unwrap();
+                let activity = role.activity_view();
+                let dialer = PmTestSelectedLoopbackWsDialer::new(
+                    PmFixedWsRoute::PublicMarket,
+                    &endpoint,
+                    address,
+                    "lo",
+                    selected_source,
+                )
+                .unwrap();
+                let (_shutdown, signal) = pm_public_ws_shutdown_channel();
+                let entered = Arc::new(Notify::new());
+                let release = Arc::new(Notify::new());
+                let delivered = Arc::new(Mutex::new(Vec::new()));
+                let sink_entered = Arc::clone(&entered);
+                let sink_release = Arc::clone(&release);
+                let sink_delivered = Arc::clone(&delivered);
+                let mut task = tokio::task::spawn_local(async move {
+                    let mut sink = BlockingSelectedInlineSink {
+                        entered: sink_entered,
+                        release: sink_release,
+                        delivered: sink_delivered,
+                    };
+                    role.run_with_test_selected_loopback(signal, &mut sink, dialer)
+                        .await
+                });
+
+                timeout(Duration::from_secs(2), entered.notified())
+                    .await
+                    .expect("selected public Open never entered the sink barrier");
+                allow_worker_progress.notify_one();
+                timeout(Duration::from_secs(2), worker_completed.notified())
+                    .await
+                    .expect("selected public worker stopped polling behind the sink barrier");
+                assert!(activity.generation() >= 4);
+                assert!(timeout(Duration::from_millis(50), &mut task).await.is_err());
+                release.notify_one();
+                assert!(matches!(
+                    timeout(Duration::from_secs(2), task)
+                        .await
+                        .expect("selected public inline pump did not return")
+                        .unwrap(),
+                    Err(PmPublicWsRunError::Transport(
+                        PmPublicWsTransportError::EventChannelSaturated
+                    ))
+                ));
+                assert_eq!(
+                    delivered.lock().unwrap().as_slice(),
+                    ["opened", "subscription", "raw"]
+                );
+                server.await.unwrap();
+            })
+            .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn selected_public_backoff_shutdown_retains_retired_epoch_facts() {
+        LocalSet::new()
+            .run_until(async {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let selected_source: std::net::IpAddr = "127.0.0.2".parse().unwrap();
+                let server = tokio::task::spawn_local(async move {
+                    let (stream, accepted_peer) = listener.accept().await.unwrap();
+                    assert_eq!(accepted_peer.ip(), selected_source);
+                    let mut socket = accept_async(stream).await.unwrap();
+                    read_subscription(&mut socket).await;
+                    socket.send(Message::Close(None)).await.unwrap();
+                });
+                let endpoint = format!("ws://{address}/ws/market");
+                let config = local_config(
+                    address,
+                    Duration::from_millis(200),
+                    Duration::from_millis(500),
+                    Duration::from_millis(50),
+                    Duration::from_millis(20),
+                    1_024,
+                    1,
+                    Duration::from_secs(5),
+                    121,
+                );
+                let role =
+                    PmPublicMarketWsRole::with_clock_source(config, TestClock { next: 1 }).unwrap();
+                let dialer = PmTestSelectedLoopbackWsDialer::new(
+                    PmFixedWsRoute::PublicMarket,
+                    &endpoint,
+                    address,
+                    "lo",
+                    selected_source,
+                )
+                .unwrap();
+                let (shutdown, signal) = pm_public_ws_shutdown_channel();
+                let (sender, mut receiver) = mpsc::unbounded_channel();
+                let facts = Arc::new(Mutex::new(Vec::new()));
+                let sink_facts = Arc::clone(&facts);
+                let task = tokio::task::spawn_local(async move {
+                    let mut sink = TestSink {
+                        sender,
+                        clocks: Arc::new(Mutex::new(Vec::new())),
+                        selected_facts: Some(sink_facts),
+                        fail_at: None,
+                        delivered: 0,
+                        reconnect_authority_calls: 0,
+                        authorized_reconnects: 0,
+                        max_authorized_reconnects: 1,
+                        authorized_backoff: Duration::from_secs(5),
+                        planned_directives: None,
+                    };
+                    role.run_with_test_selected_loopback(signal, &mut sink, dialer)
+                        .await
+                });
+                assert_eq!(next_seen(&mut receiver).await, Seen::Open(121));
+                assert_eq!(next_seen(&mut receiver).await, Seen::Subscription(121));
+                assert_eq!(
+                    next_seen(&mut receiver).await,
+                    Seen::Retired(121, PmPublicWsDisconnectReason::SocketClosed)
+                );
+                assert_eq!(next_seen(&mut receiver).await, Seen::Reconnect(121, 122, 1));
+                shutdown.request_shutdown();
+                assert_eq!(next_seen(&mut receiver).await, Seen::Shutdown(121));
+                task.await.unwrap().unwrap();
+                server.await.unwrap();
+                let facts = facts.lock().unwrap();
+                assert_eq!(facts.len(), 5);
+                let exact = facts[0].1.expect("selected facts");
+                assert!(
+                    facts
+                        .iter()
+                        .all(|(epoch, observed)| *epoch == 121 && *observed == Some(exact))
+                );
+            })
+            .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn selected_binding_failure_is_terminal_before_public_reconnect_authority() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let selected_source = "127.0.0.2".parse().unwrap();
+        let endpoint = format!("ws://{address}/ws/market");
+        let config = standard_config(address, 1_024, 3, 101);
+        let role = PmPublicMarketWsRole::with_clock_source(config, TestClock { next: 1 }).unwrap();
+        let dialer = PmTestSelectedLoopbackWsDialer::new(
+            PmFixedWsRoute::PublicMarket,
+            &endpoint,
+            address,
+            "missing0",
+            selected_source,
+        )
+        .unwrap();
+        let (_shutdown, signal) = pm_public_ws_shutdown_channel();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let facts = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = TestSink {
+            sender,
+            clocks: Arc::new(Mutex::new(Vec::new())),
+            selected_facts: Some(Arc::clone(&facts)),
+            fail_at: None,
+            delivered: 0,
+            reconnect_authority_calls: 0,
+            authorized_reconnects: 0,
+            max_authorized_reconnects: 3,
+            authorized_backoff: Duration::from_millis(1),
+            planned_directives: None,
+        };
+        let result = role
+            .run_with_test_selected_loopback(signal, &mut sink, dialer)
+            .await;
+        assert!(matches!(
+            result,
+            Err(PmPublicWsRunError::Transport(
+                PmPublicWsTransportError::WorkerFailed
+            ))
+        ));
+        assert_eq!(sink.reconnect_authority_calls, 0);
+        assert_eq!(
+            next_seen(&mut receiver).await,
+            Seen::Retired(101, PmPublicWsDisconnectReason::ConnectFailed)
+        );
+        assert_eq!(
+            next_seen(&mut receiver).await,
+            Seen::Stopped(101, PmPublicWsDisconnectReason::ConnectFailed)
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(facts.lock().unwrap().as_slice(), [(101, None), (101, None)]);
+        assert!(
+            timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "terminal device binding must not fall back to an unbound connect"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn selected_exact_peer_refusal_remains_publicly_authorized_retryable() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let selected_source = "127.0.0.2".parse().unwrap();
+        drop(listener);
+        let endpoint = format!("ws://{address}/ws/market");
+        let config = standard_config(address, 1_024, 1, 111);
+        let role = PmPublicMarketWsRole::with_clock_source(config, TestClock { next: 1 }).unwrap();
+        let dialer = PmTestSelectedLoopbackWsDialer::new(
+            PmFixedWsRoute::PublicMarket,
+            &endpoint,
+            address,
+            "lo",
+            selected_source,
+        )
+        .unwrap();
+        let (_shutdown, signal) = pm_public_ws_shutdown_channel();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut sink = TestSink {
+            sender,
+            clocks: Arc::new(Mutex::new(Vec::new())),
+            selected_facts: None,
+            fail_at: None,
+            delivered: 0,
+            reconnect_authority_calls: 0,
+            authorized_reconnects: 0,
+            max_authorized_reconnects: 0,
+            authorized_backoff: Duration::from_millis(1),
+            planned_directives: None,
+        };
+        role.run_with_test_selected_loopback(signal, &mut sink, dialer)
+            .await
+            .unwrap();
+        assert_eq!(sink.reconnect_authority_calls, 1);
+        assert_eq!(
+            next_seen(&mut receiver).await,
+            Seen::Retired(111, PmPublicWsDisconnectReason::ConnectFailed)
+        );
+        assert_eq!(
+            next_seen(&mut receiver).await,
+            Seen::Stopped(111, PmPublicWsDisconnectReason::ConnectFailed)
+        );
     }
 
     #[allow(clippy::result_large_err)]
@@ -1839,8 +2473,10 @@ mod tests {
                 inner: TestSink {
                     sender,
                     clocks: sink_clocks,
+                    selected_facts: None,
                     fail_at: None,
                     delivered: 0,
+                    reconnect_authority_calls: 0,
                     authorized_reconnects: 0,
                     max_authorized_reconnects: 0,
                     authorized_backoff: Duration::from_millis(1),

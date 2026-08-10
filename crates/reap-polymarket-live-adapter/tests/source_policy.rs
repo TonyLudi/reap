@@ -1,4 +1,5 @@
 const MANIFEST: &str = include_str!("../Cargo.toml");
+const WORKSPACE_MANIFEST: &str = include_str!("../../../Cargo.toml");
 const LIB: &str = include_str!("../src/lib.rs");
 const CLOB_HEALTH_HTTP: &str = include_str!("../src/clob_health_http.rs");
 const CONFIG: &str = include_str!("../src/config.rs");
@@ -17,6 +18,7 @@ const PUBLIC_WS_CONFIG: &str = include_str!("../src/public_ws_config.rs");
 const READ_AUTHORITY: &str = include_str!("../src/read_authority.rs");
 const READ_ONLY_PRIVATE: &str = include_str!("../src/read_only_private.rs");
 const RECONCILIATION: &str = include_str!("../src/reconciliation.rs");
+const SELECTED_WS: &str = include_str!("../src/selected_ws.rs");
 const STATUS_ANNOUNCEMENT_HTTP: &str = include_str!("../src/status_announcement_http.rs");
 const ACCOUNT: &str = include_str!("../src/account.rs");
 const USER_WS: &str = include_str!("../src/user_ws.rs");
@@ -54,6 +56,7 @@ fn phase3_foundation_has_only_role_specific_dependencies() {
         "tokio-tungstenite.workspace = true",
         "sha2.workspace = true",
         "sha3.workspace = true",
+        "socket2.workspace = true",
         "zeroize.workspace = true",
     ] {
         assert!(
@@ -67,6 +70,9 @@ fn phase3_foundation_has_only_role_specific_dependencies() {
             "forbidden dependency: {forbidden}"
         );
     }
+    assert!(
+        WORKSPACE_MANIFEST.contains("socket2 = { version = \"=0.6.4\", features = [\"all\"] }")
+    );
 }
 
 #[test]
@@ -356,6 +362,7 @@ fn modules_are_separate_and_raw_transport_remains_private() {
         "mod public_ws_config;",
         "mod read_only_private;",
         "mod reconciliation;",
+        "mod selected_ws;",
         "mod status_announcement_http;",
         "mod task_guard;",
         "mod account;",
@@ -1418,7 +1425,7 @@ fn websocket_socket_workers_are_abort_on_outer_drop_and_explicitly_joined() {
 }
 
 #[test]
-fn websocket_dial_strategy_is_private_default_preserving_and_selected_only_in_tests() {
+fn websocket_dial_strategy_is_private_default_preserving_and_production_selected() {
     assert!(LIB.contains("mod ws_transport;"));
     assert!(!LIB.contains("pub mod ws_transport;"));
     assert!(!LIB.contains("pub use ws_transport"));
@@ -1428,12 +1435,10 @@ fn websocket_dial_strategy_is_private_default_preserving_and_selected_only_in_te
         "pub(crate) trait PmWsDialStrategy",
         "pub(crate) struct PmDefaultWsDialer",
         "connect_async_with_config(request.endpoint, Some(request.websocket_config), true)",
+        "pub(crate) struct PmProductionSelectedWsDialer",
+        "PmWsDialFailure::RetryableConnect",
+        "PmWsDialFailure::TerminalInvariant",
         "pub(crate) struct PmTestSelectedLoopbackWsDialer",
-        "TcpSocket::new_v4()",
-        "TcpSocket::new_v6()",
-        ".bind(SocketAddr::new(self.local_source_ip, 0))",
-        ".connect(self.peer)",
-        "client_async_tls_with_config(",
         "thread_confinement: Rc<()>",
     ] {
         assert!(
@@ -1445,26 +1450,241 @@ fn websocket_dial_strategy_is_private_default_preserving_and_selected_only_in_te
         WS_TRANSPORT.matches("connect_async_with_config(").count(),
         1
     );
+
+    let production_dial = between(
+        WS_TRANSPORT,
+        "async fn dial_production_selected(",
+        "\nfn exact_endpoint(",
+    );
+    for required in [
+        "request.route != binding.route()",
+        "request.endpoint != exact_endpoint(binding.route())",
+        "!binding.revalidate_process_and_thread()",
+        "fixed_peer.require_production().is_err()",
+        "local_egress.require_production().is_err()",
+        ".require_same_address_family(local_egress)",
+        "TcpSocket::new_v4()",
+        "TcpSocket::new_v6()",
+        ".bind_device(Some(interface_name))",
+        ".device()",
+        ".bind(SocketAddr::new(local_source_ip, 0))",
+        "socket.connect(peer_addr)",
+        "client_async_tls_with_config(",
+        "MaybeTlsStream::Rustls(stream)",
+        "PmSelectedWsSocketFacts::from_verified_socket(",
+    ] {
+        assert!(
+            production_dial.contains(required),
+            "production selected dial lost `{required}`"
+        );
+    }
+    assert_eq!(
+        production_dial.matches("socket.connect(peer_addr)").count(),
+        1
+    );
+    assert_eq!(
+        production_dial
+            .matches("validate_connected_stream(")
+            .count(),
+        2
+    );
+    let pre_handshake_check = production_dial.find("validate_connected_stream(").unwrap();
+    let tls_upgrade = production_dial
+        .find("client_async_tls_with_config(")
+        .unwrap();
+    let post_handshake_check = production_dial.rfind("validate_connected_stream(").unwrap();
+    let facts = production_dial
+        .find("PmSelectedWsSocketFacts::from_verified_socket(")
+        .unwrap();
+    assert!(pre_handshake_check < tls_upgrade);
+    assert!(tls_upgrade < post_handshake_check && post_handshake_check < facts);
+    for forbidden in [
+        "lookup_host",
+        "ToSocketAddrs",
+        "connect_async(",
+        "connect_async_with_config(",
+        "loop {",
+        "while let",
+        "for peer",
+        "fallback",
+    ] {
+        assert!(
+            !production_dial.contains(forbidden),
+            "production selected dial gained hidden resolution/retry path: {forbidden}"
+        );
+    }
+
+    let production_stream_validation = between(
+        WS_TRANSPORT,
+        "fn validate_connected_stream(",
+        "\nfn retryable_exact_peer_connect_error(",
+    );
+    for required in [
+        "!binding.revalidate_process_and_thread()",
+        ".local_addr()",
+        ".peer_addr()",
+        ".nodelay()",
+        "SockRef::from(stream)",
+        ".device()",
+        "local_addr.ip() != expected_local_ip",
+        "peer_addr != expected_peer_addr",
+        "readback_device.as_slice() != expected_interface_name",
+    ] {
+        assert!(
+            production_stream_validation.contains(required),
+            "production selected socket recheck lost `{required}`"
+        );
+    }
+
+    for (source, selected_classifier, classifier_end) in [
+        (
+            PUBLIC_WS,
+            "const fn selected_public_retirement_is_terminal(",
+            "\n}\n\nasync fn emit(",
+        ),
+        (
+            USER_WS,
+            "const fn selected_user_retirement_is_terminal(",
+            "\n}\n\n#[cfg(test)]",
+        ),
+    ] {
+        let attempt = between(
+            source,
+            "async fn run_attempt<D>(",
+            "\nasync fn run_connected(",
+        );
+        let timeout_branch = between(
+            attempt,
+            "Err(_) =>",
+            "Ok(Err(PmWsDialFailure::RetryableConnect))",
+        );
+        let retryable_branch = between(
+            attempt,
+            "Ok(Err(PmWsDialFailure::RetryableConnect))",
+            "Ok(Err(PmWsDialFailure::TerminalInvariant))",
+        );
+        let terminal_branch = between(
+            attempt,
+            "Ok(Err(PmWsDialFailure::TerminalInvariant))",
+            "Ok(Ok(outcome))",
+        );
+        assert!(timeout_branch.contains("ConnectTimeout"));
+        assert!(timeout_branch.contains("retired("));
+        assert!(!timeout_branch.contains("terminal_retired("));
+        assert!(retryable_branch.contains("ConnectFailed"));
+        assert!(retryable_branch.contains("retired("));
+        assert!(!retryable_branch.contains("terminal_retired("));
+        assert!(terminal_branch.contains("ConnectFailed"));
+        assert!(terminal_branch.contains("terminal_retired("));
+        assert!(
+            attempt.contains("let (socket, selected_socket_facts) = dial_outcome.into_parts()")
+        );
+
+        let terminal_protocol_reasons = between(source, selected_classifier, classifier_end);
+        for retryable in ["ConnectTimeout", "ConnectFailed", "SocketClosed"] {
+            assert!(!terminal_protocol_reasons.contains(retryable));
+        }
+    }
+
     assert!(!PUBLIC_WS.contains("connect_async_with_config("));
     assert!(!USER_WS.contains("connect_async_with_config("));
-    for (source, test_impl) in [
-        (PUBLIC_WS, "#[cfg(test)]\nimpl PmPublicMarketWsRole"),
-        (USER_WS, "#[cfg(test)]\nimpl PmAuthenticatedUserWsRole"),
+    for (source, run_start, selected_start, test_impl) in [
+        (
+            PUBLIC_WS,
+            "    pub async fn run<S>(\n        self,\n        shutdown: PmPublicWsShutdownSignal,",
+            "\n}\n\n/// Public market WebSocket role fixed",
+            "#[cfg(test)]\nimpl PmPublicMarketWsRole",
+        ),
+        (
+            USER_WS,
+            "    pub async fn run<S>(\n        self,\n        shutdown: PmUserWsShutdownSignal,",
+            "\n}\n\n/// Authenticated user WebSocket role fixed",
+            "#[cfg(test)]\nimpl PmAuthenticatedUserWsRole",
+        ),
     ] {
-        let default_run = between(
-            source,
-            "pub async fn run<S>(",
-            "\n}\n\nasync fn serve_worker_events",
-        );
+        let default_run = between(source, run_start, selected_start);
         assert!(default_run.contains("AbortOnDropTask::new(tokio::spawn"));
         assert!(default_run.contains("PmDefaultWsDialer"));
         assert!(!default_run.contains("spawn_local"));
+        assert!(!default_run.contains("PmProductionSelectedWsDialer"));
+        assert!(!default_run.contains("serve_inline_worker_events"));
         assert!(source.contains("AbortOnDropTask::new(tokio::spawn"));
         assert!(source.contains("PmDefaultWsDialer"));
         assert!(source.contains(test_impl));
         assert!(source.contains("async fn run_with_test_selected_loopback"));
-        assert!(source.contains("tokio::task::spawn_local(run_worker("));
+        assert!(source.contains("serve_inline_worker_events(worker"));
+        assert!(!source.contains("spawn_local(run_worker("));
     }
+    for (source, selected_impl_start, selected_impl_end, test_impl_start, test_impl_end) in [
+        (
+            PUBLIC_WS,
+            "impl PmProductionSelectedPublicWsRole {",
+            "\n}\n\nimpl fmt::Debug for PmProductionSelectedPublicWsRole",
+            "#[cfg(test)]\nimpl PmPublicMarketWsRole {",
+            "\n}\n\nfn observe(",
+        ),
+        (
+            USER_WS,
+            "impl PmProductionSelectedUserWsRole {",
+            "\n}\n\nimpl fmt::Debug for PmProductionSelectedUserWsRole",
+            "#[cfg(test)]\nimpl PmAuthenticatedUserWsRole {",
+            "\n}\n\nasync fn emit(",
+        ),
+    ] {
+        let selected_impl = between(source, selected_impl_start, selected_impl_end);
+        let selected_test_impl = between(source, test_impl_start, test_impl_end);
+        for selected_method in [selected_impl, selected_test_impl] {
+            assert!(selected_method.contains("serve_inline_worker_events(worker"));
+            assert!(!selected_method.contains("spawn_local"));
+            assert!(!selected_method.contains("tokio::spawn"));
+        }
+    }
+    let public_inline_pump = between(
+        PUBLIC_WS,
+        "async fn serve_inline_worker_events<F, S>(",
+        "\nasync fn deliver_inline_worker_event<S>(",
+    );
+    let user_inline_pump = between(
+        USER_WS,
+        "async fn serve_inline_worker_events<F, S>(",
+        "\nasync fn serve_worker_events<S>(",
+    );
+    for (pump, helper) in [
+        (
+            public_inline_pump,
+            "deliver_inline_worker_event_while_polling(",
+        ),
+        (user_inline_pump, "deliver_inline_user_event_while_polling("),
+    ] {
+        for required in [
+            helper,
+            "worker.as_mut()",
+            "delivery.as_mut()",
+            "worker_result = worker.as_mut()",
+            "InlineWorkerCompletion::Completed(worker_result)",
+            "while let Some(event)",
+            "return result.map_err(",
+        ] {
+            assert!(pump.contains(required), "inline pump lost `{required}`");
+        }
+        assert!(!pump.contains("tokio::spawn"));
+        assert!(!pump.contains("spawn_local"));
+    }
+    assert!(public_inline_pump.contains("delivery.await?"));
+    assert!(user_inline_pump.contains("delivery.await.map_err(PmUserWsRunError::Sink)?"));
+    let public_inline_admission = between(
+        PUBLIC_WS,
+        "async fn deliver_inline_worker_event<S>(",
+        "\nasync fn serve_worker_events<S>(",
+    );
+    let public_reconnect_admission = between(
+        public_inline_admission,
+        "WorkerEvent::ReconnectAuthority { retired, response } => {",
+        "\n        }\n    }",
+    );
+    assert!(public_reconnect_admission.contains("authorize_public_ws_reconnect(retired)"));
+    assert!(public_reconnect_admission.contains("response"));
+    assert!(public_reconnect_admission.contains(".send(directive)"));
     assert!(
         WS_TRANSPORT.contains("#[cfg(test)]\npub(crate) struct PmTestSelectedLoopbackWsDialer")
     );
@@ -1474,8 +1694,6 @@ fn websocket_dial_strategy_is_private_default_preserving_and_selected_only_in_te
         "pub fn client(",
         "pub fn endpoint(",
         "pub fn send(",
-        "production_on_selected",
-        "PmProductionSelected",
         "AuthenticatedPlaceRequest",
         "PmRetainedPlaceRequest",
         "authenticate_place",
@@ -1495,6 +1713,216 @@ fn websocket_dial_strategy_is_private_default_preserving_and_selected_only_in_te
     assert!(
         USER_WS.contains("selected_loopback_dialer_preserves_user_worker_protocol_on_local_set")
     );
+
+    let public_selected_socket_test = between(
+        PUBLIC_WS,
+        "async fn selected_loopback_dialer_preserves_public_worker_protocol_across_reconnect()",
+        "async fn selected_inline_public_sink_keeps_worker_live_and_drains_after_completion()",
+    );
+    let user_selected_socket_test = between(
+        USER_WS,
+        "async fn selected_loopback_dialer_preserves_user_worker_protocol_on_local_set()",
+        "async fn selected_inline_user_sink_keeps_worker_live_and_drains_after_completion()",
+    );
+    for test in [public_selected_socket_test, user_selected_socket_test] {
+        for required in [
+            "TcpListener::bind(\"127.0.0.1:0\")",
+            "\"127.0.0.2\".parse()",
+            "let decoy_ip: std::net::IpAddr = \"127.0.0.3\".parse()",
+            "TcpListener::bind(format!(\"127.0.0.3:{}\"",
+            "assert_eq!(address.ip(), exact_peer_ip)",
+            "assert_eq!(decoy.local_addr().unwrap().ip(), decoy_ip)",
+            "assert_eq!(accepted_peer.ip(), selected_source)",
+            "decoy.accept()",
+            ".is_err()",
+            "facts.peer_addr(), address",
+            "facts.local_addr().ip(), selected_source",
+        ] {
+            assert!(
+                test.contains(required),
+                "selected loopback socket test lost `{required}`"
+            );
+        }
+    }
+
+    let public_inline_regression = between(
+        PUBLIC_WS,
+        "async fn selected_inline_public_sink_keeps_worker_live_and_drains_after_completion()",
+        "async fn selected_public_backoff_shutdown_retains_retired_epoch_facts()",
+    );
+    for required in [
+        "BlockingSelectedInlineSink",
+        "Duration::from_secs(30)",
+        "Duration::from_secs(10)",
+        "allow_worker_progress.notify_one()",
+        "worker_completed.notified()",
+        "activity.generation() >= 4",
+        "timeout(Duration::from_millis(50), &mut task)",
+        "PmPublicWsTransportError::EventChannelSaturated",
+        "[\"opened\", \"subscription\", \"raw\"]",
+    ] {
+        assert!(public_inline_regression.contains(required));
+    }
+    assert!(
+        public_inline_regression
+            .find("worker_completed.notified()")
+            .unwrap()
+            < public_inline_regression
+                .find("release.notify_one()")
+                .unwrap()
+    );
+    let user_inline_regression = between(
+        USER_WS,
+        "async fn selected_inline_user_sink_keeps_worker_live_and_drains_after_completion()",
+        "async fn selected_user_backoff_shutdown_retains_retired_epoch_facts()",
+    );
+    for required in [
+        "BlockingSelectedInlineSink",
+        "Duration::from_secs(30)",
+        "Duration::from_secs(10)",
+        "allow_worker_progress.notify_one()",
+        "worker_completed.notified()",
+        "activity.high_water() >= 4",
+        "timeout(Duration::from_millis(50), &mut task)",
+        "PmUserWsTransportError::EventChannelSaturated",
+        "[\"opened\", \"subscription\", \"bound\"]",
+    ] {
+        assert!(user_inline_regression.contains(required));
+    }
+    assert!(
+        user_inline_regression
+            .find("worker_completed.notified()")
+            .unwrap()
+            < user_inline_regression.find("release.notify_one()").unwrap()
+    );
+
+    let public_backoff = between(
+        PUBLIC_WS,
+        "async fn selected_public_backoff_shutdown_retains_retired_epoch_facts()",
+        "async fn selected_binding_failure_is_terminal_before_public_reconnect_authority()",
+    );
+    for required in [
+        "Seen::Shutdown(121)",
+        "assert_eq!(facts.len(), 5)",
+        "*epoch == 121",
+        "*observed == Some(exact)",
+    ] {
+        assert!(public_backoff.contains(required));
+    }
+    let user_backoff = between(
+        USER_WS,
+        "async fn selected_user_backoff_shutdown_retains_retired_epoch_facts()",
+        "async fn selected_binding_failure_is_terminal_before_user_auto_retry()",
+    );
+    for required in [
+        "Seen::Shutdown(5)",
+        "assert_eq!(facts.len(), 5)",
+        "*epoch == 5",
+        "*observed == Some(exact)",
+    ] {
+        assert!(user_backoff.contains(required));
+    }
+    let public_terminal = between(
+        PUBLIC_WS,
+        "async fn selected_binding_failure_is_terminal_before_public_reconnect_authority()",
+        "async fn selected_exact_peer_refusal_remains_publicly_authorized_retryable()",
+    );
+    for required in [
+        "\"missing0\"",
+        "PmPublicWsTransportError::WorkerFailed",
+        "assert_eq!(sink.reconnect_authority_calls, 0)",
+        "TryRecvError::Empty",
+        "[(101, None), (101, None)]",
+        "listener.accept()",
+    ] {
+        assert!(public_terminal.contains(required));
+    }
+    let user_terminal = between(
+        USER_WS,
+        "async fn selected_binding_failure_is_terminal_before_user_auto_retry()",
+        "async fn selected_exact_peer_refusal_reaches_bounded_user_retry_exhaustion()",
+    );
+    for required in [
+        "\"missing0\"",
+        "PmUserWsTransportError::WorkerFailed",
+        "TryRecvError::Empty",
+        "[(5, None)]",
+        "listener.accept()",
+    ] {
+        assert!(user_terminal.contains(required));
+    }
+    assert!(PUBLIC_WS.contains("retired.connection(),\n                        clock.as_mut(),"));
+    assert!(
+        USER_WS
+            .contains("retired.observation().connection(),\n                    clock.as_mut(),")
+    );
+    assert!(
+        PUBLIC_WS.contains("selected_exact_peer_refusal_remains_publicly_authorized_retryable")
+    );
+    assert!(USER_WS.contains("selected_exact_peer_refusal_reaches_bounded_user_retry_exhaustion"));
+
+    for required in [
+        "pub struct PmProductionSelectedWsOwner",
+        "pub fn into_roles(",
+        "Rc<PmProductionSelectedWsBundleIdentity>",
+        "public.scope().condition() != user.condition()",
+        "fixed_tls_peer.dns_name() != PRODUCTION_WS_DNS_NAME",
+        "pub struct PmSelectedWsSocketFacts",
+        "interface_name: [u8; LINUX_INTERFACE_NAME_MAX_BYTES]",
+        "interface_name_len: u8",
+        "pub(crate) fn from_verified_socket(",
+        "pub fn interface_name(&self) -> &str",
+        "pub const fn local_addr(self) -> SocketAddr",
+        "pub const fn peer_addr(self) -> SocketAddr",
+        "device/local/peer redacted",
+        "validated caller-provided fixed peer",
+    ] {
+        assert!(
+            SELECTED_WS.contains(required),
+            "missing selected-WebSocket owner/fact invariant: {required}"
+        );
+    }
+    for source in [SELECTED_WS, PUBLIC_WS, USER_WS] {
+        assert!(source.contains("production_order_entry_authorized"));
+        assert!(source.contains("false"));
+    }
+    for source in [PUBLIC_WS, USER_WS] {
+        assert!(source.contains("selected_socket_facts: Option<PmSelectedWsSocketFacts>"));
+        assert!(source.contains("pub const fn selected_socket_facts("));
+        assert!(source.contains("PmProductionSelectedWsDialer::new(binding)"));
+        assert!(source.contains("serve_inline_worker_events(worker"));
+    }
+    let facts_fields = between(
+        SELECTED_WS,
+        "pub struct PmSelectedWsSocketFacts {",
+        "\n}\n\nimpl PmSelectedWsSocketFacts",
+    );
+    let owner_fields = between(
+        SELECTED_WS,
+        "pub struct PmProductionSelectedWsOwner {",
+        "\n}\n\nimpl PmProductionSelectedWsOwner",
+    );
+    assert!(!facts_fields.contains("pub "));
+    assert!(!owner_fields.contains("pub "));
+    assert!(!SELECTED_WS.contains("reviewed fixed peer"));
+    for source in [SELECTED_WS, PUBLIC_WS, USER_WS] {
+        assert!(!source.contains("unsafe impl Send"));
+        assert!(!source.contains("unsafe impl Sync"));
+    }
+    for forbidden in [
+        "pub fn socket(",
+        "pub fn endpoint(",
+        "pub fn dial(",
+        "CanonicalOnline",
+        "controlled_trial",
+        "Hmac",
+        "seal",
+    ] {
+        assert!(
+            !SELECTED_WS.contains(forbidden),
+            "selected-WebSocket public owner gained forbidden surface: {forbidden}"
+        );
+    }
 }
 
 #[test]

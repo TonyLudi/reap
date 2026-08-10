@@ -1,9 +1,9 @@
-use std::fmt;
 use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
+use std::{fmt, future::Future, pin::Pin};
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -19,11 +19,13 @@ use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message, protocol:
 use zeroize::Zeroizing;
 
 use crate::{
-    PmLiveAdapterError, PmUserWsConfig,
+    PmLiveAdapterError, PmSelectedWsSocketFacts, PmUserWsConfig,
     read_authority::PmUserWsReadAuthorityProvider,
+    selected_ws::PmProductionSelectedWsRouteBinding,
     task_guard::AbortOnDropTask,
     ws_transport::{
-        PmDefaultWsDialer, PmFixedWsRoute, PmWsDialRequest, PmWsDialStrategy, PmWsSocket,
+        PmDefaultWsDialer, PmFixedWsRoute, PmProductionSelectedWsDialer, PmWsDialFailure,
+        PmWsDialRequest, PmWsDialStrategy, PmWsSocket,
     },
 };
 
@@ -119,6 +121,7 @@ impl PmUserWsClockSource for SystemUserWsClock {
 pub struct PmUserWsConnection {
     condition: PmConditionId,
     connection_epoch: ConnectionEpoch,
+    selected_socket_facts: Option<PmSelectedWsSocketFacts>,
 }
 
 /// Cloneable read-only high-water view of authenticated user-stream activity.
@@ -177,6 +180,13 @@ impl PmUserWsConnection {
     #[must_use]
     pub const fn connection_epoch(self) -> ConnectionEpoch {
         self.connection_epoch
+    }
+
+    /// Socket facts are present only after a production-selected or explicit
+    /// loopback-evidence dial completed its full post-handshake validation.
+    #[must_use]
+    pub const fn selected_socket_facts(self) -> Option<PmSelectedWsSocketFacts> {
+        self.selected_socket_facts
     }
 }
 
@@ -482,6 +492,10 @@ impl PmAuthenticatedUserWsRole {
         self.activity.clone()
     }
 
+    pub(crate) const fn is_production(&self) -> bool {
+        self.config.is_production()
+    }
+
     pub async fn run<S>(
         self,
         shutdown: PmUserWsShutdownSignal,
@@ -501,6 +515,155 @@ impl PmAuthenticatedUserWsRole {
             PmDefaultWsDialer,
         )));
         serve_worker_events(worker, &mut receiver, sink).await
+    }
+}
+
+/// Authenticated user WebSocket role fixed to one production peer and
+/// selected Linux interface/source pair by
+/// [`crate::PmProductionSelectedWsOwner`].
+///
+/// Credentials remain inside the original role and are freshly used only for
+/// its fixed subscription. This value exposes no credential, endpoint,
+/// socket, dial strategy, actor generation, namespace, DNS, or NAT authority.
+pub struct PmProductionSelectedUserWsRole {
+    role: PmAuthenticatedUserWsRole,
+    binding: PmProductionSelectedWsRouteBinding,
+}
+
+impl PmProductionSelectedUserWsRole {
+    pub(crate) const fn from_role_and_binding(
+        role: PmAuthenticatedUserWsRole,
+        binding: PmProductionSelectedWsRouteBinding,
+    ) -> Self {
+        Self { role, binding }
+    }
+
+    #[must_use]
+    pub const fn condition(&self) -> PmConditionId {
+        self.role.condition()
+    }
+
+    #[must_use]
+    pub fn activity_view(&self) -> PmUserWsActivityView {
+        self.role.activity_view()
+    }
+
+    /// A selected authenticated read transport never authorizes order entry.
+    #[must_use]
+    pub const fn production_order_entry_authorized(&self) -> bool {
+        false
+    }
+
+    pub async fn run<S>(
+        self,
+        shutdown: PmUserWsShutdownSignal,
+        sink: &mut S,
+    ) -> Result<(), PmUserWsRunError<S::Error>>
+    where
+        S: PmUserWsEventSink,
+    {
+        let Self { role, binding } = self;
+        let PmAuthenticatedUserWsRole {
+            config,
+            credentials,
+            clock,
+            activity,
+        } = role;
+        let (sender, mut receiver) = mpsc::channel(config.event_channel_capacity());
+        let worker = run_worker(
+            config,
+            credentials,
+            clock,
+            activity,
+            shutdown.receiver,
+            sender,
+            PmProductionSelectedWsDialer::new(binding),
+        );
+        serve_inline_worker_events(worker, &mut receiver, sink).await
+    }
+}
+
+impl fmt::Debug for PmProductionSelectedUserWsRole {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PmProductionSelectedUserWsRole")
+            .field("condition", &self.condition())
+            .field("credentials", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+async fn serve_inline_worker_events<F, S>(
+    worker: F,
+    receiver: &mut mpsc::Receiver<PmUserWsEvent>,
+    sink: &mut S,
+) -> Result<(), PmUserWsRunError<S::Error>>
+where
+    F: Future<Output = Result<(), PmUserWsTransportError>>,
+    S: PmUserWsEventSink,
+{
+    tokio::pin!(worker);
+    loop {
+        tokio::select! {
+            event = receiver.recv() => {
+                let Some(event) = event else {
+                    return worker.await.map_err(PmUserWsRunError::Transport);
+                };
+                if let InlineWorkerCompletion::Completed(result) = deliver_inline_user_event_while_polling(
+                    worker.as_mut(),
+                    event,
+                    sink,
+                )
+                .await?
+                {
+                    while let Some(event) = receiver.recv().await {
+                        sink.deliver_user_ws_event(event)
+                            .await
+                            .map_err(PmUserWsRunError::Sink)?;
+                    }
+                    return result.map_err(PmUserWsRunError::Transport);
+                }
+            }
+            result = &mut worker => {
+                while let Some(event) = receiver.recv().await {
+                    sink.deliver_user_ws_event(event)
+                        .await
+                        .map_err(PmUserWsRunError::Sink)?;
+                }
+                return result.map_err(PmUserWsRunError::Transport);
+            }
+        }
+    }
+}
+
+enum InlineWorkerCompletion {
+    Running,
+    Completed(Result<(), PmUserWsTransportError>),
+}
+
+async fn deliver_inline_user_event_while_polling<F, S>(
+    mut worker: Pin<&mut F>,
+    event: PmUserWsEvent,
+    sink: &mut S,
+) -> Result<InlineWorkerCompletion, PmUserWsRunError<S::Error>>
+where
+    F: Future<Output = Result<(), PmUserWsTransportError>>,
+    S: PmUserWsEventSink,
+{
+    // Keep the source-owned worker live while admission is pending. If it
+    // finishes first, retain that result without cancelling the already
+    // admitted delivery; the caller drains all queued evidence afterward.
+    let delivery = sink.deliver_user_ws_event(event);
+    tokio::pin!(delivery);
+    tokio::select! {
+        result = delivery.as_mut() => {
+            result.map_err(PmUserWsRunError::Sink)?;
+            Ok(InlineWorkerCompletion::Running)
+        }
+        worker_result = worker.as_mut() => {
+            delivery.await.map_err(PmUserWsRunError::Sink)?;
+            Ok(InlineWorkerCompletion::Completed(worker_result))
+        }
     }
 }
 
@@ -553,6 +716,7 @@ where
         let connection = PmUserWsConnection {
             condition: config.condition(),
             connection_epoch: epoch,
+            selected_socket_facts: None,
         };
         let outcome = run_attempt(
             &config,
@@ -567,16 +731,29 @@ where
             &mut dialer,
         )
         .await?;
-        let retired = match outcome {
+        let (retired, terminal) = match outcome {
             AttemptOutcome::Shutdown(observation) => {
                 emit(&events, PmUserWsEvent::Shutdown(observation)).await?;
                 return Ok(());
             }
-            AttemptOutcome::Retired(retired) => retired,
+            AttemptOutcome::Retired(retired) => (
+                retired,
+                dialer.uses_selected_reconnect_classification()
+                    && selected_user_retirement_is_terminal(retired.reason()),
+            ),
+            AttemptOutcome::Terminal(retired) => (retired, true),
         };
         emit(&events, PmUserWsEvent::ConnectionRetired(retired)).await?;
+        if terminal {
+            return Err(PmUserWsTransportError::WorkerFailed);
+        }
         if reconnects >= config.max_reconnect_attempts() {
-            let exhausted = retirement(&activity, clock.as_mut(), connection, retired.reason)?;
+            let exhausted = retirement(
+                &activity,
+                clock.as_mut(),
+                retired.observation().connection(),
+                retired.reason,
+            )?;
             emit(&events, PmUserWsEvent::RetryExhausted(exhausted)).await?;
             return Err(PmUserWsTransportError::RetryExhausted {
                 attempts: reconnects.saturating_add(1),
@@ -606,7 +783,11 @@ where
         let deadline = Instant::now() + config.reconnect_backoff();
         tokio::select! {
             () = wait_for_shutdown(&mut shutdown) => {
-                let observation = reserve_observation(&activity, connection, clock.as_mut())?;
+                let observation = reserve_observation(
+                    &activity,
+                    retired.observation().connection(),
+                    clock.as_mut(),
+                )?;
                 emit(&events, PmUserWsEvent::Shutdown(observation)).await?;
                 return Ok(());
             }
@@ -619,6 +800,7 @@ where
 enum AttemptOutcome {
     Shutdown(PmUserWsObservation),
     Retired(PmUserWsRetirement),
+    Terminal(PmUserWsRetirement),
 }
 
 struct AttemptControl<'a> {
@@ -650,15 +832,30 @@ where
         config.endpoint().as_str(),
         websocket_config,
     ));
-    let socket = tokio::select! {
+    let dial_outcome = tokio::select! {
         () = wait_for_shutdown(shutdown) => {
             return Ok(AttemptOutcome::Shutdown(reserve_observation(activity, connection, clock)?));
         }
         result = timeout(config.connect_timeout(), connect) => match result {
             Err(_) => return retired(activity, clock, connection, PmUserWsDisconnectReason::ConnectTimeout),
-            Ok(Err(_)) => return retired(activity, clock, connection, PmUserWsDisconnectReason::ConnectFailed),
-            Ok(Ok(socket)) => socket,
+            Ok(Err(PmWsDialFailure::RetryableConnect)) => {
+                return retired(activity, clock, connection, PmUserWsDisconnectReason::ConnectFailed);
+            }
+            Ok(Err(PmWsDialFailure::TerminalInvariant)) => {
+                return terminal_retired(
+                    activity,
+                    clock,
+                    connection,
+                    PmUserWsDisconnectReason::ConnectFailed,
+                );
+            }
+            Ok(Ok(outcome)) => outcome,
         },
+    };
+    let (socket, selected_socket_facts) = dial_outcome.into_parts();
+    let connection = PmUserWsConnection {
+        selected_socket_facts,
+        ..connection
     };
     let opened = reserve_observation(activity, connection, clock)?;
     emit(events, PmUserWsEvent::ConnectionOpened(opened)).await?;
@@ -932,6 +1129,31 @@ fn classify_read_error(error: &WebSocketError) -> PmUserWsDisconnectReason {
     }
 }
 
+fn terminal_retired(
+    activity: &PmUserWsActivityView,
+    clock: &mut dyn PmUserWsClockSource,
+    connection: PmUserWsConnection,
+    reason: PmUserWsDisconnectReason,
+) -> Result<AttemptOutcome, PmUserWsTransportError> {
+    Ok(AttemptOutcome::Terminal(PmUserWsRetirement {
+        observation: reserve_observation(activity, connection, clock)?,
+        reason,
+    }))
+}
+
+const fn selected_user_retirement_is_terminal(reason: PmUserWsDisconnectReason) -> bool {
+    matches!(
+        reason,
+        PmUserWsDisconnectReason::SubscriptionAuthenticationFailed
+            | PmUserWsDisconnectReason::BinaryFrame
+            | PmUserWsDisconnectReason::FrameTooLarge
+            | PmUserWsDisconnectReason::MalformedFrame
+            | PmUserWsDisconnectReason::CredentialOwnerMismatch
+            | PmUserWsDisconnectReason::CredentialAuthorityUnavailable
+            | PmUserWsDisconnectReason::UnexpectedProtocolFrame
+    )
+}
+
 #[cfg(test)]
 impl PmAuthenticatedUserWsRole {
     async fn run_with_test_selected_loopback<S>(
@@ -944,7 +1166,7 @@ impl PmAuthenticatedUserWsRole {
         S: PmUserWsEventSink,
     {
         let (sender, mut receiver) = mpsc::channel(self.config.event_channel_capacity());
-        let worker = AbortOnDropTask::new(tokio::task::spawn_local(run_worker(
+        let worker = run_worker(
             self.config,
             self.credentials,
             self.clock,
@@ -952,8 +1174,8 @@ impl PmAuthenticatedUserWsRole {
             shutdown.receiver,
             sender,
             dialer,
-        )));
-        serve_worker_events(worker, &mut receiver, sink).await
+        );
+        serve_inline_worker_events(worker, &mut receiver, sink).await
     }
 }
 
@@ -990,14 +1212,15 @@ mod tests {
     use reap_polymarket_wire::PmWireScope;
     use tokio::net::TcpListener;
     use tokio::sync::Notify;
-    use tokio::task::{JoinHandle, LocalSet};
+    use tokio::task::JoinHandle;
+    #[cfg(target_os = "linux")]
+    use tokio::task::LocalSet;
     use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
     use super::*;
-    use crate::{
-        PmPrivateConnectivityOwner, PmPrivateHttpConfig, PmUserWsConfig,
-        ws_transport::PmTestSelectedLoopbackWsDialer,
-    };
+    #[cfg(target_os = "linux")]
+    use crate::ws_transport::PmTestSelectedLoopbackWsDialer;
+    use crate::{PmPrivateConnectivityOwner, PmPrivateHttpConfig, PmUserWsConfig};
 
     const ADDRESS: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
     const API_KEY: &str = "00000000-0000-4000-8000-000000000001";
@@ -1045,6 +1268,13 @@ mod tests {
         release: Arc<Notify>,
     }
 
+    #[cfg(target_os = "linux")]
+    struct BlockingSelectedInlineSink {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        delivered: Arc<Mutex<Vec<&'static str>>>,
+    }
+
     #[async_trait]
     impl PmUserWsEventSink for BlockingOpenedSink {
         type Error = &'static str;
@@ -1054,6 +1284,32 @@ mod tests {
                 self.entered.notify_one();
                 self.release.notified().await;
             }
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[async_trait]
+    impl PmUserWsEventSink for BlockingSelectedInlineSink {
+        type Error = &'static str;
+
+        async fn deliver_user_ws_event(&mut self, event: PmUserWsEvent) -> Result<(), Self::Error> {
+            let edge = match &event {
+                PmUserWsEvent::ConnectionOpened(_) => "opened",
+                PmUserWsEvent::SubscriptionSent(_) => "subscription",
+                PmUserWsEvent::BoundFrame(_) => "bound",
+                PmUserWsEvent::PingSent(_) => "ping",
+                PmUserWsEvent::Pong(_) => "pong",
+                PmUserWsEvent::ConnectionRetired(_) => "retired",
+                PmUserWsEvent::ReconnectScheduled(_) => "reconnect",
+                PmUserWsEvent::RetryExhausted(_) => "exhausted",
+                PmUserWsEvent::Shutdown(_) => "shutdown",
+            };
+            if matches!(event, PmUserWsEvent::ConnectionOpened(_)) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            self.delivered.lock().unwrap().push(edge);
             Ok(())
         }
     }
@@ -1085,10 +1341,13 @@ mod tests {
         Shutdown(u64),
     }
 
+    type SelectedSocketFactsLog = Arc<Mutex<Vec<(u64, Option<PmSelectedWsSocketFacts>)>>>;
+
     struct TestSink {
         sender: mpsc::UnboundedSender<Seen>,
         rendered: Arc<Mutex<Vec<String>>>,
         generations: Arc<Mutex<Vec<u64>>>,
+        selected_facts: Option<SelectedSocketFactsLog>,
     }
 
     #[async_trait]
@@ -1101,6 +1360,25 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(event.activity_generation());
+            let connection = match &event {
+                PmUserWsEvent::ConnectionOpened(observation)
+                | PmUserWsEvent::SubscriptionSent(observation)
+                | PmUserWsEvent::PingSent(observation)
+                | PmUserWsEvent::Pong(observation)
+                | PmUserWsEvent::Shutdown(observation) => observation.connection(),
+                PmUserWsEvent::BoundFrame(frame) => frame.observation().connection(),
+                PmUserWsEvent::ConnectionRetired(retired)
+                | PmUserWsEvent::RetryExhausted(retired) => retired.observation().connection(),
+                PmUserWsEvent::ReconnectScheduled(reconnect) => {
+                    reconnect.retired().observation().connection()
+                }
+            };
+            if let Some(selected_facts) = &self.selected_facts {
+                selected_facts.lock().unwrap().push((
+                    connection.connection_epoch().value(),
+                    connection.selected_socket_facts(),
+                ));
+            }
             let seen = match event {
                 PmUserWsEvent::ConnectionOpened(value) => {
                     Seen::Open(value.connection().connection_epoch().value())
@@ -1244,6 +1522,7 @@ mod tests {
                 sender,
                 rendered: sink_rendered,
                 generations: sink_generations,
+                selected_facts: None,
             };
             let result = role.run(signal, &mut sink).await;
             supervisor.shutdown().await.unwrap();
@@ -1280,31 +1559,48 @@ mod tests {
         assert!(!text.contains("operation"));
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "current_thread")]
     async fn selected_loopback_dialer_preserves_user_worker_protocol_on_local_set() {
         LocalSet::new()
             .run_until(async {
                 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let address = listener.local_addr().unwrap();
+                let exact_peer_ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+                let selected_source: std::net::IpAddr = "127.0.0.2".parse().unwrap();
+                let decoy_ip: std::net::IpAddr = "127.0.0.3".parse().unwrap();
+                let decoy = TcpListener::bind(format!("127.0.0.3:{}", address.port()))
+                    .await
+                    .unwrap();
+                assert_eq!(address.ip(), exact_peer_ip);
+                assert_eq!(decoy.local_addr().unwrap().ip(), decoy_ip);
                 let server = tokio::task::spawn_local(async move {
-                    let (stream, _) = listener.accept().await.unwrap();
-                    let mut socket = accept_async(stream).await.unwrap();
-                    read_exact_subscription(&mut socket).await;
-                    while let Some(message) = socket.next().await {
-                        match message {
-                            Ok(Message::Close(_)) | Err(_) => break,
-                            Ok(_) => {}
+                    for attempt in 0..2 {
+                        let (stream, accepted_peer) = listener.accept().await.unwrap();
+                        assert_eq!(accepted_peer.ip(), selected_source);
+                        let mut socket = accept_async(stream).await.unwrap();
+                        read_exact_subscription(&mut socket).await;
+                        if attempt == 0 {
+                            socket.send(Message::Close(None)).await.unwrap();
+                        } else {
+                            while let Some(message) = socket.next().await {
+                                match message {
+                                    Ok(Message::Close(_)) | Err(_) => break,
+                                    Ok(_) => {}
+                                }
+                            }
                         }
                     }
                 });
 
                 let endpoint = format!("ws://{address}/ws/user");
-                let (role, supervisor) = role(local_user_config(address, 0));
+                let (role, supervisor) = role(local_user_config(address, 1));
                 let dialer = PmTestSelectedLoopbackWsDialer::new(
                     PmFixedWsRoute::AuthenticatedUser,
                     &endpoint,
                     address,
-                    address.ip(),
+                    "lo",
+                    selected_source,
                 )
                 .unwrap();
                 let (shutdown, signal) = pm_user_ws_shutdown_channel();
@@ -1313,11 +1609,14 @@ mod tests {
                 let sink_rendered = Arc::clone(&rendered);
                 let generations = Arc::new(Mutex::new(Vec::new()));
                 let sink_generations = Arc::clone(&generations);
+                let selected_facts = Arc::new(Mutex::new(Vec::new()));
+                let sink_selected_facts = Arc::clone(&selected_facts);
                 let task = tokio::task::spawn_local(async move {
                     let mut sink = TestSink {
                         sender,
                         rendered: sink_rendered,
                         generations: sink_generations,
+                        selected_facts: Some(sink_selected_facts),
                     };
                     role.run_with_test_selected_loopback(signal, &mut sink, dialer)
                         .await
@@ -1325,12 +1624,51 @@ mod tests {
 
                 assert_eq!(next(&mut receiver).await, Seen::Open(5));
                 assert_eq!(next(&mut receiver).await, Seen::Subscription(5));
+                assert_eq!(
+                    next(&mut receiver).await,
+                    Seen::Retired(5, PmUserWsDisconnectReason::SocketClosed)
+                );
+                assert_eq!(next(&mut receiver).await, Seen::Reconnect(5, 6, 1));
+                assert_eq!(next(&mut receiver).await, Seen::Open(6));
+                assert_eq!(next(&mut receiver).await, Seen::Subscription(6));
                 shutdown.request_shutdown();
-                assert_eq!(next(&mut receiver).await, Seen::Shutdown(5));
+                assert_eq!(next(&mut receiver).await, Seen::Shutdown(6));
                 task.await.unwrap().unwrap();
                 supervisor.shutdown().await.unwrap();
                 server.await.unwrap();
-                assert_eq!(generations.lock().unwrap().as_slice(), [1, 2, 3]);
+                assert!(
+                    timeout(Duration::from_millis(50), decoy.accept())
+                        .await
+                        .is_err(),
+                    "selected user WebSocket must leave the same-port decoy idle"
+                );
+                // The first Close receive edge conservatively consumes
+                // generation 3 before retirement is stamped at generation 4.
+                assert_eq!(
+                    generations.lock().unwrap().as_slice(),
+                    [1, 2, 4, 5, 6, 7, 8]
+                );
+                let selected_facts = selected_facts.lock().unwrap();
+                assert_eq!(selected_facts.len(), 7);
+                let first_epoch_facts = selected_facts[0].1.expect("selected socket facts");
+                assert!(
+                    selected_facts[..4].iter().all(
+                        |(epoch, observed)| *epoch == 5 && *observed == Some(first_epoch_facts)
+                    )
+                );
+                let second_epoch_facts = selected_facts[4].1.expect("selected socket facts");
+                assert!(
+                    selected_facts[4..]
+                        .iter()
+                        .all(|(epoch, observed)| *epoch == 6
+                            && *observed == Some(second_epoch_facts))
+                );
+                assert_eq!(first_epoch_facts.interface_name(), "lo");
+                assert_eq!(first_epoch_facts.peer_addr(), address);
+                assert_eq!(first_epoch_facts.local_addr().ip(), selected_source);
+                assert_eq!(second_epoch_facts.interface_name(), "lo");
+                assert_eq!(second_epoch_facts.peer_addr(), address);
+                assert_eq!(second_epoch_facts.local_addr().ip(), selected_source);
                 assert!(
                     rendered
                         .lock()
@@ -1340,6 +1678,296 @@ mod tests {
                 );
             })
             .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn selected_inline_user_sink_keeps_worker_live_and_drains_after_completion() {
+        LocalSet::new()
+            .run_until(async {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let selected_source: std::net::IpAddr = "127.0.0.2".parse().unwrap();
+                let allow_worker_progress = Arc::new(Notify::new());
+                let server_allow_worker_progress = Arc::clone(&allow_worker_progress);
+                let worker_completed = Arc::new(Notify::new());
+                let server_completed = Arc::clone(&worker_completed);
+                let server = tokio::task::spawn_local(async move {
+                    let (stream, accepted_peer) = listener.accept().await.unwrap();
+                    assert_eq!(accepted_peer.ip(), selected_source);
+                    let mut socket = accept_async(stream).await.unwrap();
+                    read_exact_subscription(&mut socket).await;
+                    server_allow_worker_progress.notified().await;
+                    socket
+                        .feed(Message::text(order_frame(API_KEY)))
+                        .await
+                        .unwrap();
+                    socket
+                        .feed(Message::text(order_frame(API_KEY)))
+                        .await
+                        .unwrap();
+                    socket.flush().await.unwrap();
+                    timeout(Duration::from_secs(2), async {
+                        loop {
+                            match socket.next().await {
+                                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                                Some(Ok(_)) => {}
+                            }
+                        }
+                    })
+                    .await
+                    .expect("selected user worker did not close after saturated handoff");
+                    server_completed.notify_one();
+                });
+
+                let endpoint = format!("ws://{address}/ws/user");
+                let config = PmUserWsConfig::loopback_evidence(
+                    &endpoint,
+                    scope().condition(),
+                    Duration::from_millis(200),
+                    Duration::from_secs(30),
+                    Duration::from_secs(10),
+                    Duration::from_secs(2),
+                    4 * 1_024,
+                    0,
+                    Duration::from_millis(5),
+                    2,
+                    ConnectionEpoch::new(5),
+                )
+                .unwrap();
+                let (role, supervisor) = role(config);
+                let activity = role.activity_view();
+                let dialer = PmTestSelectedLoopbackWsDialer::new(
+                    PmFixedWsRoute::AuthenticatedUser,
+                    &endpoint,
+                    address,
+                    "lo",
+                    selected_source,
+                )
+                .unwrap();
+                let (_shutdown, signal) = pm_user_ws_shutdown_channel();
+                let entered = Arc::new(Notify::new());
+                let release = Arc::new(Notify::new());
+                let delivered = Arc::new(Mutex::new(Vec::new()));
+                let sink_entered = Arc::clone(&entered);
+                let sink_release = Arc::clone(&release);
+                let sink_delivered = Arc::clone(&delivered);
+                let mut task = tokio::task::spawn_local(async move {
+                    let mut sink = BlockingSelectedInlineSink {
+                        entered: sink_entered,
+                        release: sink_release,
+                        delivered: sink_delivered,
+                    };
+                    role.run_with_test_selected_loopback(signal, &mut sink, dialer)
+                        .await
+                });
+
+                timeout(Duration::from_secs(2), entered.notified())
+                    .await
+                    .expect("selected user Open never entered the sink barrier");
+                allow_worker_progress.notify_one();
+                timeout(Duration::from_secs(2), worker_completed.notified())
+                    .await
+                    .expect("selected user worker stopped polling behind the sink barrier");
+                assert!(activity.high_water() >= 4);
+                assert!(timeout(Duration::from_millis(50), &mut task).await.is_err());
+                release.notify_one();
+                assert!(matches!(
+                    timeout(Duration::from_secs(2), task)
+                        .await
+                        .expect("selected user inline pump did not return")
+                        .unwrap(),
+                    Err(PmUserWsRunError::Transport(
+                        PmUserWsTransportError::EventChannelSaturated
+                    ))
+                ));
+                assert_eq!(
+                    delivered.lock().unwrap().as_slice(),
+                    ["opened", "subscription", "bound"]
+                );
+                supervisor.shutdown().await.unwrap();
+                server.await.unwrap();
+            })
+            .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn selected_user_backoff_shutdown_retains_retired_epoch_facts() {
+        LocalSet::new()
+            .run_until(async {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let selected_source: std::net::IpAddr = "127.0.0.2".parse().unwrap();
+                let server = tokio::task::spawn_local(async move {
+                    let (stream, accepted_peer) = listener.accept().await.unwrap();
+                    assert_eq!(accepted_peer.ip(), selected_source);
+                    let mut socket = accept_async(stream).await.unwrap();
+                    read_exact_subscription(&mut socket).await;
+                    socket.send(Message::Close(None)).await.unwrap();
+                });
+
+                let endpoint = format!("ws://{address}/ws/user");
+                let config = PmUserWsConfig::loopback_evidence(
+                    &endpoint,
+                    scope().condition(),
+                    Duration::from_millis(200),
+                    Duration::from_millis(500),
+                    Duration::from_millis(50),
+                    Duration::from_millis(20),
+                    4 * 1_024,
+                    1,
+                    Duration::from_secs(5),
+                    8,
+                    ConnectionEpoch::new(5),
+                )
+                .unwrap();
+                let (role, supervisor) = role(config);
+                let dialer = PmTestSelectedLoopbackWsDialer::new(
+                    PmFixedWsRoute::AuthenticatedUser,
+                    &endpoint,
+                    address,
+                    "lo",
+                    selected_source,
+                )
+                .unwrap();
+                let (shutdown, signal) = pm_user_ws_shutdown_channel();
+                let (sender, mut receiver) = mpsc::unbounded_channel();
+                let facts = Arc::new(Mutex::new(Vec::new()));
+                let sink_facts = Arc::clone(&facts);
+                let task = tokio::task::spawn_local(async move {
+                    let mut sink = TestSink {
+                        sender,
+                        rendered: Arc::new(Mutex::new(Vec::new())),
+                        generations: Arc::new(Mutex::new(Vec::new())),
+                        selected_facts: Some(sink_facts),
+                    };
+                    role.run_with_test_selected_loopback(signal, &mut sink, dialer)
+                        .await
+                });
+
+                assert_eq!(next(&mut receiver).await, Seen::Open(5));
+                assert_eq!(next(&mut receiver).await, Seen::Subscription(5));
+                assert_eq!(
+                    next(&mut receiver).await,
+                    Seen::Retired(5, PmUserWsDisconnectReason::SocketClosed)
+                );
+                assert_eq!(next(&mut receiver).await, Seen::Reconnect(5, 6, 1));
+                shutdown.request_shutdown();
+                assert_eq!(next(&mut receiver).await, Seen::Shutdown(5));
+                task.await.unwrap().unwrap();
+                server.await.unwrap();
+                supervisor.shutdown().await.unwrap();
+                let facts = facts.lock().unwrap();
+                assert_eq!(facts.len(), 5);
+                let exact = facts[0].1.expect("selected facts");
+                assert!(
+                    facts
+                        .iter()
+                        .all(|(epoch, observed)| *epoch == 5 && *observed == Some(exact))
+                );
+            })
+            .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn selected_binding_failure_is_terminal_before_user_auto_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let selected_source = "127.0.0.2".parse().unwrap();
+        let endpoint = format!("ws://{address}/ws/user");
+        let (role, supervisor) = role(local_user_config(address, 3));
+        let dialer = PmTestSelectedLoopbackWsDialer::new(
+            PmFixedWsRoute::AuthenticatedUser,
+            &endpoint,
+            address,
+            "missing0",
+            selected_source,
+        )
+        .unwrap();
+        let (_shutdown, signal) = pm_user_ws_shutdown_channel();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let selected_facts = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = TestSink {
+            sender,
+            rendered: Arc::new(Mutex::new(Vec::new())),
+            generations: Arc::new(Mutex::new(Vec::new())),
+            selected_facts: Some(Arc::clone(&selected_facts)),
+        };
+        let result = role
+            .run_with_test_selected_loopback(signal, &mut sink, dialer)
+            .await;
+        assert!(matches!(
+            result,
+            Err(PmUserWsRunError::Transport(
+                PmUserWsTransportError::WorkerFailed
+            ))
+        ));
+        assert_eq!(
+            next(&mut receiver).await,
+            Seen::Retired(5, PmUserWsDisconnectReason::ConnectFailed)
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(selected_facts.lock().unwrap().as_slice(), [(5, None)]);
+        assert!(
+            timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "terminal device binding must not fall back to an unbound user connect"
+        );
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn selected_exact_peer_refusal_reaches_bounded_user_retry_exhaustion() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let selected_source = "127.0.0.2".parse().unwrap();
+        drop(listener);
+        let endpoint = format!("ws://{address}/ws/user");
+        let (role, supervisor) = role(local_user_config(address, 0));
+        let dialer = PmTestSelectedLoopbackWsDialer::new(
+            PmFixedWsRoute::AuthenticatedUser,
+            &endpoint,
+            address,
+            "lo",
+            selected_source,
+        )
+        .unwrap();
+        let (_shutdown, signal) = pm_user_ws_shutdown_channel();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut sink = TestSink {
+            sender,
+            rendered: Arc::new(Mutex::new(Vec::new())),
+            generations: Arc::new(Mutex::new(Vec::new())),
+            selected_facts: None,
+        };
+        let result = role
+            .run_with_test_selected_loopback(signal, &mut sink, dialer)
+            .await;
+        assert!(matches!(
+            result,
+            Err(PmUserWsRunError::Transport(
+                PmUserWsTransportError::RetryExhausted {
+                    attempts: 1,
+                    final_reason: PmUserWsDisconnectReason::ConnectFailed,
+                }
+            ))
+        ));
+        assert_eq!(
+            next(&mut receiver).await,
+            Seen::Retired(5, PmUserWsDisconnectReason::ConnectFailed)
+        );
+        assert_eq!(
+            next(&mut receiver).await,
+            Seen::Exhausted(5, PmUserWsDisconnectReason::ConnectFailed)
+        );
+        supervisor.shutdown().await.unwrap();
     }
 
     #[tokio::test]
