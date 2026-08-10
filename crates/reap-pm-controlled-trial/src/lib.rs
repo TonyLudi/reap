@@ -15,6 +15,7 @@ mod preflight;
 mod protected_file;
 mod reviewed_destination_profile_v1;
 mod reviewed_fresh_credential_slot_locator_v1;
+mod reviewed_remote_credential_proof_policy_v1;
 mod reviewed_signer_proxy_account_identity_v1;
 
 pub use config::{
@@ -127,6 +128,28 @@ pub use reviewed_fresh_credential_slot_locator_v1::{
     load_canonical_reviewed_fresh_credential_slot_locator_v1,
     verify_reviewed_fresh_credential_slot_locator_evidence_v1,
     verify_reviewed_fresh_credential_slot_locator_v1,
+};
+pub use reviewed_remote_credential_proof_policy_v1::{
+    CanonicalReviewedRemoteCredentialProofPolicyV1,
+    PM_T2_REVIEWED_REMOTE_CREDENTIAL_PROOF_POLICY_FILE_V1,
+    PmReviewedRemoteCredentialProofPolicyV1Error,
+    REVIEWED_REMOTE_CREDENTIAL_PROOF_POLICY_V1_SCHEMA_VERSION,
+    ReviewedRemoteCredentialAuthenticationAcceptanceContractStatusV1,
+    ReviewedRemoteCredentialProofAccountIdentityPinsV1,
+    ReviewedRemoteCredentialProofDeliveryPinsV1, ReviewedRemoteCredentialProofDestinationPinsV1,
+    ReviewedRemoteCredentialProofDispatchPolicyV1, ReviewedRemoteCredentialProofEndpointPolicyV1,
+    ReviewedRemoteCredentialProofFreshnessPolicyV1,
+    ReviewedRemoteCredentialProofHmacPreimageGrammarV1,
+    ReviewedRemoteCredentialProofHmacPreimageOrderedVariantV1,
+    ReviewedRemoteCredentialProofLocatorPinsV1, ReviewedRemoteCredentialProofOfficialSourcesV1,
+    ReviewedRemoteCredentialProofPolicyContextV1, ReviewedRemoteCredentialProofPolicyV1,
+    ReviewedRemoteCredentialProofPolicyVerificationV1,
+    ReviewedRemoteCredentialProofProtocolPolicyV1, ReviewedRemoteCredentialProofRequestPolicyV1,
+    ReviewedRemoteCredentialProofResponsePolicyV1,
+    ReviewedRemoteCredentialProofSensitiveHeaderNamesV1,
+    ReviewedRemoteCredentialProofSourceEntryPinsV1,
+    load_canonical_reviewed_remote_credential_proof_policy_v1,
+    verify_reviewed_remote_credential_proof_policy_v1,
 };
 pub use reviewed_signer_proxy_account_identity_v1::{
     CanonicalReviewedSignerProxyAccountIdentityV1, PM_T2_OFFICIAL_SOURCE_MANIFEST_BYTE_LENGTH_V1,

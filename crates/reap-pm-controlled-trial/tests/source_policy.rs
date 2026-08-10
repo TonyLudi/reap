@@ -15,6 +15,8 @@ const FRESH_CREDENTIAL_DELIVERY_BINDING_V1: &str =
     include_str!("../src/fresh_credential_delivery_binding_v1.rs");
 const REVIEWED_SIGNER_PROXY_ACCOUNT_IDENTITY_V1: &str =
     include_str!("../src/reviewed_signer_proxy_account_identity_v1.rs");
+const REVIEWED_REMOTE_CREDENTIAL_PROOF_POLICY_V1: &str =
+    include_str!("../src/reviewed_remote_credential_proof_policy_v1.rs");
 const MAIN: &str = include_str!("../src/main.rs");
 
 #[test]
@@ -49,6 +51,7 @@ fn source_exposes_only_offline_dry_run_commands_and_no_mutation_route_or_body() 
         REVIEWED_FRESH_CREDENTIAL_SLOT_LOCATOR_V1,
         FRESH_CREDENTIAL_DELIVERY_BINDING_V1,
         REVIEWED_SIGNER_PROXY_ACCOUNT_IDENTITY_V1,
+        REVIEWED_REMOTE_CREDENTIAL_PROOF_POLICY_V1,
         MAIN,
     ]
     .join("\n");
@@ -73,6 +76,484 @@ fn source_exposes_only_offline_dry_run_commands_and_no_mutation_route_or_body() 
     assert!(!MAIN.contains("Place"));
     assert!(!MAIN.contains("Cancel"));
     assert!(!MAIN.contains("ConsumeAuthorization"));
+}
+
+#[test]
+fn reviewed_remote_credential_proof_policy_v1_is_exact_noncapable_and_denied_only() {
+    for required in [
+        "REVIEWED_REMOTE_CREDENTIAL_PROOF_POLICY_V1_FINGERPRINT_DOMAIN",
+        "reap.pm-t2.controlled-trial.reviewed-remote-credential-proof-policy.v1\\0",
+        "pm-t2-reviewed-remote-credential-proof-policy-v1.json",
+        "pub struct ReviewedRemoteCredentialProofDestinationPinsV1",
+        "pub struct ReviewedRemoteCredentialProofLocatorPinsV1",
+        "pub struct ReviewedRemoteCredentialProofDeliveryPinsV1",
+        "pub struct ReviewedRemoteCredentialProofAccountIdentityPinsV1",
+        "REVIEWED_PRODUCTION_DESTINATION_PROFILE_V1_SCHEMA_VERSION",
+        "REVIEWED_FRESH_CREDENTIAL_SLOT_LOCATOR_V1_SCHEMA_VERSION",
+        "FRESH_CREDENTIAL_DELIVERY_BINDING_V1_SCHEMA_VERSION",
+        "REVIEWED_SIGNER_PROXY_ACCOUNT_IDENTITY_V1_SCHEMA_VERSION",
+        "pub profile_id: String,",
+        "pub locator_id: String,",
+        "pub binding_id: String,",
+        "pub identity_id: String,",
+        "pub canonical_sha256: String,",
+        "pub canonical_length: u64,",
+        "pub fingerprint: String,",
+        "verify_reviewed_production_destination_profile_v1(",
+        "verify_reviewed_fresh_credential_slot_locator_v1(",
+        "verify_fresh_credential_delivery_binding_v1(",
+        "verify_reviewed_signer_proxy_account_identity_v1(",
+        "context.reviewed_fresh_credential_locator",
+        "pub struct ReviewedRemoteCredentialProofOfficialSourcesV1",
+        "pub manifest: ReviewedOfficialSourceManifestPinsV1,",
+        "pub api_authentication: ReviewedRemoteCredentialProofSourceEntryPinsV1,",
+        "pub manage_orders: ReviewedRemoteCredentialProofSourceEntryPinsV1,",
+        "PM_T2_OFFICIAL_SOURCE_MANIFEST_SCHEMA_FAMILY_V1",
+        "PM_T2_OFFICIAL_SOURCE_MANIFEST_RETRIEVED_AT_UTC_V1",
+        "PM_T2_OFFICIAL_SOURCE_MANIFEST_BYTE_LENGTH_V1",
+        "PM_T2_OFFICIAL_SOURCE_MANIFEST_SHA256_V1",
+        "api_authentication",
+        "https://docs.polymarket.com/getting-started/api.md",
+        "API_AUTHENTICATION_SOURCE_BYTE_LENGTH_V1: u64 = 9_391",
+        "6c397c66109852220b3f5d8033ea274061b3fc44b426edc9faa60673ecbef8fc",
+        "manage_orders",
+        "https://docs.polymarket.com/trading/manage-orders.md",
+        "MANAGE_ORDERS_SOURCE_BYTE_LENGTH_V1: u64 = 52_401",
+        "e4a0238db31d5137b4d0da0d4333b1fb90be8f7c7b47d92968edfd993c8c4482",
+        "text/markdown; charset=utf-8",
+        "pub enum ReviewedRemoteCredentialAuthenticationAcceptanceContractStatusV1",
+        "#[serde(rename = \"unavailable_in_frozen_sources_v1\")]",
+        "UnavailableInFrozenSourcesV1,",
+        "accepts no caller-supplied substitute digest or signature",
+        "pub struct ReviewedRemoteCredentialProofEndpointPolicyV1",
+        "pub scheme: String,",
+        "pub dns_name: String,",
+        "pub tls_server_name: String,",
+        "pub http_host: String,",
+        "pub tcp_port: u16,",
+        "pub selected_peer_ip: String,",
+        "pub network_namespace_device: u64,",
+        "pub network_namespace_inode: u64,",
+        "pub interface_name: String,",
+        "pub interface_index: u32,",
+        "pub local_egress_ip: String,",
+        "pub dedicated_tunnel_or_gateway_profile_reference: String,",
+        "pub dedicated_tunnel_or_gateway_profile_sha256: String,",
+        "endpoint.network_namespace_device",
+        "endpoint.network_namespace_inode",
+        "endpoint.interface_name",
+        "endpoint.interface_index",
+        "endpoint.dedicated_tunnel_or_gateway_profile_reference",
+        "endpoint.dedicated_tunnel_or_gateway_profile_sha256",
+        "pub struct ReviewedRemoteCredentialProofSensitiveHeaderNamesV1",
+        "self.poly_address != \"POLY_ADDRESS\"",
+        "self.poly_signature != \"POLY_SIGNATURE\"",
+        "self.poly_timestamp != \"POLY_TIMESTAMP\"",
+        "self.poly_api_key != \"POLY_API_KEY\"",
+        "self.poly_passphrase != \"POLY_PASSPHRASE\"",
+        "pub enum ReviewedRemoteCredentialProofHmacPreimageOrderedVariantV1",
+        "decimal_timestamp_then_uppercase_get_then_exact_path_no_separators_v1",
+        "DecimalTimestampThenUppercaseGetThenExactPathNoSeparatorsV1,",
+        "pub hmac_algorithm: String,",
+        "hmac_sha256",
+        "pub hmac_key_source: String,",
+        "same_loaded_l2_credential_holder_decoded_url_safe_base64_secret_bytes",
+        "pub l2_secret_input_encoding: String,",
+        "rfc4648_url_safe_base64_with_padding_canonical",
+        "pub maximum_l2_secret_encoded_bytes: u16,",
+        "MAXIMUM_L2_SECRET_ENCODED_BYTES_V1: u16 = 172",
+        "pub minimum_hmac_key_bytes: u16,",
+        "MINIMUM_HMAC_KEY_BYTES_V1: u16 = 1",
+        "pub maximum_hmac_key_bytes: u16,",
+        "MAXIMUM_HMAC_KEY_BYTES_V1: u16 = 128",
+        "fresh_clob_server_unix_seconds_decimal_ascii",
+        "pub timestamp_decimal_digits: u8,",
+        "HMAC_TIMESTAMP_DECIMAL_DIGITS_V1: u8 = 10",
+        "pub minimum_timestamp_unix_seconds: u64,",
+        "HMAC_MINIMUM_TIMESTAMP_UNIX_SECONDS_V1: u64 = 1_000_000_000",
+        "pub maximum_timestamp_unix_seconds: u64,",
+        "HMAC_MAXIMUM_TIMESTAMP_UNIX_SECONDS_V1: u64 = 9_999_999_999",
+        "excluded_from_preimage_header_only",
+        "hmac_key_only_not_preimage",
+        "pub signature_encoding: String,",
+        "rfc4648_url_safe_base64_with_padding",
+        "pub signature_decoded_length: u8,",
+        "HMAC_SIGNATURE_DECODED_LENGTH_V1: u8 = 32",
+        "pub signature_encoded_length: u8,",
+        "HMAC_SIGNATURE_ENCODED_LENGTH_V1: u8 = 44",
+        "pub signature_terminal_padding: String,",
+        "HMAC_SIGNATURE_TERMINAL_PADDING_V1: &str = \"=\"",
+        "self.hmac_algorithm != HMAC_ALGORITHM_V1",
+        "self.hmac_key_source != HMAC_KEY_SOURCE_V1",
+        "self.l2_secret_input_encoding != L2_SECRET_INPUT_ENCODING_V1",
+        "self.maximum_l2_secret_encoded_bytes != MAXIMUM_L2_SECRET_ENCODED_BYTES_V1",
+        "self.minimum_hmac_key_bytes != MINIMUM_HMAC_KEY_BYTES_V1",
+        "self.maximum_hmac_key_bytes != MAXIMUM_HMAC_KEY_BYTES_V1",
+        "self.timestamp_decimal_digits != HMAC_TIMESTAMP_DECIMAL_DIGITS_V1",
+        "self.minimum_timestamp_unix_seconds",
+        "self.maximum_timestamp_unix_seconds",
+        "self.signature_encoding != HMAC_SIGNATURE_ENCODING_V1",
+        "self.signature_decoded_length != HMAC_SIGNATURE_DECODED_LENGTH_V1",
+        "self.signature_encoded_length != HMAC_SIGNATURE_ENCODED_LENGTH_V1",
+        "self.signature_terminal_padding != HMAC_SIGNATURE_TERMINAL_PADDING_V1",
+        "self.separator != HMAC_SEPARATOR_V1",
+        "self.query_component != ABSENT_COMPONENT_V1",
+        "self.body_component != ABSENT_COMPONENT_V1",
+        "self.poly_address_component != HMAC_EXCLUDED_HEADER_ONLY_V1",
+        "self.poly_api_key_component != HMAC_EXCLUDED_HEADER_ONLY_V1",
+        "self.poly_passphrase_component != HMAC_EXCLUDED_HEADER_ONLY_V1",
+        "pub poly_timestamp_source: String,",
+        "same_canonical_l2_timestamp_as_hmac_preimage",
+        "pub poly_signature_source: String,",
+        "exact_hmac_output",
+        "pub poly_api_key_source: String,",
+        "pub poly_passphrase_source: String,",
+        "same_loaded_l2_credential_holder",
+        "self.poly_timestamp_source != POLY_TIMESTAMP_SOURCE_V1",
+        "self.poly_signature_source != POLY_SIGNATURE_SOURCE_V1",
+        "self.poly_api_key_source != POLY_L2_HOLDER_SOURCE_V1",
+        "self.poly_passphrase_source != POLY_L2_HOLDER_SOURCE_V1",
+        "pub method: String,",
+        "pub path: String,",
+        "pub query: String,",
+        "pub body: String,",
+        "pub content_type: String,",
+        "pub accept: String,",
+        "pub accept_encoding: String,",
+        "self.method != CLOSED_ONLY_METHOD_V1",
+        "self.path != CLOSED_ONLY_PATH_V1",
+        "self.query != ABSENT_COMPONENT_V1",
+        "self.body != ABSENT_COMPONENT_V1",
+        "self.content_type != ABSENT_COMPONENT_V1",
+        "self.accept != ACCEPT_APPLICATION_JSON_V1",
+        "self.accept_encoding != ACCEPT_ENCODING_IDENTITY_V1",
+        "pub maximum_server_time_sample_to_dispatch_age_ms: u64,",
+        "pub maximum_proof_observation_age_ms: u64,",
+        "MAXIMUM_SERVER_TIME_SAMPLE_TO_DISPATCH_AGE_MS_V1: u64 = 5_000",
+        "MAXIMUM_PROOF_OBSERVATION_AGE_MS_V1: u64 = 5_000",
+        "maximum_preflight_observation_age_ms",
+        "maximum_observation_age_ms",
+        "pub maximum_authenticated_dispatch_count: u8,",
+        "pub connect_timeout_ms: u64,",
+        "pub request_timeout_ms: u64,",
+        "pub redirects_allowed: bool,",
+        "pub retries_allowed: bool,",
+        "pub forward_proxy_allowed: bool,",
+        "pub destination_fallback_allowed: bool,",
+        "pub connected_peer_check_before_status_and_body_required: bool,",
+        "pub ambiguous_outcome_requires_durable_burn: bool,",
+        "self.maximum_authenticated_dispatch_count != 1",
+        "self.connect_timeout_ms != CONNECT_TIMEOUT_MS_V1",
+        "self.request_timeout_ms != REQUEST_TIMEOUT_MS_V1",
+        "pub required_status_code: u16,",
+        "pub content_type_header_required: bool,",
+        "!self.content_type_header_required",
+        "pub required_content_type_essence: String,",
+        "pub allowed_content_type_charset: String,",
+        "pub allowed_content_encoding: String,",
+        "pub maximum_body_bytes: u64,",
+        "pub required_json_object_field_count: u8,",
+        "pub required_json_field_name: String,",
+        "pub required_json_field_type: String,",
+        "pub allowed_json_boolean_values: String,",
+        "pub closed_only_false_semantics: String,",
+        "pub closed_only_true_semantics: String,",
+        "pub authentication_semantics: String,",
+        "none_or_single_charset_utf8_ascii_case_insensitive",
+        "absent_or_single_identity_ascii_case_insensitive",
+        "self.maximum_body_bytes != 64",
+        "true_or_false_shape_only",
+        "placement_candidate_evaluated_separately",
+        "hard_block",
+        "neither_value_proves_authentication_acceptance_or_failure",
+        "let source_retrieval_times = self.official_sources.validate()?;",
+        "retrieved_at > reviewed_at",
+        "reviewed_at > valid_not_before",
+        "valid_not_before >= valid_not_after",
+        "reviewed_times.reviewed_at < authorization_times.reviewed_at",
+        "reviewed_times.reviewed_at > authorization_times.not_before",
+        "reviewed_times.valid_not_before != authorization_times.not_before",
+        "reviewed_times.valid_not_after != authorization_times.cleanup_not_after",
+        "pub struct ReviewedRemoteCredentialProofPolicyContextV1<'a>",
+        "pre-bind offline policy conjunction only",
+        "A future V3 must join the whole retained",
+        "must join the whole retained evidence and load token to the selected actor",
+        "retained delivery evidence or a post-split load-token join",
+        "pub config: &'a CanonicalTrialConfig,",
+        "pub online_policy: &'a CanonicalOnlinePolicyV2,",
+        "pub online_authorization: &'a CanonicalOnlineAuthorizationV2,",
+        "pub reviewed_destination: &'a CanonicalReviewedProductionDestinationProfileV1,",
+        "pub reviewed_fresh_credential_locator: &'a CanonicalReviewedFreshCredentialSlotLocatorV1,",
+        "pub fresh_credential_delivery: &'a CanonicalFreshCredentialDeliveryBindingV1,",
+        "pub reviewed_signer_proxy_identity: &'a CanonicalReviewedSignerProxyAccountIdentityV1,",
+        "pub fn load_canonical_reviewed_remote_credential_proof_policy_v1(",
+        "pub fn verify_reviewed_remote_credential_proof_policy_v1(",
+        "context: &ReviewedRemoteCredentialProofPolicyContextV1<'_>",
+        "reviewed_policy: &CanonicalReviewedRemoteCredentialProofPolicyV1",
+        "without a clock, network, or load",
+        "OfflineAuthorizationState::DENIED",
+        "ProtectedFileKind::ReviewedRemoteCredentialProofPolicyV1",
+        "CanonicalReviewedRemoteCredentialProofPolicyV1(<exact-protected-canonical-bytes; no-value-route-address-source-or-request-projection; redacted; denied>)",
+    ] {
+        assert!(
+            REVIEWED_REMOTE_CREDENTIAL_PROOF_POLICY_V1.contains(required),
+            "missing reviewed remote credential-proof policy V1 source pin `{required}`"
+        );
+    }
+
+    let false_claims = [
+        "official_source_manifest_bytes_loaded_and_hash_verified",
+        "api_authentication_source_bytes_loaded_and_hash_verified",
+        "manage_orders_source_bytes_loaded_and_hash_verified",
+        "official_source_publisher_authorship_attested",
+        "official_source_manifest_publisher_authorship_attested",
+        "api_authentication_source_publisher_authorship_attested",
+        "manage_orders_source_publisher_authorship_attested",
+        "reviewer_authorship_attested",
+        "remote_api_key_owner_attested",
+        "authoritative_authentication_acceptance_contract_available",
+        "api_key_mismatch_rejected_before_http_200_attested",
+        "l2_secret_mismatch_rejected_before_http_200_attested",
+        "passphrase_mismatch_rejected_before_http_200_attested",
+        "poly_address_mismatch_rejected_before_http_200_attested",
+        "timestamp_mismatch_rejected_before_http_200_attested",
+        "authentication_precedes_closed_only_handler_attested",
+        "response_not_shared_or_cache_derived_attested",
+        "strict_http_200_implies_live_credential_tuple_acceptance_attested",
+        "credential_provider_authorship_attested",
+        "credential_delivery_generation_attested",
+        "same_loaded_credential_holder_attested",
+        "post_load_same_holder_runtime_conjunction_attested",
+        "credential_delivery_and_remote_proof_same_source_generation_attested",
+        "globally_unique_credential_delivery_attested",
+        "rotation_generation_attested",
+        "protected_credential_directory_and_four_objects_checked",
+        "loaded_credentials_match_delivery_binding",
+        "request_l2_tuple_from_same_loaded_credential_holder_checked",
+        "selected_actor_generation_bound",
+        "product_clock_owner_bound",
+        "retained_delivery_evidence_and_load_token_joined_for_selected_actor",
+        "private_key_derived_signer_matches_config_checked",
+        "l2_credentials_match_configured_signer_checked",
+        "signer_controls_proxy_attested",
+        "signer_proxy_relationship_current_and_unrevoked_attested",
+        "server_time_sample_received",
+        "server_time_proof_authenticated_and_fresh",
+        "source_owned_current_time_checked",
+        "server_time_sample_to_dispatch_freshness_checked",
+        "server_time_and_closed_only_same_peer_pairing_checked",
+        "proof_observation_freshness_checked",
+        "response_receive_freshness_checked",
+        "poly_address_header_from_configured_signer_produced",
+        "sensitive_request_headers_produced",
+        "request_query_body_and_content_type_absence_enforced",
+        "request_accept_application_json_header_produced",
+        "accept_encoding_identity_header_produced",
+        "hmac_preimage_produced",
+        "hmac_signature_produced",
+        "fixed_local_egress_selected_and_checked",
+        "fixed_reviewed_peer_selected_and_checked",
+        "network_namespace_and_interface_selected_and_checked",
+        "tunnel_or_gateway_profile_checked",
+        "live_dns_answer_checked",
+        "dnssec_checked",
+        "dns_ttl_freshness_checked",
+        "destination_nat_equivalence_checked",
+        "authorized_public_ip_checked",
+        "connect_and_request_timeouts_enforced",
+        "authenticated_dispatch_performed_once",
+        "redirect_retry_proxy_and_fallback_absence_enforced",
+        "response_received",
+        "connected_peer_checked_before_status_and_body",
+        "tls_server_identity_verified",
+        "http_status_200_checked",
+        "response_content_type_checked",
+        "response_content_encoding_checked",
+        "response_body_length_and_exact_schema_checked",
+        "closed_only_boolean_observed",
+        "closed_only_false_readiness_checked",
+        "closed_only_true_hard_block_checked",
+        "ambiguous_outcome_durable_burn_performed",
+        "live_credential_tuple_accepted_by_provider",
+        "credential_tuple_current_and_unrevoked_attested",
+        "online_authorization_v2_reverse_pins_remote_policy",
+        "reviewed_destination_reverse_pins_remote_policy",
+        "reviewed_locator_reverse_pins_remote_policy",
+        "fresh_delivery_reverse_pins_remote_policy",
+        "reviewed_identity_reverse_pins_remote_policy",
+        "remote_policy_fingerprint_pinned_by_online_authorization_v2",
+        "remote_policy_fingerprint_pinned_by_v3",
+        "remote_policy_consumption_durably_recorded",
+        "authorization_consumption_checked",
+        "credential_mutation_authority_attested",
+    ];
+    for claim in false_claims {
+        assert!(
+            REVIEWED_REMOTE_CREDENTIAL_PROOF_POLICY_V1.contains(&format!("{claim}: false")),
+            "reviewed remote credential-proof claim is not explicitly false: {claim}"
+        );
+        assert!(
+            !REVIEWED_REMOTE_CREDENTIAL_PROOF_POLICY_V1.contains(&format!("{claim}: true")),
+            "reviewed remote credential-proof claim became true: {claim}"
+        );
+    }
+
+    for forbidden in [
+        "reqwest::",
+        "tokio::net",
+        "TcpStream",
+        "RequestBuilder",
+        "L2Credentials",
+        "AuthenticatedL2Headers",
+        "PmFixedTlsPeerSelection",
+        "PmLocalEgressSelection",
+        "PmReadServerTime",
+        "reap_polymarket_auth",
+        "reap_polymarket_wire",
+        "reap_polymarket_egress_binding",
+        "hmac::",
+        "HmacSha256",
+        "read_four(",
+        "include_bytes!",
+        "fs::read",
+        "File::open",
+        "pub fn bind_",
+        "pub fn into_parts",
+        "ProofTokenV1",
+        "acceptance_contract_sha256",
+        "expected_closed_only",
+        "observed_closed_only",
+        "production_order_entry_authorized: true",
+        "real_order_submission_authorized: true",
+    ] {
+        assert!(
+            !REVIEWED_REMOTE_CREDENTIAL_PROOF_POLICY_V1.contains(forbidden),
+            "reviewed remote credential-proof source gained forbidden capability or claim `{forbidden}`"
+        );
+    }
+
+    let acceptance_status = REVIEWED_REMOTE_CREDENTIAL_PROOF_POLICY_V1
+        .split_once("pub enum ReviewedRemoteCredentialAuthenticationAcceptanceContractStatusV1 {")
+        .and_then(|(_, tail)| tail.split_once("\n}").map(|(body, _)| body.trim()))
+        .expect("acceptance-contract status enum must remain recognizable");
+    assert_eq!(
+        acceptance_status,
+        "#[serde(rename = \"unavailable_in_frozen_sources_v1\")]\n    UnavailableInFrozenSourcesV1,"
+    );
+
+    let hmac_variant = REVIEWED_REMOTE_CREDENTIAL_PROOF_POLICY_V1
+        .split_once("pub enum ReviewedRemoteCredentialProofHmacPreimageOrderedVariantV1 {")
+        .and_then(|(_, tail)| tail.split_once("\n}").map(|(body, _)| body.trim()))
+        .expect("HMAC ordered variant enum must remain recognizable");
+    assert_eq!(
+        hmac_variant,
+        "#[serde(rename = \"decimal_timestamp_then_uppercase_get_then_exact_path_no_separators_v1\")]\n    DecimalTimestampThenUppercaseGetThenExactPathNoSeparatorsV1,"
+    );
+
+    let response = REVIEWED_REMOTE_CREDENTIAL_PROOF_POLICY_V1
+        .split_once("pub struct ReviewedRemoteCredentialProofResponsePolicyV1 {")
+        .and_then(|(_, tail)| tail.split_once("\n}").map(|(body, _)| body))
+        .expect("reviewed remote credential-proof response schema must remain recognizable");
+    for forbidden_response_field in [
+        "proxy",
+        "funder",
+        "signer",
+        "address",
+        "api_key",
+        "passphrase",
+        "signature",
+        "expected",
+        "observed",
+        "response_bytes",
+    ] {
+        assert!(
+            !response.contains(forbidden_response_field),
+            "response schema gained forbidden field `{forbidden_response_field}`"
+        );
+    }
+
+    let context = REVIEWED_REMOTE_CREDENTIAL_PROOF_POLICY_V1
+        .split_once("pub struct ReviewedRemoteCredentialProofPolicyContextV1<'a> {")
+        .and_then(|(_, tail)| tail.split_once("\n}").map(|(body, _)| body))
+        .expect("reviewed remote credential-proof context must remain recognizable");
+    for forbidden_context_input in [
+        "VerificationV1",
+        "String",
+        "&str",
+        "fingerprint:",
+        "Token",
+        "EvidenceV1",
+    ] {
+        assert!(
+            !context.contains(forbidden_context_input),
+            "reviewed remote credential-proof context gained caller evidence `{forbidden_context_input}`"
+        );
+    }
+
+    let canonical_surface = REVIEWED_REMOTE_CREDENTIAL_PROOF_POLICY_V1
+        .split_once("impl CanonicalReviewedRemoteCredentialProofPolicyV1 {")
+        .and_then(|(_, tail)| {
+            tail.split_once("impl fmt::Debug for CanonicalReviewedRemoteCredentialProofPolicyV1")
+                .map(|(surface, _)| surface)
+        })
+        .expect("canonical remote credential-proof policy surface must remain recognizable");
+    for forbidden_projection in [
+        "value(",
+        "route(",
+        "address(",
+        "endpoint(",
+        "request(",
+        "source(",
+        "bytes(",
+        "path(",
+    ] {
+        assert!(
+            !canonical_surface.contains(forbidden_projection),
+            "canonical remote credential-proof holder gained projection `{forbidden_projection}`"
+        );
+    }
+
+    let declaration = "pub struct CanonicalReviewedRemoteCredentialProofPolicyV1 {";
+    let before = REVIEWED_REMOTE_CREDENTIAL_PROOF_POLICY_V1
+        .split_once(declaration)
+        .map(|(before, _)| before)
+        .expect("canonical remote credential-proof declaration must remain recognizable");
+    let declaration_attributes = before
+        .rsplit_once("\n}\n\n")
+        .map_or(before, |(_, attributes)| attributes);
+    assert!(!declaration_attributes.contains("#[derive"));
+    for implementation in REVIEWED_REMOTE_CREDENTIAL_PROOF_POLICY_V1.split("\nimpl") {
+        let header = implementation
+            .split_once('{')
+            .map_or(implementation, |(header, _)| header);
+        assert!(
+            !(header.contains("CanonicalReviewedRemoteCredentialProofPolicyV1")
+                && ["Clone", "Copy", "Serialize", "Deserialize"]
+                    .iter()
+                    .any(|trait_name| header.contains(trait_name))),
+            "canonical remote credential-proof holder gained manual Clone, Copy, Serialize, or Deserialize"
+        );
+    }
+
+    assert!(PROTECTED.contains("ReviewedRemoteCredentialProofPolicyV1"));
+    assert!(LIB.contains("mod reviewed_remote_credential_proof_policy_v1;"));
+    assert!(!CONFIG.contains("ReviewedRemoteCredentialProofPolicyV1"));
+    assert!(!PREFLIGHT.contains("ReviewedRemoteCredentialProofPolicyV1"));
+    assert!(!ONLINE_POLICY_V2.contains("ReviewedRemoteCredentialProofPolicyV1"));
+    assert!(!ONLINE_CONSUMPTION_V2.contains("ReviewedRemoteCredentialProofPolicyV1"));
+    assert!(!REVIEWED_DESTINATION_PROFILE_V1.contains("ReviewedRemoteCredentialProofPolicyV1"));
+    assert!(
+        !REVIEWED_FRESH_CREDENTIAL_SLOT_LOCATOR_V1
+            .contains("ReviewedRemoteCredentialProofPolicyV1")
+    );
+    assert!(
+        !FRESH_CREDENTIAL_DELIVERY_BINDING_V1.contains("ReviewedRemoteCredentialProofPolicyV1")
+    );
+    assert!(
+        !REVIEWED_SIGNER_PROXY_ACCOUNT_IDENTITY_V1
+            .contains("ReviewedRemoteCredentialProofPolicyV1")
+    );
+    assert!(!MAIN.contains("ReviewedRemoteCredentialProofPolicyV1"));
 }
 
 #[test]
