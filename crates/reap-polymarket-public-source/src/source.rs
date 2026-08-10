@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, time::Duration};
 
-use reap_polymarket_egress_binding::PmLocalEgressSelection;
+use reap_polymarket_egress_binding::{PmFixedTlsPeerSelection, PmLocalEgressSelection};
 use reqwest::{
     Client, StatusCode, Url,
     header::{ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, HeaderMap, HeaderName},
@@ -9,10 +9,10 @@ use reqwest::{
 use sha2::{Digest, Sha256};
 
 use crate::{
-    PM_DATA_API_PRODUCTION_ORIGIN, PmConfiguredTokenPosition, PmDataApiPositionConfig,
-    PmDataApiPositionEvidence, PmDataApiPositionObservationCommitment, PmDataApiPositionScope,
-    PmDataApiReceiveClockObservation, PmExactPositionDecimal, PmMonitoredPositionObservation,
-    PmPublicPositionError,
+    PM_DATA_API_PRODUCTION_ORIGIN, PmConfiguredTokenPosition, PmDataApiFixedPeerSourceError,
+    PmDataApiPositionConfig, PmDataApiPositionEvidence, PmDataApiPositionObservationCommitment,
+    PmDataApiPositionScope, PmDataApiReceiveClockObservation, PmExactPositionDecimal,
+    PmMonitoredPositionObservation, PmPublicPositionError,
     config::OriginMode,
     position::{MAX_POSITION_PAGE_ROWS, ParsedPositionRow, parse_position_page},
 };
@@ -47,6 +47,7 @@ struct PmDataApiPositionTransport {
     origin: Url,
     scope: PmDataApiPositionScope,
     mode: OriginMode,
+    expected_peer: Option<std::net::SocketAddr>,
 }
 
 /// Errors specific to obtaining a production-origin proof around an otherwise
@@ -148,6 +149,12 @@ impl PmDataApiPositionTransport {
                 return Err(PmPublicPositionError::SelectedLocalEgressUnsupported);
             }
         }
+        if let Some(fixed_peer) = config.fixed_peer() {
+            if config.origin().host_str() != Some(fixed_peer.dns_name()) {
+                return Err(PmPublicPositionError::TransportBuild);
+            }
+            builder = builder.resolve(fixed_peer.dns_name(), fixed_peer.peer_addr());
+        }
         if config.mode() == OriginMode::Production {
             builder = builder.https_only(true);
         }
@@ -159,6 +166,7 @@ impl PmDataApiPositionTransport {
             origin: config.origin().clone(),
             scope: config.scope(),
             mode: config.mode(),
+            expected_peer: config.fixed_peer().map(PmFixedTlsPeerSelection::peer_addr),
         })
     }
 
@@ -172,6 +180,12 @@ impl PmDataApiPositionTransport {
             .send()
             .await
             .map_err(map_request_error)?;
+        if self
+            .expected_peer
+            .is_some_and(|expected_peer| response.remote_addr() != Some(expected_peer))
+        {
+            return Err(PmPublicPositionError::RequestFailed);
+        }
         let status = response.status();
         if status.is_redirection() {
             return Err(PmPublicPositionError::Redirect(status.as_u16()));
@@ -263,6 +277,27 @@ impl PmDataApiCurrentPositionSource {
         )
     }
 
+    /// Construct the fixed credential-free production source on one exact
+    /// reviewed TLS peer and one selected local interface/source IP.
+    pub fn production_on_fixed_tls_peer_and_selected_local_egress(
+        scope: PmDataApiPositionScope,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        fixed_peer: &PmFixedTlsPeerSelection,
+        local_egress: &PmLocalEgressSelection,
+    ) -> Result<Self, PmDataApiFixedPeerSourceError> {
+        Ok(Self::new(
+            PmDataApiPositionConfig::production_on_fixed_tls_peer_and_selected_local_egress(
+                scope,
+                connect_timeout,
+                request_timeout,
+                fixed_peer,
+                local_egress,
+            )?,
+            ClockSource::System,
+        )?)
+    }
+
     fn new(
         config: PmDataApiPositionConfig,
         clock: ClockSource,
@@ -311,6 +346,27 @@ impl PmDataApiCurrentPositionSource {
             )?,
             ClockSource::Fixed(clock),
         )
+    }
+
+    #[cfg(test)]
+    fn loopback_evidence_on_fixed_tls_peer_and_selected_local_egress(
+        scope: PmDataApiPositionScope,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        clock: PmDataApiReceiveClockObservation,
+        fixed_peer: &PmFixedTlsPeerSelection,
+        local_egress: &PmLocalEgressSelection,
+    ) -> Result<Self, PmDataApiFixedPeerSourceError> {
+        Ok(Self::new(
+            PmDataApiPositionConfig::loopback_evidence_on_fixed_tls_peer_and_selected_local_egress(
+                scope,
+                connect_timeout,
+                request_timeout,
+                fixed_peer,
+                local_egress,
+            )?,
+            ClockSource::Fixed(clock),
+        )?)
     }
 
     #[must_use]
@@ -661,6 +717,36 @@ mod tests {
     ) {
         let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let (requests_rx, task) = serve_mock(listener, responses);
+        (
+            format!("http://127.0.0.1:{}", address.port()),
+            requests_rx,
+            task,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn fixed_peer_mock_server(
+        responses: Vec<MockResponse>,
+    ) -> (
+        std::net::SocketAddr,
+        TcpListener,
+        mpsc::UnboundedReceiver<RecordedRequest>,
+        JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let decoy = TcpListener::bind(("127.0.0.3", peer_addr.port()))
+            .await
+            .unwrap();
+        let (requests, task) = serve_mock(listener, responses);
+        (peer_addr, decoy, requests, task)
+    }
+
+    fn serve_mock(
+        listener: TcpListener,
+        responses: Vec<MockResponse>,
+    ) -> (mpsc::UnboundedReceiver<RecordedRequest>, JoinHandle<()>) {
         let (requests_tx, requests_rx) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
             let mut responses = VecDeque::from(responses);
@@ -709,11 +795,7 @@ mod tests {
                 }
             }
         });
-        (
-            format!("http://127.0.0.1:{}", address.port()),
-            requests_rx,
-            task,
-        )
+        (requests_rx, task)
     }
 
     fn source(origin: &str, token: u64) -> PmDataApiCurrentPositionSource {
@@ -838,6 +920,74 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fixed_peer_keeps_hostname_source_ip_exact_peer_and_avoids_decoy() {
+        let (peer_addr, decoy, mut requests, server) =
+            fixed_peer_mock_server(vec![MockResponse::ok(format!("[{}]", row(501, "0")))]).await;
+        let fixed_peer =
+            PmFixedTlsPeerSelection::loopback_evidence("data-api-source.test", peer_addr).unwrap();
+        let local_egress =
+            PmLocalEgressSelection::loopback_evidence("lo", "127.0.0.2".parse().unwrap()).unwrap();
+        let source = PmDataApiCurrentPositionSource::loopback_evidence_on_fixed_tls_peer_and_selected_local_egress(
+            scope(501),
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+            PmDataApiReceiveClockObservation::for_loopback_evidence(1_700_000_000_123),
+            &fixed_peer,
+            &local_egress,
+        )
+        .unwrap();
+        assert_eq!(source.transport.expected_peer, Some(peer_addr));
+
+        let observation = source.observe_configured_token().await.unwrap();
+        assert_eq!(observation.rows_observed(), 1);
+        let request = requests.recv().await.unwrap();
+        assert_eq!(request.peer_ip, "127.0.0.2".parse::<IpAddr>().unwrap());
+        let expected_host = format!("host: data-api-source.test:{}", peer_addr.port());
+        assert!(
+            request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case(&expected_host))
+        );
+        server.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), decoy.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fixed_peer_response_rejects_a_different_expected_remote_socket() {
+        let (peer_addr, _decoy, _requests, server) =
+            fixed_peer_mock_server(vec![MockResponse::ok(format!("[{}]", row(501, "0")))]).await;
+        let fixed_peer =
+            PmFixedTlsPeerSelection::loopback_evidence("data-api-source.test", peer_addr).unwrap();
+        let local_egress =
+            PmLocalEgressSelection::loopback_evidence("lo", "127.0.0.2".parse().unwrap()).unwrap();
+        let mut source = PmDataApiCurrentPositionSource::loopback_evidence_on_fixed_tls_peer_and_selected_local_egress(
+            scope(501),
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+            PmDataApiReceiveClockObservation::for_loopback_evidence(1_700_000_000_123),
+            &fixed_peer,
+            &local_egress,
+        )
+        .unwrap();
+        source.transport.expected_peer = Some(std::net::SocketAddr::new(
+            "127.0.0.3".parse().unwrap(),
+            peer_addr.port(),
+        ));
+
+        assert!(matches!(
+            source.observe_configured_token().await,
+            Err(PmPublicPositionError::RequestFailed)
+        ));
+        server.await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn selected_production_constructor_changes_no_fixed_source_authority() {
         let selection =
@@ -882,6 +1032,68 @@ mod tests {
             ),
             Err(PmPublicPositionError::LocalEgressSelection(
                 reap_polymarket_egress_binding::PmLocalEgressSelectionError::ProductionSelectionRequired
+            ))
+        ));
+
+        let production_peer =
+            PmFixedTlsPeerSelection::production("data-api.polymarket.com", "8.8.8.8").unwrap();
+        assert!(matches!(
+            PmDataApiCurrentPositionSource::production_on_fixed_tls_peer_and_selected_local_egress(
+                scope(501),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                &production_peer,
+                &loopback,
+            ),
+            Err(PmDataApiFixedPeerSourceError::LocalEgressSelection(
+                reap_polymarket_egress_binding::PmLocalEgressSelectionError::ProductionSelectionRequired
+            ))
+        ));
+
+        let loopback_peer = PmFixedTlsPeerSelection::loopback_evidence(
+            "data-api-source.test",
+            "127.0.0.1:9".parse().unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            PmDataApiPositionConfig::loopback_evidence_on_fixed_tls_peer_and_selected_local_egress(
+                scope(501),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                &loopback_peer,
+                &production,
+            ),
+            Err(PmDataApiFixedPeerSourceError::LocalEgressSelection(
+                reap_polymarket_egress_binding::PmLocalEgressSelectionError::LoopbackEvidenceSelectionRequired
+            ))
+        ));
+
+        let wrong_host_peer =
+            PmFixedTlsPeerSelection::production("polygon.drpc.org", "8.8.8.8").unwrap();
+        assert!(matches!(
+            PmDataApiCurrentPositionSource::production_on_fixed_tls_peer_and_selected_local_egress(
+                scope(501),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                &wrong_host_peer,
+                &production,
+            ),
+            Err(PmDataApiFixedPeerSourceError::DnsNameMismatch)
+        ));
+
+        let ipv6_local =
+            PmLocalEgressSelection::production("pm0", "2001:4860:4860::8844".parse().unwrap())
+                .unwrap();
+        assert!(matches!(
+            PmDataApiCurrentPositionSource::production_on_fixed_tls_peer_and_selected_local_egress(
+                scope(501),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                &production_peer,
+                &ipv6_local,
+            ),
+            Err(PmDataApiFixedPeerSourceError::FixedTlsPeerSelection(
+                reap_polymarket_egress_binding::PmFixedTlsPeerSelectionError::AddressFamilyMismatch
             ))
         ));
     }

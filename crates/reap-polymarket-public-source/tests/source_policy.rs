@@ -201,6 +201,8 @@ fn production_origin_route_query_and_transport_policy_are_closed() {
         ".no_proxy()",
         ".interface(local_egress.interface_name())",
         ".local_address(local_egress.local_source_ip())",
+        ".resolve(fixed_peer.dns_name(), fixed_peer.peer_addr())",
+        "response.remote_addr() != Some(expected_peer)",
         ".header(ACCEPT, \"application/json\")",
         ".header(ACCEPT_ENCODING, \"identity\")",
         "MAX_POSITION_PAGE_BODY_BYTES",
@@ -238,10 +240,27 @@ fn selected_local_egress_is_configuration_only_and_preserves_the_fixed_get_surfa
         "pub fn production_on_selected_local_egress(",
         "local_egress: &PmLocalEgressSelection",
         "PmDataApiPositionConfig::production_on_selected_local_egress(",
+        "pub fn production_on_fixed_tls_peer_and_selected_local_egress(",
+        "production_on_fixed_tls_peer_and_selected_local_egress(",
+        "loopback_evidence_on_fixed_tls_peer_and_selected_local_egress(",
+        "fixed_peer: &PmFixedTlsPeerSelection",
+        "fixed_peer.require_production()?;",
+        "fixed_peer.require_loopback_evidence()?;",
+        "fixed_peer.require_same_address_family(local_egress)?;",
+        "config.origin.host_str() != Some(fixed_peer.dns_name())",
         "local_egress.require_production()?;",
         "local_egress.require_loopback_evidence()?;",
         ".interface(local_egress.interface_name())",
         ".local_address(local_egress.local_source_ip())",
+        ".resolve(fixed_peer.dns_name(), fixed_peer.peer_addr())",
+        "expected_peer: Option<std::net::SocketAddr>",
+        "response.remote_addr() != Some(expected_peer)",
+        "return Err(PmPublicPositionError::RequestFailed)",
+        "pub enum PmDataApiFixedPeerSourceError",
+        "FixedTlsPeerSelection(#[from] PmFixedTlsPeerSelectionError)",
+        "LocalEgressSelection(#[from] PmLocalEgressSelectionError)",
+        "DnsNameMismatch",
+        "Source(#[from] PmPublicPositionError)",
         "#[cfg(target_os = \"linux\")]",
         "SelectedLocalEgressUnsupported",
     ] {
@@ -254,12 +273,43 @@ fn selected_local_egress_is_configuration_only_and_preserves_the_fixed_get_surfa
         "pub fn client(",
         "pub fn request(",
         "pub fn local_egress(",
+        "pub fn fixed_peer(",
+        "pub const fn fixed_peer(",
+        ".resolve_to_addrs(",
         "PmSelectedEgressGeoblockObservation",
         "production_order_entry_authorized: true",
     ] {
         assert!(
             !CONFIG.contains(forbidden) && !SOURCE.contains(forbidden),
             "selected egress escape: {forbidden}"
+        );
+    }
+    for required in [
+        "fixed_peer_keeps_hostname_source_ip_exact_peer_and_avoids_decoy",
+        "fixed_peer_response_rejects_a_different_expected_remote_socket",
+        "127.0.0.2",
+        "data-api-source.test",
+        "decoy.accept()",
+        "PmFixedTlsPeerSelectionError::AddressFamilyMismatch",
+    ] {
+        assert!(
+            SOURCE.contains(required),
+            "missing dynamic fixed-peer pin: {required}"
+        );
+    }
+    let raw_error = between(
+        ERROR,
+        "pub enum PmPublicPositionError {",
+        "\n}\n\n/// Construction errors confined",
+    );
+    for fixed_peer_only in [
+        "FixedTlsPeerSelection",
+        "DnsNameMismatch",
+        "RemotePeerMismatch",
+    ] {
+        assert!(
+            !raw_error.contains(fixed_peer_only),
+            "raw Data API error enum expanded with {fixed_peer_only}"
         );
     }
 }

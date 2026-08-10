@@ -3,10 +3,10 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use reap_pm_core::{EvmAddress, PmConditionId, PmTokenId};
-use reap_polymarket_egress_binding::PmLocalEgressSelection;
+use reap_polymarket_egress_binding::{PmFixedTlsPeerSelection, PmLocalEgressSelection};
 use reqwest::Url;
 
-use crate::PmPublicPositionError;
+use crate::{PmDataApiFixedPeerSourceError, PmPublicPositionError};
 
 pub const PM_DATA_API_PRODUCTION_ORIGIN: &str = "https://data-api.polymarket.com";
 const MAX_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
@@ -67,6 +67,7 @@ pub struct PmDataApiPositionConfig {
     scope: PmDataApiPositionScope,
     mode: OriginMode,
     local_egress: Option<PmLocalEgressSelection>,
+    fixed_peer: Option<PmFixedTlsPeerSelection>,
 }
 
 impl PmDataApiPositionConfig {
@@ -84,6 +85,7 @@ impl PmDataApiPositionConfig {
             scope,
             mode: OriginMode::Production,
             local_egress: None,
+            fixed_peer: None,
         })
     }
 
@@ -99,6 +101,25 @@ impl PmDataApiPositionConfig {
     ) -> Result<Self, PmPublicPositionError> {
         local_egress.require_production()?;
         let mut config = Self::production(scope, connect_timeout, request_timeout)?;
+        config.local_egress = Some(local_egress.clone());
+        Ok(config)
+    }
+
+    pub(crate) fn production_on_fixed_tls_peer_and_selected_local_egress(
+        scope: PmDataApiPositionScope,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        fixed_peer: &PmFixedTlsPeerSelection,
+        local_egress: &PmLocalEgressSelection,
+    ) -> Result<Self, PmDataApiFixedPeerSourceError> {
+        fixed_peer.require_production()?;
+        local_egress.require_production()?;
+        fixed_peer.require_same_address_family(local_egress)?;
+        let mut config = Self::production(scope, connect_timeout, request_timeout)?;
+        if config.origin.host_str() != Some(fixed_peer.dns_name()) {
+            return Err(PmDataApiFixedPeerSourceError::DnsNameMismatch);
+        }
+        config.fixed_peer = Some(fixed_peer.clone());
         config.local_egress = Some(local_egress.clone());
         Ok(config)
     }
@@ -119,6 +140,7 @@ impl PmDataApiPositionConfig {
             scope,
             mode: OriginMode::NumericLoopback,
             local_egress: None,
+            fixed_peer: None,
         })
     }
 
@@ -135,6 +157,35 @@ impl PmDataApiPositionConfig {
             Self::numeric_loopback_evidence(origin, scope, connect_timeout, request_timeout)?;
         config.local_egress = Some(local_egress.clone());
         Ok(config)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn loopback_evidence_on_fixed_tls_peer_and_selected_local_egress(
+        scope: PmDataApiPositionScope,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        fixed_peer: &PmFixedTlsPeerSelection,
+        local_egress: &PmLocalEgressSelection,
+    ) -> Result<Self, PmDataApiFixedPeerSourceError> {
+        validate_timeouts(connect_timeout, request_timeout)?;
+        fixed_peer.require_loopback_evidence()?;
+        local_egress.require_loopback_evidence()?;
+        fixed_peer.require_same_address_family(local_egress)?;
+        let origin = Url::parse(&format!(
+            "http://{}:{}/",
+            fixed_peer.dns_name(),
+            fixed_peer.peer_addr().port()
+        ))
+        .map_err(|_| PmPublicPositionError::InvalidConfiguration)?;
+        Ok(Self {
+            origin,
+            connect_timeout,
+            request_timeout,
+            scope,
+            mode: OriginMode::NumericLoopback,
+            local_egress: Some(local_egress.clone()),
+            fixed_peer: Some(fixed_peer.clone()),
+        })
     }
 
     #[must_use]
@@ -165,6 +216,10 @@ impl PmDataApiPositionConfig {
 
     pub(crate) const fn local_egress(&self) -> Option<&PmLocalEgressSelection> {
         self.local_egress.as_ref()
+    }
+
+    pub(crate) const fn fixed_peer(&self) -> Option<&PmFixedTlsPeerSelection> {
+        self.fixed_peer.as_ref()
     }
 }
 
@@ -273,6 +328,30 @@ mod tests {
         assert_eq!(config.origin().as_str(), "https://data-api.polymarket.com/");
         assert_eq!(config.mode(), OriginMode::Production);
         assert_eq!(config.local_egress(), Some(&selection));
+        assert!(!config.production_order_entry_authorized());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fixed_peer_production_config_preserves_host_peer_local_ip_and_denied_authority() {
+        let local_egress =
+            PmLocalEgressSelection::production("pm-tunnel0", "192.0.2.10".parse().unwrap())
+                .unwrap();
+        let fixed_peer =
+            PmFixedTlsPeerSelection::production("data-api.polymarket.com", "8.8.8.8").unwrap();
+        let config =
+            PmDataApiPositionConfig::production_on_fixed_tls_peer_and_selected_local_egress(
+                scope(),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                &fixed_peer,
+                &local_egress,
+            )
+            .unwrap();
+        assert_eq!(config.origin().as_str(), "https://data-api.polymarket.com/");
+        assert_eq!(config.mode(), OriginMode::Production);
+        assert_eq!(config.local_egress(), Some(&local_egress));
+        assert_eq!(config.fixed_peer(), Some(&fixed_peer));
         assert!(!config.production_order_entry_authorized());
     }
 

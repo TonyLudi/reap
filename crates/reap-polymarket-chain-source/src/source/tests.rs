@@ -10,7 +10,7 @@ use reap_pm_core::{
     EvmAddress, PmAccountHandle, PmAccountScope, PmChainId, PmEnvironmentId, PmFunderId,
     PmSignerId, U256,
 };
-use reap_polymarket_egress_binding::PmLocalEgressSelection;
+use reap_polymarket_egress_binding::{PmFixedTlsPeerSelection, PmLocalEgressSelection};
 
 use super::*;
 use crate::{PmPolygonExchangeSpender, PmPolygonSystemClockObservation};
@@ -57,6 +57,18 @@ struct MockServer {
 impl MockServer {
     fn spawn(replies: Vec<MockReply>) -> Self {
         let listener = TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        Self::from_listener(listener, replies)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spawn_fixed_peer(replies: Vec<MockReply>) -> (Self, std::net::SocketAddr, TcpListener) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let decoy = TcpListener::bind(("127.0.0.3", peer_addr.port())).unwrap();
+        (Self::from_listener(listener, replies), peer_addr, decoy)
+    }
+
+    fn from_listener(listener: TcpListener, replies: Vec<MockReply>) -> Self {
         let address = listener.local_addr().unwrap();
         let origin = format!("http://127.0.0.1:{}/", address.port());
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -318,6 +330,78 @@ async fn selected_loopback_interface_and_source_ip_preserve_the_exact_fixed_cut(
 }
 
 #[cfg(target_os = "linux")]
+#[tokio::test]
+async fn fixed_peer_keeps_hostname_source_ip_exact_peer_and_avoids_decoy() {
+    let (server, peer_addr, decoy) = MockServer::spawn_fixed_peer(successful_replies());
+    let fixed_peer =
+        PmFixedTlsPeerSelection::loopback_evidence("polygon-source.test", peer_addr).unwrap();
+    let local_egress =
+        PmLocalEgressSelection::loopback_evidence("lo", "127.0.0.2".parse().unwrap()).unwrap();
+    let source =
+        PmPolygonAuthorizationSource::loopback_evidence_on_fixed_tls_peer_and_selected_local_egress(
+            PmPolygonSystemClockObservation::for_loopback_evidence(BLOCK_TIMESTAMP + 10),
+            Duration::from_secs(1),
+            &fixed_peer,
+            &local_egress,
+        )
+        .unwrap();
+    assert_eq!(source.transport.expected_peer, Some(peer_addr));
+
+    let cut = source
+        .finalized_authorization_cut(proxy_scope(PmPolygonExchangeSpender::StandardV2))
+        .await
+        .unwrap();
+    assert_eq!(cut.block().number(), 0x1234);
+
+    let expected_host = format!("host: polygon-source.test:{}", peer_addr.port());
+    let requests = server.finish();
+    assert_eq!(requests.len(), 5);
+    assert!(requests.iter().all(|request| {
+        request.peer_ip == "127.0.0.2".parse::<IpAddr>().unwrap()
+            && request
+                .head
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case(&expected_host))
+    }));
+    decoy.set_nonblocking(true).unwrap();
+    assert!(matches!(
+        decoy.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn fixed_peer_response_rejects_a_different_expected_remote_socket() {
+    let (server, peer_addr, _decoy) =
+        MockServer::spawn_fixed_peer(vec![MockReply::json(rpc_result(1, r#""0x89""#))]);
+    let fixed_peer =
+        PmFixedTlsPeerSelection::loopback_evidence("polygon-source.test", peer_addr).unwrap();
+    let local_egress =
+        PmLocalEgressSelection::loopback_evidence("lo", "127.0.0.2".parse().unwrap()).unwrap();
+    let mut source =
+        PmPolygonAuthorizationSource::loopback_evidence_on_fixed_tls_peer_and_selected_local_egress(
+            PmPolygonSystemClockObservation::for_loopback_evidence(BLOCK_TIMESTAMP + 10),
+            Duration::from_secs(1),
+            &fixed_peer,
+            &local_egress,
+        )
+        .unwrap();
+    source.transport.expected_peer = Some(std::net::SocketAddr::new(
+        "127.0.0.3".parse().unwrap(),
+        peer_addr.port(),
+    ));
+
+    assert_eq!(
+        source
+            .finalized_authorization_cut(proxy_scope(PmPolygonExchangeSpender::StandardV2))
+            .await,
+        Err(PmPolygonChainSourceError::RequestFailed)
+    );
+    assert_eq!(server.finish().len(), 1);
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn selected_production_constructor_changes_no_fixed_source_authority() {
     let selection =
@@ -350,6 +434,57 @@ fn selected_production_and_loopback_modes_cannot_cross_source_constructors() {
         PmPolygonAuthorizationSource::production_on_selected_local_egress(&loopback),
         Err(PmPolygonChainSourceError::LocalEgressSelection(
             reap_polymarket_egress_binding::PmLocalEgressSelectionError::ProductionSelectionRequired
+        ))
+    ));
+
+    let production_peer =
+        PmFixedTlsPeerSelection::production("polygon.drpc.org", "8.8.8.8").unwrap();
+    assert!(matches!(
+        PmPolygonAuthorizationSource::production_on_fixed_tls_peer_and_selected_local_egress(
+            &production_peer,
+            &loopback,
+        ),
+        Err(PmPolygonFixedPeerSourceError::LocalEgressSelection(
+            reap_polymarket_egress_binding::PmLocalEgressSelectionError::ProductionSelectionRequired
+        ))
+    ));
+
+    let loopback_peer = PmFixedTlsPeerSelection::loopback_evidence(
+        "polygon-source.test",
+        "127.0.0.1:9".parse().unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        PmPolygonAuthorizationSource::loopback_evidence_on_fixed_tls_peer_and_selected_local_egress(
+            PmPolygonSystemClockObservation::for_loopback_evidence(BLOCK_TIMESTAMP),
+            Duration::from_millis(100),
+            &loopback_peer,
+            &production,
+        ),
+        Err(PmPolygonFixedPeerSourceError::LocalEgressSelection(
+            reap_polymarket_egress_binding::PmLocalEgressSelectionError::LoopbackEvidenceSelectionRequired
+        ))
+    ));
+
+    let wrong_host_peer =
+        PmFixedTlsPeerSelection::production("data-api.polymarket.com", "8.8.8.8").unwrap();
+    assert!(matches!(
+        PmPolygonAuthorizationSource::production_on_fixed_tls_peer_and_selected_local_egress(
+            &wrong_host_peer,
+            &production,
+        ),
+        Err(PmPolygonFixedPeerSourceError::DnsNameMismatch)
+    ));
+
+    let ipv6_local =
+        PmLocalEgressSelection::production("pm0", "2001:4860:4860::8844".parse().unwrap()).unwrap();
+    assert!(matches!(
+        PmPolygonAuthorizationSource::production_on_fixed_tls_peer_and_selected_local_egress(
+            &production_peer,
+            &ipv6_local,
+        ),
+        Err(PmPolygonFixedPeerSourceError::FixedTlsPeerSelection(
+            reap_polymarket_egress_binding::PmFixedTlsPeerSelectionError::AddressFamilyMismatch
         ))
     ));
 }

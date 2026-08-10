@@ -12,6 +12,6 @@ pub use contract::{
     PmPolygonFinalizedAuthorizationCut, PmPolygonFinalizedBlock, PmPolygonSystemClockObservation,
 };
 pub use source::{
-    PmPolygonAuthorizationSource, PmPolygonChainSourceError,
+    PmPolygonAuthorizationSource, PmPolygonChainSourceError, PmPolygonFixedPeerSourceError,
     PmProductionPolygonFinalizedAuthorizationCut, PmProductionPolygonFinalizedAuthorizationError,
 };

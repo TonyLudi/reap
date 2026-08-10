@@ -221,11 +221,15 @@ fn origin_transport_and_clock_policy_cannot_be_widened_silently() {
     assert!(source.contains("pub fn production()"));
     assert_eq!(source.matches("pub fn production()").count(), 1);
     assert!(source.contains("pub fn production_on_selected_local_egress("));
+    assert!(source.contains("pub fn production_on_fixed_tls_peer_and_selected_local_egress("));
     assert!(source.contains("local_egress: &PmLocalEgressSelection"));
     assert!(source.contains("local_egress.require_production()?;"));
     assert!(source.contains("local_egress.require_loopback_evidence()?;"));
     assert!(source.contains("#[cfg(any(test, feature = \"loopback-evidence\"))]"));
     assert!(source.contains("pub fn loopback_evidence("));
+    assert!(
+        source.contains("pub fn loopback_evidence_on_fixed_tls_peer_and_selected_local_egress(")
+    );
     assert!(source.contains("Host::Ipv4"));
     assert!(source.contains("Host::Ipv6"));
     assert!(source.contains("ip.is_loopback()"));
@@ -234,6 +238,8 @@ fn origin_transport_and_clock_policy_cannot_be_widened_silently() {
     assert!(source.contains(".no_proxy()"));
     assert!(source.contains(".interface(local_egress.interface_name())"));
     assert!(source.contains(".local_address(local_egress.local_source_ip())"));
+    assert!(source.contains("builder.resolve(fixed_peer.dns_name(), fixed_peer.peer_addr())"));
+    assert!(source.contains("response.remote_addr() != Some(expected_peer)"));
     assert!(source.contains("#[cfg(target_os = \"linux\")]"));
     assert!(source.contains("SelectedLocalEgressUnsupported"));
     assert!(source.contains("builder.https_only(true)"));
@@ -255,8 +261,24 @@ fn selected_local_egress_is_configuration_only_and_preserves_the_fixed_rpc_surfa
         "local_egress.require_production()?;",
         "local_egress.require_loopback_evidence()?;",
         "PmPolygonRpcTransport::build(",
+        "pub fn production_on_fixed_tls_peer_and_selected_local_egress(",
+        "pub fn loopback_evidence_on_fixed_tls_peer_and_selected_local_egress(",
+        "fixed_peer: &PmFixedTlsPeerSelection",
+        "fixed_peer.require_production()?;",
+        "fixed_peer.require_loopback_evidence()?;",
+        "fixed_peer.require_same_address_family(local_egress)?;",
+        "origin.host_str() != Some(fixed_peer.dns_name())",
         ".interface(local_egress.interface_name())",
         ".local_address(local_egress.local_source_ip())",
+        ".resolve(fixed_peer.dns_name(), fixed_peer.peer_addr())",
+        "expected_peer: Option<std::net::SocketAddr>",
+        "response.remote_addr() != Some(expected_peer)",
+        "return Err(PmPolygonChainSourceError::RequestFailed)",
+        "pub enum PmPolygonFixedPeerSourceError",
+        "FixedTlsPeerSelection(#[from] PmFixedTlsPeerSelectionError)",
+        "LocalEgressSelection(#[from] PmLocalEgressSelectionError)",
+        "DnsNameMismatch",
+        "Source(#[from] PmPolygonChainSourceError)",
     ] {
         assert!(
             source.contains(required),
@@ -268,12 +290,45 @@ fn selected_local_egress_is_configuration_only_and_preserves_the_fixed_rpc_surfa
         "pub fn request(",
         "pub fn post(",
         "pub fn local_egress(",
+        "pub fn fixed_peer(",
+        ".resolve_to_addrs(",
         "PmSelectedEgressGeoblockObservation",
         "production_order_entry_authorized: true",
     ] {
         assert!(
             !source.contains(forbidden),
             "selected egress escape: {forbidden}"
+        );
+    }
+
+    let raw_error = between(
+        &source,
+        "pub enum PmPolygonChainSourceError {",
+        "\n}\n\n/// Construction errors confined",
+    );
+    for fixed_peer_only in [
+        "FixedTlsPeerSelection",
+        "DnsNameMismatch",
+        "RemotePeerMismatch",
+    ] {
+        assert!(
+            !raw_error.contains(fixed_peer_only),
+            "raw Polygon error enum expanded with {fixed_peer_only}"
+        );
+    }
+
+    let source_tests = std::fs::read_to_string(root.join("src/source/tests.rs")).unwrap();
+    for required in [
+        "fixed_peer_keeps_hostname_source_ip_exact_peer_and_avoids_decoy",
+        "fixed_peer_response_rejects_a_different_expected_remote_socket",
+        "127.0.0.2",
+        "polygon-source.test",
+        "decoy.accept()",
+        "PmFixedTlsPeerSelectionError::AddressFamilyMismatch",
+    ] {
+        assert!(
+            source_tests.contains(required),
+            "missing dynamic fixed-peer pin: {required}"
         );
     }
 }

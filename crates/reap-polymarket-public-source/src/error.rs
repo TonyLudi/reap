@@ -1,4 +1,4 @@
-use reap_polymarket_egress_binding::PmLocalEgressSelectionError;
+use reap_polymarket_egress_binding::{PmFixedTlsPeerSelectionError, PmLocalEgressSelectionError};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -45,4 +45,18 @@ pub enum PmPublicPositionError {
     SystemClockBeforeUnixEpoch,
     #[error("system clock observation exceeds the exact millisecond range")]
     SystemClockOutOfRange,
+}
+
+/// Construction errors confined to the additive fixed-peer plus selected
+/// local-egress Data API source path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum PmDataApiFixedPeerSourceError {
+    #[error(transparent)]
+    FixedTlsPeerSelection(#[from] PmFixedTlsPeerSelectionError),
+    #[error(transparent)]
+    LocalEgressSelection(#[from] PmLocalEgressSelectionError),
+    #[error("fixed TLS peer DNS name does not match the closed PM Data API origin")]
+    DnsNameMismatch,
+    #[error(transparent)]
+    Source(#[from] PmPublicPositionError),
 }

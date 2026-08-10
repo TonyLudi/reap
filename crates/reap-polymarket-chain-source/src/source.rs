@@ -3,7 +3,10 @@ use std::time::Duration;
 #[cfg(any(test, feature = "loopback-evidence"))]
 use std::net::IpAddr;
 
-use reap_polymarket_egress_binding::{PmLocalEgressSelection, PmLocalEgressSelectionError};
+use reap_polymarket_egress_binding::{
+    PmFixedTlsPeerSelection, PmFixedTlsPeerSelectionError, PmLocalEgressSelection,
+    PmLocalEgressSelectionError,
+};
 use reqwest::{Client, StatusCode, Url, redirect::Policy};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -100,6 +103,20 @@ pub enum PmPolygonChainSourceError {
     StaleFinalizedBlock,
     #[error("finalized Polygon block is more than 5 seconds in the future")]
     FutureFinalizedBlock,
+}
+
+/// Construction errors confined to the additive fixed-peer plus selected
+/// local-egress source path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum PmPolygonFixedPeerSourceError {
+    #[error(transparent)]
+    FixedTlsPeerSelection(#[from] PmFixedTlsPeerSelectionError),
+    #[error(transparent)]
+    LocalEgressSelection(#[from] PmLocalEgressSelectionError),
+    #[error("fixed TLS peer DNS name does not match the closed Polygon RPC origin")]
+    DnsNameMismatch,
+    #[error(transparent)]
+    Source(#[from] PmPolygonChainSourceError),
 }
 
 /// Errors specific to obtaining a production-origin proof around an otherwise
@@ -233,8 +250,36 @@ impl PmPolygonAuthorizationSource {
         Self::production_with_local_egress(Some(local_egress))
     }
 
+    /// Builds the fixed production source on one exact reviewed TLS peer and
+    /// one selected local interface/source IP. Both inputs are
+    /// non-authoritative configuration and must independently be in their
+    /// production modes.
+    pub fn production_on_fixed_tls_peer_and_selected_local_egress(
+        fixed_peer: &PmFixedTlsPeerSelection,
+        local_egress: &PmLocalEgressSelection,
+    ) -> Result<Self, PmPolygonFixedPeerSourceError> {
+        fixed_peer.require_production()?;
+        local_egress.require_production()?;
+        fixed_peer.require_same_address_family(local_egress)?;
+        let origin = Url::parse(PM_POLYGON_RPC_ORIGIN).expect("frozen Polygon RPC origin");
+        if origin.host_str() != Some(fixed_peer.dns_name()) {
+            return Err(PmPolygonFixedPeerSourceError::DnsNameMismatch);
+        }
+        Ok(Self::production_with_network_selections(
+            Some(local_egress),
+            Some(fixed_peer),
+        )?)
+    }
+
     fn production_with_local_egress(
         local_egress: Option<&PmLocalEgressSelection>,
+    ) -> Result<Self, PmPolygonChainSourceError> {
+        Self::production_with_network_selections(local_egress, None)
+    }
+
+    fn production_with_network_selections(
+        local_egress: Option<&PmLocalEgressSelection>,
+        fixed_peer: Option<&PmFixedTlsPeerSelection>,
     ) -> Result<Self, PmPolygonChainSourceError> {
         let origin = Url::parse(PM_POLYGON_RPC_ORIGIN).expect("frozen Polygon RPC origin");
         Ok(Self {
@@ -244,6 +289,7 @@ impl PmPolygonAuthorizationSource {
                 PRODUCTION_REQUEST_TIMEOUT,
                 true,
                 local_egress,
+                fixed_peer,
             )?,
             clock: ClockSource::System,
             mode: SourceMode::Production,
@@ -281,6 +327,42 @@ impl PmPolygonAuthorizationSource {
         )
     }
 
+    /// Build a hostname-preserving loopback evidence source on exactly one
+    /// loopback peer and one selected loopback source address.
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub fn loopback_evidence_on_fixed_tls_peer_and_selected_local_egress(
+        clock: PmPolygonSystemClockObservation,
+        request_timeout: Duration,
+        fixed_peer: &PmFixedTlsPeerSelection,
+        local_egress: &PmLocalEgressSelection,
+    ) -> Result<Self, PmPolygonFixedPeerSourceError> {
+        fixed_peer.require_loopback_evidence()?;
+        local_egress.require_loopback_evidence()?;
+        fixed_peer.require_same_address_family(local_egress)?;
+        if !(MIN_LOOPBACK_REQUEST_TIMEOUT..=MAX_LOOPBACK_REQUEST_TIMEOUT).contains(&request_timeout)
+        {
+            return Err(PmPolygonChainSourceError::InvalidLoopbackTimeout.into());
+        }
+        let origin = Url::parse(&format!(
+            "http://{}:{}/",
+            fixed_peer.dns_name(),
+            fixed_peer.peer_addr().port()
+        ))
+        .map_err(|_| PmPolygonChainSourceError::InvalidLoopbackOrigin)?;
+        Ok(Self {
+            transport: PmPolygonRpcTransport::build(
+                origin,
+                request_timeout.min(PRODUCTION_CONNECT_TIMEOUT),
+                request_timeout,
+                false,
+                Some(local_egress),
+                Some(fixed_peer),
+            )?,
+            clock: ClockSource::Fixed(clock),
+            mode: SourceMode::LoopbackEvidence,
+        })
+    }
+
     #[cfg(any(test, feature = "loopback-evidence"))]
     fn loopback_evidence_with_local_egress(
         origin: &str,
@@ -300,6 +382,7 @@ impl PmPolygonAuthorizationSource {
                 request_timeout,
                 false,
                 local_egress,
+                None,
             )?,
             clock: ClockSource::Fixed(clock),
             mode: SourceMode::LoopbackEvidence,
@@ -571,6 +654,7 @@ fn parse_numeric_loopback_origin(origin: &str) -> Result<Url, PmPolygonChainSour
 struct PmPolygonRpcTransport {
     client: Client,
     origin: Url,
+    expected_peer: Option<std::net::SocketAddr>,
 }
 
 impl PmPolygonRpcTransport {
@@ -580,6 +664,7 @@ impl PmPolygonRpcTransport {
         request_timeout: Duration,
         production: bool,
         local_egress: Option<&PmLocalEgressSelection>,
+        fixed_peer: Option<&PmFixedTlsPeerSelection>,
     ) -> Result<Self, PmPolygonChainSourceError> {
         let mut builder = Client::builder()
             .connect_timeout(connect_timeout)
@@ -600,13 +685,23 @@ impl PmPolygonRpcTransport {
                 return Err(PmPolygonChainSourceError::SelectedLocalEgressUnsupported);
             }
         }
+        if let Some(fixed_peer) = fixed_peer {
+            if origin.host_str() != Some(fixed_peer.dns_name()) {
+                return Err(PmPolygonChainSourceError::TransportBuild);
+            }
+            builder = builder.resolve(fixed_peer.dns_name(), fixed_peer.peer_addr());
+        }
         if production {
             builder = builder.https_only(true);
         }
         let client = builder
             .build()
             .map_err(|_| PmPolygonChainSourceError::TransportBuild)?;
-        Ok(Self { client, origin })
+        Ok(Self {
+            client,
+            origin,
+            expected_peer: fixed_peer.map(PmFixedTlsPeerSelection::peer_addr),
+        })
     }
 
     async fn post(&self, body: Vec<u8>) -> Result<Vec<u8>, PmPolygonChainSourceError> {
@@ -619,6 +714,12 @@ impl PmPolygonRpcTransport {
             .send()
             .await
             .map_err(map_request_error)?;
+        if self
+            .expected_peer
+            .is_some_and(|expected_peer| response.remote_addr() != Some(expected_peer))
+        {
+            return Err(PmPolygonChainSourceError::RequestFailed);
+        }
         let status = response.status();
         if status.is_redirection() {
             return Err(PmPolygonChainSourceError::Redirect {
