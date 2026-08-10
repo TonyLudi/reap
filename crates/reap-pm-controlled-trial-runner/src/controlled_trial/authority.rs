@@ -2,7 +2,9 @@ mod credential_custody;
 
 use std::{
     fmt,
+    marker::PhantomData,
     path::PathBuf,
+    rc::Rc,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -288,6 +290,50 @@ impl FreshCredentialAuthorityOwner {
         Self { custody }
     }
 
+    // BEGIN STAGED_OBSERVATION_SPAWN
+    /// Start the exact four-file fresh custody in observation-only mode.
+    ///
+    /// The task retains the sole signer without using it and owns the sole L2
+    /// bundle. The caller must supply its actor-local task set; this transition
+    /// creates only the common fixed REST/user-stream channel and terminal
+    /// custody, and cannot construct an order-authentication channel or accept
+    /// a time capability. The same local set must remain driven through
+    /// `PmObservingFreshCredentialCustody::shutdown_bounded`; dropping it
+    /// cancels the secret task but does not disarm the returned cleanup owner.
+    pub(super) fn spawn_staged_observation(
+        self,
+        local_set: &tokio::task::LocalSet,
+    ) -> Result<FreshStagedObservationAuthorityRoles, CredentialAuthorityError> {
+        let (signer, credentials, teardown) = self.custody.into_authorities_and_teardown();
+        let loaded_signer = signer.address();
+        let identity = Arc::new(AuthorityIdentity::new());
+        let (common_sender, common_receiver) = mpsc::channel(COMMON_AUTHORITY_CAPACITY);
+        let (shutdown, shutdown_receiver) = oneshot::channel();
+        let task = local_set.spawn_local(run_fresh_staged_observation_authority(
+            TaskSignerCustody::new(signer, Arc::clone(&identity)),
+            credentials,
+            common_receiver,
+            shutdown_receiver,
+        ));
+
+        Ok(FreshStagedObservationAuthorityRoles {
+            http: FixedHttpAuthenticationRole {
+                sender: common_sender.clone(),
+            },
+            user_ws: FixedUserWsAuthenticationRole {
+                sender: common_sender,
+            },
+            loaded_signer,
+            custody: PmObservingFreshCredentialCustody {
+                task: ArmedTaskSupervisor::new(shutdown, task),
+                teardown,
+                identity,
+                _actor_local: PhantomData,
+            },
+        })
+    }
+    // END STAGED_OBSERVATION_SPAWN
+
     pub(super) fn spawn_with_mutation_time_finalizers(
         self,
         place_time_finalizer: PmPlaceMutationTimeFinalizer,
@@ -429,6 +475,42 @@ impl fmt::Debug for RecoveryCredentialAuthorityOwner {
         formatter.write_str("RecoveryCredentialAuthorityOwner([REDACTED])")
     }
 }
+
+// BEGIN STAGED_OBSERVATION_ROLE_SURFACE
+/// Observation-only result of starting one fresh four-file custody.
+///
+/// The two purpose-closed read handles and armed custody remain move-only.
+/// This surface has no order authentication, dispatch, or time capability.
+#[must_use = "both read roles and the observing fresh custody must remain owned"]
+pub(super) struct FreshStagedObservationAuthorityRoles {
+    http: FixedHttpAuthenticationRole,
+    user_ws: FixedUserWsAuthenticationRole,
+    loaded_signer: EoaAddress,
+    custody: PmObservingFreshCredentialCustody,
+}
+
+impl FreshStagedObservationAuthorityRoles {
+    /// Consume the complete staged bundle only at the private-read assembly
+    /// boundary. Keeping this one projection on the bundle prevents callers
+    /// from independently sourcing the two same-credential handles.
+    pub(super) fn into_private_read_runtime_parts(
+        self,
+    ) -> (
+        FixedHttpAuthenticationRole,
+        FixedUserWsAuthenticationRole,
+        EoaAddress,
+        PmObservingFreshCredentialCustody,
+    ) {
+        (self.http, self.user_ws, self.loaded_signer, self.custody)
+    }
+}
+
+impl fmt::Debug for FreshStagedObservationAuthorityRoles {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FreshStagedObservationAuthorityRoles([REDACTED; OBSERVING])")
+    }
+}
+// END STAGED_OBSERVATION_ROLE_SURFACE
 
 #[must_use = "all roles and the armed supervisor must remain owned"]
 pub(super) struct FreshCredentialAuthorityRoles {
@@ -1154,6 +1236,66 @@ fn map_external_read_error(error: CredentialAuthorityError) -> PmLiveAdapterErro
     }
 }
 
+// BEGIN STAGED_OBSERVATION_CUSTODY
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub(super) enum PmObservingFreshCredentialShutdownError {
+    #[error("observing fresh credential files could not be removed durably")]
+    StagedCredentialTeardownFailed,
+}
+
+/// Armed terminal owner for an observation-only fresh credential task.
+///
+/// Dropping this value cannot detach the signer or L2 bundle. The sole normal
+/// terminal path joins their task before durably removing all four staged
+/// files.
+#[must_use = "dropping armed observing fresh custody aborts the process"]
+pub(super) struct PmObservingFreshCredentialCustody {
+    task: ArmedTaskSupervisor,
+    teardown: FreshPlaceCredentialTeardown,
+    identity: Arc<AuthorityIdentity>,
+    _actor_local: PhantomData<Rc<()>>,
+}
+
+impl PmObservingFreshCredentialCustody {
+    pub(super) async fn shutdown_bounded(
+        self,
+        bounds: CredentialAuthorityShutdownBounds,
+    ) -> Result<CredentialAuthorityShutdownOutcome, PmObservingFreshCredentialShutdownError> {
+        let Self {
+            task,
+            mut teardown,
+            identity,
+            _actor_local: _,
+        } = self;
+        let joined = task.join_bounded(bounds).await;
+        if !identity.signer_dropped() {
+            // A joined task cannot retain either task-local secret. The join
+            // proves the L2 value was dropped; this publication independently
+            // proves the signer's Drop completed.
+            std::process::abort();
+        }
+        teardown
+            .remove_private_key()
+            .map_err(|_| PmObservingFreshCredentialShutdownError::StagedCredentialTeardownFailed)?;
+        teardown
+            .remove_l2_files()
+            .map_err(|_| PmObservingFreshCredentialShutdownError::StagedCredentialTeardownFailed)?;
+        Ok(joined.complete_with_teardown())
+    }
+
+    #[cfg(test)]
+    fn signer_dropped_for_test(&self) -> bool {
+        self.identity.signer_dropped()
+    }
+}
+
+impl fmt::Debug for PmObservingFreshCredentialCustody {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PmObservingFreshCredentialCustody([REDACTED; ARMED])")
+    }
+}
+// END STAGED_OBSERVATION_CUSTODY
+
 #[must_use = "dropping an armed credential supervisor aborts the process"]
 pub(super) struct FreshCredentialAuthoritySupervisor {
     task: ArmedTaskSupervisor,
@@ -1461,6 +1603,34 @@ struct FreshAuthorityTaskInputs {
     cancel: mpsc::Receiver<CancelAuthorityRequest>,
     shutdown: oneshot::Receiver<()>,
 }
+
+// BEGIN STAGED_OBSERVATION_TASK
+async fn run_fresh_staged_observation_authority(
+    signer: TaskSignerCustody,
+    credentials: L2Credentials,
+    mut common: mpsc::Receiver<CommonAuthorityRequest>,
+    mut shutdown: oneshot::Receiver<()>,
+) {
+    let mut common_open = true;
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                common.close();
+                break;
+            }
+            request = common.recv(), if common_open => match request {
+                Some(request) => handle_common_request(&credentials, request),
+                // Losing both read handles is not terminal authority to drop
+                // either secret. Keep custody until bounded abandonment.
+                None => common_open = false,
+            },
+        }
+    }
+    drop(credentials);
+    drop(signer);
+}
+// END STAGED_OBSERVATION_TASK
 
 async fn run_fresh_authority(
     mut signer: TaskSignerCustody,
@@ -2594,6 +2764,101 @@ mod tests {
         let outcome = supervisor.shutdown_bounded(normal_bounds()).await.unwrap();
         assert!(outcome.task_completed_cleanly());
         assert!(all_staged_absent(directory.path()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn staged_observation_keeps_unused_signer_and_real_common_reads_until_cleanup() {
+        let local_set = tokio::task::LocalSet::new();
+        local_set
+            .run_until(async {
+                let condition = PmConditionId::parse(CONDITION).unwrap();
+                let order_id = FixedOrderId::parse(
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )
+                .unwrap();
+                let user_frame =
+                    parse_live_user_frame(user_frame_json(order_id, API_KEY).as_bytes()).unwrap();
+                let foreign_user_frame =
+                    parse_live_user_frame(user_frame_json(order_id, FOREIGN_API_KEY).as_bytes())
+                        .unwrap();
+                let directory = stage_four();
+                let roles = fresh_owner(directory.path())
+                    .spawn_staged_observation(&local_set)
+                    .unwrap();
+                assert_eq!(
+                    format!("{roles:?}"),
+                    "FreshStagedObservationAuthorityRoles([REDACTED; OBSERVING])"
+                );
+                let (mut http, mut user_ws, loaded_signer, custody) =
+                    roles.into_private_read_runtime_parts();
+
+                assert_eq!(loaded_signer, configured_eoa());
+                assert!(!custody.signer_dropped_for_test());
+                let headers = PmHttpReadAuthorityProvider::authenticate_closed_only(
+                    &mut http,
+                    L2Timestamp::from_unix_seconds(AUTH_SECONDS).unwrap(),
+                )
+                .await
+                .unwrap();
+                let mut header_capture = HeaderCapture::default();
+                headers.apply_to(&mut header_capture).unwrap();
+                let subscription = PmUserWsReadAuthorityProvider::authenticate_user_subscription(
+                    &mut user_ws,
+                    condition,
+                )
+                .await
+                .unwrap();
+                let mut frame_capture = FrameCapture::default();
+                subscription.dispatch(&mut frame_capture).unwrap();
+                let bound =
+                    PmUserWsReadAuthorityProvider::bind_user_frame(&mut user_ws, user_frame)
+                        .await
+                        .unwrap();
+                let foreign = PmUserWsReadAuthorityProvider::bind_user_frame(
+                    &mut user_ws,
+                    foreign_user_frame,
+                )
+                .await;
+
+                assert_eq!(header_capture.address, SIGNER);
+                assert_eq!(header_capture.timestamp, AUTH_SECONDS.to_string());
+                assert_eq!(header_capture.api_key, API_KEY);
+                assert_eq!(header_capture.passphrase, PASSPHRASE);
+                let subscription = String::from_utf8(frame_capture.0).unwrap();
+                assert!(subscription.contains(API_KEY));
+                assert!(subscription.contains(CONDITION));
+                assert_eq!(bound.events().len(), 1);
+                assert!(matches!(foreign, Err(PmLiveAdapterError::Auth(_))));
+                assert!(!custody.signer_dropped_for_test());
+                assert!(
+                    ["private-key", "api-key", "l2-secret", "passphrase"]
+                        .iter()
+                        .all(|name| directory.path().join(name).exists())
+                );
+
+                drop((http, user_ws));
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+                assert!(
+                    !custody.signer_dropped_for_test(),
+                    "closing read handles must not consume terminal custody"
+                );
+                assert_eq!(
+                    format!("{custody:?}"),
+                    "PmObservingFreshCredentialCustody([REDACTED; ARMED])"
+                );
+
+                let shutdown = custody.shutdown_bounded(normal_bounds()).await.unwrap();
+                assert!(shutdown.shutdown_requested());
+                assert!(!shutdown.abort_requested());
+                assert!(shutdown.task_joined());
+                assert!(shutdown.task_completed_cleanly());
+                assert!(shutdown.credentials_dropped());
+                assert!(shutdown.staged_l2_files_removed());
+                assert!(all_staged_absent(directory.path()));
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

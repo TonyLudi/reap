@@ -1319,6 +1319,110 @@ fn private_rest_and_user_stream_form_one_move_only_same_authority_cut() {
 }
 
 #[test]
+fn staged_fresh_private_reads_are_actor_local_signer_bound_and_cleanup_on_build_failure() {
+    let production = production_prefix(PRIVATE_READS);
+    let staged = between(
+        production,
+        "// BEGIN STAGED_OBSERVATION_PRIVATE_READ_ROLES",
+        "// END STAGED_OBSERVATION_PRIVATE_READ_ROLES",
+    );
+    for required in [
+        "pub(super) struct PmFreshStagedObservationPrivateReadRuntimeRoles",
+        "rest: PmFreshAuthenticatedRestRuntime",
+        "user_ws: PmSameCredentialUserWsInput",
+        "custody: PmObservingFreshCredentialCustody",
+        "pub(super) async fn production(",
+        "authority: FreshStagedObservationAuthorityRoles",
+        "shutdown_bounds: CredentialAuthorityShutdownBounds",
+        "let (http_authority, user_authority, loaded_signer, custody)",
+        "if loaded_signer != profile.signer",
+        "drop((http_authority, user_authority));",
+        "PmPrivateReadRuntimeError::StagedObservationSignerBindingMismatch",
+        "match production_runtime_core(profile, clocks, http_authority, user_authority)",
+        "cleanup_staged_observation_after_assembly_failure(",
+        "custody.shutdown_bounded(shutdown_bounds).await",
+        "PmPrivateReadRuntimeError::StagedObservationCleanupFailed",
+        "pub(super) fn into_parts(",
+    ] {
+        assert!(
+            staged.contains(required),
+            "staged private reads lost `{required}`"
+        );
+    }
+    assert!(
+        !staged.contains('?'),
+        "staged assembly must not unwind by dropping armed custody through `?`",
+    );
+    for forbidden in [
+        "FreshPlaceAuthenticationOnce",
+        "ExactOwnedCancelAuthenticationRole",
+        "FreshCredentialAuthoritySupervisor",
+        "RecoveryCredentialAuthoritySupervisor",
+        "FixedEoaSigner",
+        "L2Credentials",
+        "PlaceAuthorityRequest",
+        "CancelAuthorityRequest",
+        "PlaceHmacAdmission",
+        "CancelHmacAdmission",
+        "PmPlaceMutationTimeFinalizer",
+        "PmCancelMutationTimeFinalizer",
+        "PmPlaceMutationTimeProof",
+        "PmCancelMutationTimeProof",
+        "AuthenticatedPlaceRequest",
+        "AuthenticatedOwnedCancelRequest",
+        "place_sender",
+        "cancel_sender",
+    ] {
+        assert!(
+            !staged.contains(forbidden),
+            "staged private-read surface gained forbidden `{forbidden}` authority",
+        );
+    }
+
+    let authority_roles = between(
+        AUTHORITY,
+        "// BEGIN STAGED_OBSERVATION_ROLE_SURFACE",
+        "// END STAGED_OBSERVATION_ROLE_SURFACE",
+    );
+    let observing_spawn = between(
+        AUTHORITY,
+        "// BEGIN STAGED_OBSERVATION_SPAWN",
+        "// END STAGED_OBSERVATION_SPAWN",
+    );
+    let observing_custody = between(
+        AUTHORITY,
+        "// BEGIN STAGED_OBSERVATION_CUSTODY",
+        "// END STAGED_OBSERVATION_CUSTODY",
+    );
+    let observing_task = between(
+        AUTHORITY,
+        "// BEGIN STAGED_OBSERVATION_TASK",
+        "// END STAGED_OBSERVATION_TASK",
+    );
+    assert!(authority_roles.contains("loaded_signer: EoaAddress"));
+    assert!(!authority_roles.contains("fn loaded_signer("));
+    assert!(observing_spawn.contains("local_set: &tokio::task::LocalSet"));
+    assert!(observing_spawn.contains("local_set.spawn_local("));
+    assert!(!observing_spawn.contains("tokio::runtime::Handle"));
+    assert!(!observing_spawn.contains(".spawn("));
+    assert!(observing_custody.contains("_actor_local: PhantomData<Rc<()>>"));
+    assert!(observing_task.contains("None => common_open = false"));
+    assert!(observing_task.contains("drop(credentials);\n    drop(signer);"));
+    assert!(PRIVATE_READS.contains("assert_send::<FreshCredentialAuthorityOwner>();"));
+    assert!(PRIVATE_READS.contains(".spawn_staged_observation(local_set)"));
+    for regression in [
+        "staged_production_builds_real_same_credential_rest_and_user_roles",
+        "failed_staged_production_build_joins_and_removes_all_four_files",
+        "staged_production_rejects_profile_signer_mismatch_then_cleans_up",
+    ] {
+        assert!(PRIVATE_READS.contains(regression), "missing `{regression}`");
+        assert!(PRIVATE_READS.contains(&format!(
+            "#[tokio::test(flavor = \"current_thread\")]\n    async fn {regression}"
+        )));
+    }
+}
+
+#[test]
 fn user_online_preflight_lease_is_move_only_source_owned_and_borrow_inspectable() {
     let production = production_prefix(USER_STREAM);
     let declaration = between(

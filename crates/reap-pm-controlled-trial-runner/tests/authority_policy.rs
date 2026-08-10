@@ -247,8 +247,8 @@ fn credential_custody_is_a_private_authority_child_with_no_raw_sibling_escape() 
         authority_production
             .matches(".into_authorities_and_teardown()")
             .count(),
-        1,
-        "production may decompose fresh custody only in its credential task spawn",
+        2,
+        "production may decompose fresh custody only in its full and staged task spawns",
     );
     assert_eq!(
         authority_production
@@ -274,6 +274,185 @@ fn credential_custody_is_a_private_authority_child_with_no_raw_sibling_escape() 
             "controlled_trial/authority/credential_custody.rs",
         ],
     );
+}
+
+#[test]
+fn staged_observation_is_a_distinct_armed_read_only_fresh_custody() {
+    let production = AUTHORITY_SOURCE
+        .split_once("#[cfg(all(test, target_os = \"linux\"))]")
+        .map(|(production, _)| production)
+        .expect("unit tests must remain after the production authority");
+    let spawn = between(
+        production,
+        "// BEGIN STAGED_OBSERVATION_SPAWN",
+        "// END STAGED_OBSERVATION_SPAWN",
+    );
+    let roles = between(
+        production,
+        "// BEGIN STAGED_OBSERVATION_ROLE_SURFACE",
+        "// END STAGED_OBSERVATION_ROLE_SURFACE",
+    );
+    let custody = between(
+        production,
+        "// BEGIN STAGED_OBSERVATION_CUSTODY",
+        "// END STAGED_OBSERVATION_CUSTODY",
+    );
+    let task = between(
+        production,
+        "// BEGIN STAGED_OBSERVATION_TASK",
+        "// END STAGED_OBSERVATION_TASK",
+    );
+
+    let signature = function_signature(spawn, "pub(super) fn spawn_staged_observation");
+    assert!(signature.contains("self,"));
+    assert!(signature.contains("local_set: &tokio::task::LocalSet,"));
+    assert!(
+        signature.contains(
+            ") -> Result<FreshStagedObservationAuthorityRoles, CredentialAuthorityError>"
+        )
+    );
+    for forbidden in ["finalizer", "proof", "timestamp", "sender:", "receiver:"] {
+        assert!(
+            !signature.contains(forbidden),
+            "local-only staged spawn gained `{forbidden}` input authority",
+        );
+    }
+    for required in [
+        "same local set must remain driven through",
+        "self.custody.into_authorities_and_teardown()",
+        "let loaded_signer = signer.address();",
+        "TaskSignerCustody::new(signer, Arc::clone(&identity))",
+        "mpsc::channel(COMMON_AUTHORITY_CAPACITY)",
+        "common_sender.clone()",
+        "local_set.spawn_local(run_fresh_staged_observation_authority(",
+        "run_fresh_staged_observation_authority(",
+        "ArmedTaskSupervisor::new(shutdown, task)",
+    ] {
+        assert!(spawn.contains(required), "staged spawn lost `{required}`");
+    }
+    assert_eq!(spawn.matches(".into_authorities_and_teardown()").count(), 1);
+    assert_eq!(spawn.matches("TaskSignerCustody::new(").count(), 1);
+    assert_eq!(spawn.matches("mpsc::channel(").count(), 1);
+    assert!(!spawn.contains("tokio::runtime::Handle"));
+    assert!(!spawn.contains(".spawn("));
+
+    for required in [
+        "pub(super) struct FreshStagedObservationAuthorityRoles",
+        "http: FixedHttpAuthenticationRole",
+        "user_ws: FixedUserWsAuthenticationRole",
+        "loaded_signer: EoaAddress",
+        "custody: PmObservingFreshCredentialCustody",
+        "pub(super) fn into_private_read_runtime_parts(",
+    ] {
+        assert!(
+            roles.contains(required),
+            "staged role surface lost `{required}`"
+        );
+    }
+    for forbidden in [
+        "FixedEoaSigner",
+        "L2Credentials",
+        "FreshPlaceCredentialHandoff",
+        "FreshPlaceCredentialTeardown",
+    ] {
+        assert!(
+            !roles.contains(forbidden),
+            "staged role surface exposed raw custody `{forbidden}`",
+        );
+    }
+
+    for required in [
+        "pub(super) enum PmObservingFreshCredentialShutdownError",
+        "pub(super) struct PmObservingFreshCredentialCustody",
+        "task: ArmedTaskSupervisor",
+        "teardown: FreshPlaceCredentialTeardown",
+        "identity: Arc<AuthorityIdentity>",
+        "_actor_local: PhantomData<Rc<()>>",
+        "pub(super) async fn shutdown_bounded(",
+        "let joined = task.join_bounded(bounds).await;",
+        "if !identity.signer_dropped()",
+        ".remove_private_key()",
+        ".remove_l2_files()",
+        "Ok(joined.complete_with_teardown())",
+    ] {
+        assert!(
+            custody.contains(required),
+            "observing custody lost `{required}`"
+        );
+    }
+    let join = custody
+        .find("let joined = task.join_bounded(bounds).await;")
+        .unwrap();
+    let signer_proof = custody.find("if !identity.signer_dropped()").unwrap();
+    let key_remove = custody.find(".remove_private_key()").unwrap();
+    let l2_remove = custody.find(".remove_l2_files()").unwrap();
+    assert!(join < signer_proof && signer_proof < key_remove && key_remove < l2_remove);
+    assert!(CREDENTIAL_CUSTODY_SOURCE.contains("fn unlink_slot("));
+    assert!(CREDENTIAL_CUSTODY_SOURCE.contains("self.file.sync_all().map_err(|_|"));
+    assert!(CREDENTIAL_CUSTODY_SOURCE.contains("CredentialCustodyError::DirectorySync"));
+    assert!(spawn.contains("_actor_local: PhantomData"));
+    assert!(!production.contains("unsafe impl Send for PmObservingFreshCredentialCustody"));
+    assert!(!production.contains("unsafe impl Sync for PmObservingFreshCredentialCustody"));
+    assert!(!roles.contains("fn loaded_signer("));
+
+    for required in [
+        "signer: TaskSignerCustody",
+        "credentials: L2Credentials",
+        "mut common: mpsc::Receiver<CommonAuthorityRequest>",
+        "mut shutdown: oneshot::Receiver<()> ",
+        "Some(request) => handle_common_request(&credentials, request)",
+        "None => common_open = false",
+        "drop(credentials);",
+        "drop(signer);",
+    ] {
+        let required = required.trim_end();
+        assert!(task.contains(required), "staged task lost `{required}`");
+    }
+    assert!(!task.contains("signer.take()"));
+    assert!(!task.contains("publish_prepared_public_identity"));
+    assert!(!task.contains("None => break"));
+
+    for (name, slice) in [
+        ("spawn", spawn),
+        ("roles", roles),
+        ("custody", custody),
+        ("task", task),
+    ] {
+        for forbidden in [
+            "PlaceAuthorityRequest",
+            "CancelAuthorityRequest",
+            "FreshPlaceAuthenticationOnce",
+            "ExactOwnedCancelAuthenticationRole",
+            "PlaceHmacAdmission",
+            "CancelHmacAdmission",
+            "PmPlaceMutationTimeFinalizer",
+            "PmCancelMutationTimeFinalizer",
+            "PmPlaceMutationTimeProof",
+            "PmCancelMutationTimeProof",
+            "AuthenticatedPlaceRequest",
+            "AuthenticatedOwnedCancelRequest",
+            "place_sender",
+            "place_receiver",
+            "cancel_sender",
+            "cancel_receiver",
+            "authenticate_exact_place",
+            "authenticate_exact_owned_cancel",
+        ] {
+            assert!(
+                !slice.contains(forbidden),
+                "staged {name} slice gained mutation authority `{forbidden}`",
+            );
+        }
+    }
+    assert!(
+        AUTHORITY_SOURCE
+            .contains("staged_observation_keeps_unused_signer_and_real_common_reads_until_cleanup")
+    );
+    assert!(AUTHORITY_SOURCE.contains(
+        "#[tokio::test(flavor = \"current_thread\")]\n    async fn staged_observation_keeps_unused_signer_and_real_common_reads_until_cleanup"
+    ));
+    assert!(AUTHORITY_SOURCE.contains(".spawn_staged_observation(&local_set)"));
+    assert!(AUTHORITY_SOURCE.contains(".run_until(async {"));
 }
 
 #[test]
@@ -617,7 +796,7 @@ fn sole_task_routes_every_fixed_http_user_ws_binding_and_exact_cancel_operation(
         AUTHORITY_SOURCE
             .matches("credentials: L2Credentials")
             .count(),
-        2
+        3
     );
     assert!(AUTHORITY_SOURCE.contains("common_sender.clone()"));
     for required in [

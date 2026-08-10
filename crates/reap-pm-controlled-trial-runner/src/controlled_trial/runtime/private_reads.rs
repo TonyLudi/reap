@@ -31,9 +31,11 @@ use reap_polymarket_wire::{PmLiveOrder, PmLiveTrade, PmWireScope};
 use thiserror::Error;
 
 use super::super::authority::{
-    ExactOwnedCancelAuthenticationRole, FixedHttpAuthenticationRole, FixedUserWsAuthenticationRole,
-    FreshCredentialAuthorityRoles, FreshCredentialAuthoritySupervisor,
-    FreshPlaceAuthenticationOnce, RecoveryCredentialAuthorityRoles,
+    CredentialAuthorityShutdownBounds, ExactOwnedCancelAuthenticationRole,
+    FixedHttpAuthenticationRole, FixedUserWsAuthenticationRole, FreshCredentialAuthorityRoles,
+    FreshCredentialAuthoritySupervisor, FreshPlaceAuthenticationOnce,
+    FreshStagedObservationAuthorityRoles, PmObservingFreshCredentialCustody,
+    PmObservingFreshCredentialShutdownError, RecoveryCredentialAuthorityRoles,
     RecoveryCredentialAuthoritySupervisor,
 };
 use super::public_book::PmPrivateReadClockBundle;
@@ -1092,6 +1094,15 @@ pub(super) enum PmPrivateReadRuntimeError {
     SameCredentialAuthorityMismatch,
     #[error("user-stream activity changed; discard the torn REST cut and retry")]
     UserActivityChangedRetryRequired,
+    #[error("staged observation credentials do not match the fixed private-read signer")]
+    StagedObservationSignerBindingMismatch,
+    #[error(
+        "staged observation build failed ({build}) and bounded credential cleanup failed ({cleanup})"
+    )]
+    StagedObservationCleanupFailed {
+        build: Box<PmPrivateReadRuntimeError>,
+        cleanup: PmObservingFreshCredentialShutdownError,
+    },
 }
 
 struct PmAuthenticatedRestRuntimeCore {
@@ -1539,6 +1550,81 @@ impl PmRecoveryAuthenticatedRestRuntime {
     }
 }
 
+// BEGIN STAGED_OBSERVATION_PRIVATE_READ_ROLES
+/// Complete observation-only runtime projection of one fresh custody.
+///
+/// Construction consumes the unsplit authority bundle, preserving the common
+/// task behind both authenticated read roles and its armed terminal custody.
+pub(super) struct PmFreshStagedObservationPrivateReadRuntimeRoles {
+    rest: PmFreshAuthenticatedRestRuntime,
+    user_ws: PmSameCredentialUserWsInput,
+    custody: PmObservingFreshCredentialCustody,
+}
+
+impl PmFreshStagedObservationPrivateReadRuntimeRoles {
+    pub(super) async fn production(
+        authority: FreshStagedObservationAuthorityRoles,
+        profile: PmPrivateReadRuntimeProfile,
+        clocks: PmPrivateReadClockBundle,
+        shutdown_bounds: CredentialAuthorityShutdownBounds,
+    ) -> Result<Self, PmPrivateReadRuntimeError> {
+        let (http_authority, user_authority, loaded_signer, custody) =
+            authority.into_private_read_runtime_parts();
+        if loaded_signer != profile.signer {
+            drop((http_authority, user_authority));
+            return Err(cleanup_staged_observation_after_assembly_failure(
+                custody,
+                shutdown_bounds,
+                PmPrivateReadRuntimeError::StagedObservationSignerBindingMismatch,
+            )
+            .await);
+        }
+        match production_runtime_core(profile, clocks, http_authority, user_authority) {
+            Ok((core, user_ws)) => Ok(Self {
+                rest: PmFreshAuthenticatedRestRuntime { core },
+                user_ws,
+                custody,
+            }),
+            Err(build) => {
+                // A failed connectivity build has already dropped both common
+                // role senders. The task deliberately remains alive until this
+                // explicit joined teardown consumes its armed custody.
+                Err(cleanup_staged_observation_after_assembly_failure(
+                    custody,
+                    shutdown_bounds,
+                    build,
+                )
+                .await)
+            }
+        }
+    }
+
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        PmFreshAuthenticatedRestRuntime,
+        PmSameCredentialUserWsInput,
+        PmObservingFreshCredentialCustody,
+    ) {
+        (self.rest, self.user_ws, self.custody)
+    }
+}
+
+async fn cleanup_staged_observation_after_assembly_failure(
+    custody: PmObservingFreshCredentialCustody,
+    shutdown_bounds: CredentialAuthorityShutdownBounds,
+    build: PmPrivateReadRuntimeError,
+) -> PmPrivateReadRuntimeError {
+    match custody.shutdown_bounded(shutdown_bounds).await {
+        Ok(_) => build,
+        Err(cleanup) => PmPrivateReadRuntimeError::StagedObservationCleanupFailed {
+            build: Box::new(build),
+            cleanup,
+        },
+    }
+}
+// END STAGED_OBSERVATION_PRIVATE_READ_ROLES
+
 /// Mode-specific result after the fresh authority bundle has already been
 /// consumed and its read roles installed in fixed connectivity.
 pub(super) struct PmFreshPrivateReadRuntimeRoles {
@@ -1734,10 +1820,13 @@ mod tests {
 
     use super::*;
     use crate::controlled_trial::authority::{
-        CredentialAuthorityShutdownBounds, RecoveryCredentialAuthorityOwner,
+        CredentialAuthorityShutdownBounds, FreshCredentialAuthorityOwner,
+        FreshStagedObservationAuthorityRoles, RecoveryCredentialAuthorityOwner,
     };
 
+    const KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
     const SIGNER: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+    const FOREIGN_SIGNER: &str = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
     const PROXY: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
     const API_KEY: &str = "00000000-0000-4000-8000-000000000001";
     const FOREIGN_API_KEY: &str = "00000000-0000-4000-8000-000000000002";
@@ -2020,6 +2109,46 @@ mod tests {
         (directory, roles)
     }
 
+    fn fresh_staged_authority(
+        local_set: &tokio::task::LocalSet,
+    ) -> (TempDir, FreshStagedObservationAuthorityRoles) {
+        fn assert_send<T: Send>() {}
+        assert_send::<FreshCredentialAuthorityOwner>();
+
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        write_secret(directory.path(), "private-key", KEY);
+        write_secret(directory.path(), "api-key", API_KEY);
+        write_secret(directory.path(), "l2-secret", L2_SECRET);
+        write_secret(directory.path(), "passphrase", PASSPHRASE);
+        let roles = FreshCredentialAuthorityOwner::load_from_protected_files(
+            directory.path().to_owned(),
+            "private-key".into(),
+            "api-key".into(),
+            "l2-secret".into(),
+            "passphrase".into(),
+            signer(),
+        )
+        .unwrap()
+        .spawn_staged_observation(local_set)
+        .unwrap();
+        (directory, roles)
+    }
+
+    fn user_ws_bounds() -> PmUserWsBounds {
+        PmUserWsBounds::new(
+            Duration::from_secs(1),
+            Duration::from_secs(20),
+            Duration::from_secs(2),
+            64 * 1_024,
+            1,
+            Duration::from_millis(1),
+            8,
+            ConnectionEpoch::new(1),
+        )
+        .unwrap()
+    }
+
     fn clock_bundle(origin: &str) -> PmPrivateReadClockBundle {
         let http = PmPublicHttpConfig::loopback_evidence(
             origin,
@@ -2152,6 +2281,142 @@ mod tests {
 
     fn collection_start(marker: &PmSameCredentialAuthorityMarker) -> PmUserRestCollectionStart {
         marker.begin_rest_collection(7, ConnectionEpoch::new(3))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn staged_production_builds_real_same_credential_rest_and_user_roles() {
+        let local_set = tokio::task::LocalSet::new();
+        local_set
+            .run_until(async {
+                let (directory, authority) = fresh_staged_authority(&local_set);
+                let profile = PmPrivateReadRuntimeProfile::new(
+                    Duration::from_secs(1),
+                    Duration::from_secs(2),
+                    scope(),
+                    user_ws_bounds(),
+                    signer(),
+                    proxy(),
+                );
+                let bounds = CredentialAuthorityShutdownBounds::new(
+                    Duration::from_secs(2),
+                    Duration::from_secs(2),
+                )
+                .unwrap();
+
+                let runtime = PmFreshStagedObservationPrivateReadRuntimeRoles::production(
+                    authority,
+                    profile,
+                    clock_bundle("http://127.0.0.1:9"),
+                    bounds,
+                )
+                .await
+                .unwrap();
+                let (rest, user_ws, custody) = runtime.into_parts();
+
+                assert!(rest.core.marker.same_instance(&user_ws.marker));
+                assert!(
+                    ["private-key", "api-key", "l2-secret", "passphrase"]
+                        .iter()
+                        .all(|entry| directory.path().join(entry).exists())
+                );
+                drop((rest, user_ws));
+                let outcome = custody.shutdown_bounded(bounds).await.unwrap();
+                assert!(outcome.task_joined());
+                assert!(outcome.credentials_dropped());
+                assert!(outcome.staged_l2_files_removed());
+                for entry in ["private-key", "api-key", "l2-secret", "passphrase"] {
+                    assert!(!directory.path().join(entry).exists());
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_staged_production_build_joins_and_removes_all_four_files() {
+        let local_set = tokio::task::LocalSet::new();
+        local_set
+            .run_until(async {
+                let (directory, authority) = fresh_staged_authority(&local_set);
+                let profile = PmPrivateReadRuntimeProfile::new(
+                    Duration::ZERO,
+                    Duration::from_secs(2),
+                    scope(),
+                    user_ws_bounds(),
+                    signer(),
+                    proxy(),
+                );
+                let bounds = CredentialAuthorityShutdownBounds::new(
+                    Duration::from_secs(2),
+                    Duration::from_secs(2),
+                )
+                .unwrap();
+
+                let result = PmFreshStagedObservationPrivateReadRuntimeRoles::production(
+                    authority,
+                    profile,
+                    clock_bundle("http://127.0.0.1:9"),
+                    bounds,
+                )
+                .await;
+
+                assert!(matches!(
+                    result,
+                    Err(PmPrivateReadRuntimeError::Live(
+                        PmLiveAdapterError::InvalidConfiguration(
+                            "connect and request timeouts must be positive"
+                        )
+                    ))
+                ));
+                for entry in ["private-key", "api-key", "l2-secret", "passphrase"] {
+                    assert!(
+                        !directory.path().join(entry).exists(),
+                        "failed staged build retained {entry}"
+                    );
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn staged_production_rejects_profile_signer_mismatch_then_cleans_up() {
+        let local_set = tokio::task::LocalSet::new();
+        local_set
+            .run_until(async {
+                let (directory, authority) = fresh_staged_authority(&local_set);
+                let profile = PmPrivateReadRuntimeProfile::new(
+                    Duration::from_secs(1),
+                    Duration::from_secs(2),
+                    scope(),
+                    user_ws_bounds(),
+                    EoaAddress::parse(FOREIGN_SIGNER).unwrap(),
+                    proxy(),
+                );
+                let bounds = CredentialAuthorityShutdownBounds::new(
+                    Duration::from_secs(2),
+                    Duration::from_secs(2),
+                )
+                .unwrap();
+
+                let result = PmFreshStagedObservationPrivateReadRuntimeRoles::production(
+                    authority,
+                    profile,
+                    clock_bundle("http://127.0.0.1:9"),
+                    bounds,
+                )
+                .await;
+
+                assert!(matches!(
+                    result,
+                    Err(PmPrivateReadRuntimeError::StagedObservationSignerBindingMismatch)
+                ));
+                for entry in ["private-key", "api-key", "l2-secret", "passphrase"] {
+                    assert!(
+                        !directory.path().join(entry).exists(),
+                        "signer mismatch retained staged file {entry}"
+                    );
+                }
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
