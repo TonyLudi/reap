@@ -6,6 +6,7 @@ use reap_polymarket_auth::{
     AuthenticatedL2Headers, AuthenticatedUserSubscription, CredentialOwnedUserFrame, EoaAddress,
     FixedOrderId, L2Timestamp,
 };
+use reap_polymarket_egress_binding::{PmFixedTlsPeerSelection, PmLocalEgressSelection};
 use reap_polymarket_wire::{
     PmLiveOpenOrderPage, PmLiveOrder, PmLiveTradePage, PmLiveUserFrame, PmWireScope,
 };
@@ -117,6 +118,47 @@ impl PmExternalProxyReadConnectivityOwner {
     {
         let http_config =
             PmPrivateHttpConfig::production(connect_timeout, request_timeout, exact_order_scope)?;
+        let user_ws_config =
+            PmUserWsConfig::production(exact_order_scope.condition(), user_ws_bounds)?;
+        Self::from_configs(
+            http_config,
+            user_ws_config,
+            l2_signer_address,
+            proxy_funder,
+            http_authority,
+            user_ws_authority,
+        )
+    }
+
+    /// Construct the same external-authority read owner while fixing only its
+    /// authenticated HTTP client to one exact TLS peer and selected local
+    /// egress. The user WebSocket remains the ordinary fixed production
+    /// endpoint; selected WebSocket egress is a separate, later capability.
+    #[allow(clippy::too_many_arguments)]
+    pub fn production_on_fixed_tls_peer_and_selected_local_egress<H, U>(
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        exact_order_scope: PmWireScope,
+        user_ws_bounds: PmUserWsBounds,
+        fixed_tls_peer: PmFixedTlsPeerSelection,
+        selected_local_egress: PmLocalEgressSelection,
+        l2_signer_address: EoaAddress,
+        proxy_funder: EvmAddress,
+        http_authority: H,
+        user_ws_authority: U,
+    ) -> Result<Self, PmLiveAdapterError>
+    where
+        H: PmHttpReadAuthorityProvider + 'static,
+        U: PmUserWsReadAuthorityProvider + 'static,
+    {
+        let http_config =
+            PmPrivateHttpConfig::production_on_fixed_tls_peer_and_selected_local_egress(
+                connect_timeout,
+                request_timeout,
+                exact_order_scope,
+                fixed_tls_peer,
+                selected_local_egress,
+            )?;
         let user_ws_config =
             PmUserWsConfig::production(exact_order_scope.condition(), user_ws_bounds)?;
         Self::from_configs(
@@ -261,6 +303,20 @@ mod tests {
         .unwrap()
     }
 
+    fn user_ws_bounds() -> PmUserWsBounds {
+        PmUserWsBounds::new(
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+            4 * 1_024,
+            0,
+            Duration::from_millis(1),
+            8,
+            ConnectionEpoch::new(1),
+        )
+        .unwrap()
+    }
+
     fn foreign_frame() -> String {
         format!(
             r#"{{"event_type":"order","id":"{ORDER}","owner":"{FOREIGN_API_KEY}","market":"{CONDITION}","asset_id":"123","side":"BUY","original_size":"10","size_matched":"0","price":"0.42","type":"PLACEMENT","status":"LIVE","timestamp":"1782753357257"}}"#,
@@ -329,6 +385,35 @@ mod tests {
                 "loopback external read owner requires loopback private HTTP and user WebSocket configurations"
             ))
         ));
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fixed_peer_selected_http_preserves_external_read_authorities_without_selecting_ws() {
+        let fixed_tls_peer =
+            PmFixedTlsPeerSelection::production("clob.polymarket.com", "8.8.8.8").unwrap();
+        let selected_local_egress =
+            PmLocalEgressSelection::production("pm-tunnel0", "192.0.2.10".parse().unwrap())
+                .unwrap();
+        let (http_authority, user_ws_authority, supervisor) =
+            test_read_credential_roles(credentials()).unwrap();
+        let owner = PmExternalProxyReadConnectivityOwner::
+            production_on_fixed_tls_peer_and_selected_local_egress(
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                scope(),
+                user_ws_bounds(),
+                fixed_tls_peer,
+                selected_local_egress,
+                EoaAddress::parse(SIGNER).unwrap(),
+                EvmAddress::parse(PROXY).unwrap(),
+                http_authority,
+                user_ws_authority,
+            )
+            .unwrap();
+        assert!(!owner.production_order_entry_authorized());
+        drop(owner);
         supervisor.shutdown().await.unwrap();
     }
 

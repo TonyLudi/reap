@@ -34,6 +34,21 @@ fn production_surface_has_no_constructible_mutation_transport() {
     assert!(!TRANSPORT.contains("pub fn new_origin("));
     assert!(LIB.contains("PRODUCTION_ORDER_ENTRY_AUTHORIZED: bool = false"));
     assert!(!LIB.contains("PRODUCTION_ORDER_ENTRY_AUTHORIZED: bool = true"));
+    for source in [MUTATION, RETAINED, TRANSPORT, LOOPBACK_CREDENTIALS] {
+        for forbidden in [
+            "PmFixedTlsPeerSelection",
+            "fixed_tls_peer",
+            ".resolve(",
+            "remote_addr()",
+            "expected_peer",
+            "production_on_fixed_tls_peer_and_selected_local_egress",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "fixed read-peer capability escaped into mutation source: {forbidden}"
+            );
+        }
+    }
 }
 
 #[test]

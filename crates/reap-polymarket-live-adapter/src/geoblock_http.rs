@@ -140,6 +140,25 @@ impl PmGeoblockHttpRole {
         })
     }
 
+    /// Construct the fixed production geoblock role with one exact TLS peer
+    /// and one selected Linux interface/source address. Both inputs remain
+    /// non-authoritative configuration and grant no order-entry authority.
+    pub fn production_on_fixed_tls_peer_and_selected_local_egress(
+        connect_timeout: std::time::Duration,
+        request_timeout: std::time::Duration,
+        fixed_tls_peer: reap_polymarket_egress_binding::PmFixedTlsPeerSelection,
+        selected_local_egress: reap_polymarket_egress_binding::PmLocalEgressSelection,
+    ) -> Result<Self, PmLiveAdapterError> {
+        Self::new(
+            PmGeoblockHttpConfig::production_on_fixed_tls_peer_and_selected_local_egress(
+                connect_timeout,
+                request_timeout,
+                fixed_tls_peer,
+                selected_local_egress,
+            )?,
+        )
+    }
+
     pub async fn status(&self) -> Result<PmGeoblockStatus, PmLiveAdapterError> {
         Ok(self.status_observation().await?.into_status())
     }

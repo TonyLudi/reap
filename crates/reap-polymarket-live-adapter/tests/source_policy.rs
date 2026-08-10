@@ -89,6 +89,13 @@ fn selected_local_http_egress_is_configuration_only_and_never_a_combined_owner_c
     );
     assert_eq!(
         CONFIG
+            .matches("fixed_tls_peer: Option<PmFixedTlsPeerSelection>")
+            .count(),
+        4,
+        "every HTTP configuration family must retain the paired fixed peer privately"
+    );
+    assert_eq!(
+        CONFIG
             .matches("pub fn production_on_selected_local_egress(")
             .count(),
         2,
@@ -110,17 +117,45 @@ fn selected_local_http_egress_is_configuration_only_and_never_a_combined_owner_c
     );
     assert_eq!(
         CONFIG
-            .matches("require_production_local_egress(&selected_local_egress)?;")
+            .matches("pub(crate) const fn fixed_tls_peer(&self)")
             .count(),
         4,
-        "every selected production configuration must reject evidence mode"
+        "fixed peers are borrowed only by private transports"
+    );
+    assert_eq!(
+        CONFIG
+            .matches("pub fn production_on_fixed_tls_peer_and_selected_local_egress(")
+            .count(),
+        2,
+        "only private-read and geoblock configs expose paired production setup"
+    );
+    assert_eq!(
+        CONFIG
+            .matches("pub(crate) fn production_on_fixed_tls_peer_and_selected_local_egress(")
+            .count(),
+        2,
+        "status and public CLOB paired configs remain crate-private"
+    );
+    assert_eq!(
+        CONFIG
+            .matches("require_same_address_family(&fixed_tls_peer, &selected_local_egress)?;")
+            .count(),
+        8,
+        "every production and loopback pair must reject mixed address families"
+    );
+    assert_eq!(
+        CONFIG
+            .matches("require_production_local_egress(&selected_local_egress)?;")
+            .count(),
+        8,
+        "every selected-only and paired production configuration must reject evidence mode"
     );
     assert_eq!(
         CONFIG
             .matches("require_loopback_local_egress(&selected_local_egress)?;")
             .count(),
-        4,
-        "every selected loopback configuration must reject production mode"
+        8,
+        "every selected-only and paired loopback configuration must reject production mode"
     );
     for required in [
         ".require_production()",
@@ -138,6 +173,28 @@ fn selected_local_http_egress_is_configuration_only_and_never_a_combined_owner_c
         let production = production_prefix(transport);
         assert_eq!(production.matches(".interface(").count(), 1);
         assert_eq!(production.matches(".local_address(").count(), 1);
+        assert_eq!(production.matches("builder.resolve(").count(), 1);
+        assert_eq!(production.matches("response.remote_addr()").count(), 1);
+        assert_eq!(production.matches(".redirect(Policy::none())").count(), 1);
+        assert_eq!(
+            production
+                .matches(".retry(reqwest::retry::never())")
+                .count(),
+            1
+        );
+        assert_eq!(production.matches(".no_proxy()").count(), 1);
+        assert!(production.contains("validate_response_peer(self.expected_peer"));
+        assert!(
+            production.contains("fixed TLS peer requires an inseparable selected local egress")
+        );
+        let peer_check = production
+            .find("validate_response_peer(self.expected_peer, response.remote_addr())?")
+            .expect("fixed peer response validation");
+        let status_read = production[peer_check..]
+            .find("let status = response.status();")
+            .map(|offset| peer_check + offset)
+            .expect("status read after peer validation");
+        assert!(peer_check < status_read);
         assert!(production.contains("#[cfg(target_os = \"linux\")]"));
         assert!(production.contains("selected local egress requires Linux"));
         for escape in [
@@ -155,20 +212,90 @@ fn selected_local_http_egress_is_configuration_only_and_never_a_combined_owner_c
     }
     for role in [CLOB_HEALTH_HTTP, STATUS_ANNOUNCEMENT_HTTP] {
         assert!(role.contains("pub fn production_on_selected_local_egress("));
+        assert!(role.contains("pub fn production_on_fixed_tls_peer_and_selected_local_egress("));
         assert!(
             role.contains("selection remains non-authoritative")
                 || role.contains("selection is configuration only")
         );
     }
-    for combined_owner in [PUBLIC_CONNECTIVITY, READ_AUTHORITY, READ_ONLY_PRIVATE] {
+    assert!(
+        GEOBLOCK_HTTP.contains("pub fn production_on_fixed_tls_peer_and_selected_local_egress(")
+    );
+    for combined_owner in [PUBLIC_CONNECTIVITY, READ_ONLY_PRIVATE] {
         assert!(
             !production_prefix(combined_owner).contains("production_on_selected_local_egress"),
             "an owner containing a generic WebSocket must not claim selected egress"
+        );
+        assert!(
+            !production_prefix(combined_owner).contains("PmFixedTlsPeerSelection"),
+            "an owner containing a generic WebSocket must not claim a fixed HTTP peer"
+        );
+    }
+    let external_fixed_http = between(
+        READ_AUTHORITY,
+        "pub fn production_on_fixed_tls_peer_and_selected_local_egress<H, U>(",
+        "/// Literal-loopback construction for synthetic protocol evidence only.",
+    );
+    assert!(
+        external_fixed_http.contains(
+            "PmPrivateHttpConfig::production_on_fixed_tls_peer_and_selected_local_egress("
+        )
+    );
+    assert!(
+        external_fixed_http.contains(
+            "PmUserWsConfig::production(exact_order_scope.condition(), user_ws_bounds)?;"
+        )
+    );
+    for forbidden in [
+        "PmUserWsConfig::production_on_",
+        "PmGeoblockHttpConfig",
+        "PmPublicHttpConfig",
+        "PmFixedPlace",
+        "PmExactOwnedCancel",
+    ] {
+        assert!(
+            !external_fixed_http.contains(forbidden),
+            "purpose-closed external read constructor gained another selected role: {forbidden}"
+        );
+    }
+    assert!(READ_AUTHORITY.contains(
+        "fixed_peer_selected_http_preserves_external_read_authorities_without_selecting_ws"
+    ));
+    for (role, constructor_end) in [
+        (GEOBLOCK_HTTP, "\n    pub async fn status("),
+        (
+            CLOB_HEALTH_HTTP,
+            "\n    #[cfg(any(test, feature = \"read-only-evidence\"))]",
+        ),
+        (
+            STATUS_ANNOUNCEMENT_HTTP,
+            "\n    #[cfg(any(test, feature = \"read-only-evidence\"))]",
+        ),
+    ] {
+        let constructor = between(
+            production_prefix(role),
+            "pub fn production_on_fixed_tls_peer_and_selected_local_egress(",
+            constructor_end,
+        );
+        assert_eq!(
+            constructor.matches("PmFixedTlsPeerSelection").count(),
+            production_prefix(role)
+                .matches("PmFixedTlsPeerSelection")
+                .count(),
+            "fixed peer type must remain confined to role construction, never an observation seal",
+        );
+        assert_eq!(
+            constructor.matches("fixed_tls_peer").count() + 1,
+            production_prefix(role).matches("fixed_tls_peer").count(),
+            "fixed peer value must remain confined to role construction, never an observation seal",
         );
     }
     assert!(
         CONFIG
             .contains("pub(crate) fn production_on_selected_local_egress(\n        origin: &str,")
+    );
+    assert!(
+        CONFIG.contains("pub(crate) fn production_on_fixed_tls_peer_and_selected_local_egress(")
     );
     assert!(!production_prefix(PUBLIC_CONNECTIVITY).contains("selected_local_egress"));
     for (consumer, purpose) in [
@@ -181,12 +308,26 @@ fn selected_local_http_egress_is_configuration_only_and_never_a_combined_owner_c
         assert!(consumer.contains(purpose));
     }
     assert!(!LIB.contains("pub use reap_polymarket_egress_binding"));
+    for source in [
+        PUBLIC_WS,
+        USER_WS,
+        PRIVATE_CREDENTIALS,
+        LOOPBACK_MUTATION_CREDENTIALS,
+    ] {
+        assert!(!source.contains("PmFixedTlsPeerSelection"));
+        assert!(!source.contains("expected_peer"));
+        assert!(!source.contains("remote_addr()"));
+    }
     for transport_test in [HTTP_TRANSPORT, PRIVATE_HTTP] {
         for required in [
             "TcpListener::bind(\"0.0.0.0:0\")",
             "\"127.0.0.2\"",
             "peer_ip",
             "\"missing0\"",
+            "clob.polymarket.test",
+            "127.0.0.3",
+            "decoy.accept()",
+            "validate_response_peer(Some(expected), None)",
         ] {
             assert!(
                 transport_test.contains(required),
@@ -861,6 +1002,21 @@ fn server_time_and_type_one_account_observations_are_sealed_and_source_clocked()
         .map(|offset| closed_observe_start + offset)
         .unwrap();
     let closed_observe = &PRIVATE_HTTP[closed_observe_start..closed_observe_end];
+    for forbidden in [
+        "PmFixedTlsPeerSelection",
+        "fixed_tls_peer",
+        "expected_peer",
+        "PmLocalEgressSelection",
+    ] {
+        assert!(
+            !closed_observe.contains(forbidden),
+            "transport selection became closed-only sealing authority: {forbidden}"
+        );
+        assert!(
+            !RECONCILIATION.contains(forbidden),
+            "transport selection became reconciliation sealing authority: {forbidden}"
+        );
+    }
     assert!(
         closed_observe
             .find("self.closed_only_source(server_time)")

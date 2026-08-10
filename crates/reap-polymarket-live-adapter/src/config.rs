@@ -3,7 +3,7 @@ use std::time::Duration;
 #[cfg(any(test, feature = "loopback-evidence", feature = "read-only-evidence"))]
 use std::net::IpAddr;
 
-use reap_polymarket_egress_binding::PmLocalEgressSelection;
+use reap_polymarket_egress_binding::{PmFixedTlsPeerSelection, PmLocalEgressSelection};
 use reap_polymarket_wire::PmWireScope;
 use url::Url;
 
@@ -28,6 +28,7 @@ pub struct PmPublicHttpConfig {
     request_timeout: Duration,
     mode: OriginMode,
     selected_local_egress: Option<PmLocalEgressSelection>,
+    fixed_tls_peer: Option<PmFixedTlsPeerSelection>,
 }
 
 /// Fixed public-safety endpoint configuration. Production construction has no
@@ -39,6 +40,7 @@ pub struct PmGeoblockHttpConfig {
     request_timeout: Duration,
     mode: OriginMode,
     selected_local_egress: Option<PmLocalEgressSelection>,
+    fixed_tls_peer: Option<PmFixedTlsPeerSelection>,
 }
 
 /// Crate-private configuration for the fixed Polymarket status-page source.
@@ -50,6 +52,7 @@ pub(crate) struct PmStatusHttpConfig {
     request_timeout: Duration,
     mode: OriginMode,
     selected_local_egress: Option<PmLocalEgressSelection>,
+    fixed_tls_peer: Option<PmFixedTlsPeerSelection>,
 }
 
 impl PmStatusHttpConfig {
@@ -66,6 +69,7 @@ impl PmStatusHttpConfig {
             request_timeout,
             mode: OriginMode::Production,
             selected_local_egress: None,
+            fixed_tls_peer: None,
         })
     }
 
@@ -76,6 +80,21 @@ impl PmStatusHttpConfig {
     ) -> Result<Self, PmLiveAdapterError> {
         require_production_local_egress(&selected_local_egress)?;
         let mut config = Self::production(connect_timeout, request_timeout)?;
+        config.selected_local_egress = Some(selected_local_egress);
+        Ok(config)
+    }
+
+    pub(crate) fn production_on_fixed_tls_peer_and_selected_local_egress(
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        fixed_tls_peer: PmFixedTlsPeerSelection,
+        selected_local_egress: PmLocalEgressSelection,
+    ) -> Result<Self, PmLiveAdapterError> {
+        require_production_fixed_tls_peer(&fixed_tls_peer, "status.polymarket.com")?;
+        require_production_local_egress(&selected_local_egress)?;
+        require_same_address_family(&fixed_tls_peer, &selected_local_egress)?;
+        let mut config = Self::production(connect_timeout, request_timeout)?;
+        config.fixed_tls_peer = Some(fixed_tls_peer);
         config.selected_local_egress = Some(selected_local_egress);
         Ok(config)
     }
@@ -93,6 +112,7 @@ impl PmStatusHttpConfig {
             request_timeout,
             mode: OriginMode::LocalEvidence,
             selected_local_egress: None,
+            fixed_tls_peer: None,
         })
     }
 
@@ -107,6 +127,27 @@ impl PmStatusHttpConfig {
         let mut config = Self::local_evidence(origin, connect_timeout, request_timeout)?;
         config.selected_local_egress = Some(selected_local_egress);
         Ok(config)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn loopback_evidence_on_fixed_tls_peer_and_selected_local_egress(
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        fixed_tls_peer: PmFixedTlsPeerSelection,
+        selected_local_egress: PmLocalEgressSelection,
+    ) -> Result<Self, PmLiveAdapterError> {
+        require_loopback_fixed_tls_peer(&fixed_tls_peer)?;
+        require_loopback_local_egress(&selected_local_egress)?;
+        require_same_address_family(&fixed_tls_peer, &selected_local_egress)?;
+        validate_timeouts(connect_timeout, request_timeout)?;
+        Ok(Self {
+            origin: fixed_tls_peer_loopback_origin(&fixed_tls_peer)?,
+            connect_timeout,
+            request_timeout,
+            mode: OriginMode::LocalEvidence,
+            selected_local_egress: Some(selected_local_egress),
+            fixed_tls_peer: Some(fixed_tls_peer),
+        })
     }
 
     pub(crate) fn origin(&self) -> &Url {
@@ -128,6 +169,10 @@ impl PmStatusHttpConfig {
     pub(crate) const fn selected_local_egress(&self) -> Option<&PmLocalEgressSelection> {
         self.selected_local_egress.as_ref()
     }
+
+    pub(crate) const fn fixed_tls_peer(&self) -> Option<&PmFixedTlsPeerSelection> {
+        self.fixed_tls_peer.as_ref()
+    }
 }
 
 impl PmGeoblockHttpConfig {
@@ -144,6 +189,7 @@ impl PmGeoblockHttpConfig {
             request_timeout,
             mode: OriginMode::Production,
             selected_local_egress: None,
+            fixed_tls_peer: None,
         })
     }
 
@@ -154,6 +200,21 @@ impl PmGeoblockHttpConfig {
     ) -> Result<Self, PmLiveAdapterError> {
         require_production_local_egress(&selected_local_egress)?;
         let mut config = Self::production(connect_timeout, request_timeout)?;
+        config.selected_local_egress = Some(selected_local_egress);
+        Ok(config)
+    }
+
+    pub fn production_on_fixed_tls_peer_and_selected_local_egress(
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        fixed_tls_peer: PmFixedTlsPeerSelection,
+        selected_local_egress: PmLocalEgressSelection,
+    ) -> Result<Self, PmLiveAdapterError> {
+        require_production_fixed_tls_peer(&fixed_tls_peer, "polymarket.com")?;
+        require_production_local_egress(&selected_local_egress)?;
+        require_same_address_family(&fixed_tls_peer, &selected_local_egress)?;
+        let mut config = Self::production(connect_timeout, request_timeout)?;
+        config.fixed_tls_peer = Some(fixed_tls_peer);
         config.selected_local_egress = Some(selected_local_egress);
         Ok(config)
     }
@@ -180,6 +241,7 @@ impl PmGeoblockHttpConfig {
             request_timeout,
             mode: OriginMode::LocalEvidence,
             selected_local_egress: None,
+            fixed_tls_peer: None,
         })
     }
 
@@ -194,6 +256,27 @@ impl PmGeoblockHttpConfig {
         let mut config = Self::local_evidence(origin, connect_timeout, request_timeout)?;
         config.selected_local_egress = Some(selected_local_egress);
         Ok(config)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn loopback_evidence_on_fixed_tls_peer_and_selected_local_egress(
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        fixed_tls_peer: PmFixedTlsPeerSelection,
+        selected_local_egress: PmLocalEgressSelection,
+    ) -> Result<Self, PmLiveAdapterError> {
+        require_loopback_fixed_tls_peer(&fixed_tls_peer)?;
+        require_loopback_local_egress(&selected_local_egress)?;
+        require_same_address_family(&fixed_tls_peer, &selected_local_egress)?;
+        validate_timeouts(connect_timeout, request_timeout)?;
+        Ok(Self {
+            origin: fixed_tls_peer_loopback_origin(&fixed_tls_peer)?,
+            connect_timeout,
+            request_timeout,
+            mode: OriginMode::LocalEvidence,
+            selected_local_egress: Some(selected_local_egress),
+            fixed_tls_peer: Some(fixed_tls_peer),
+        })
     }
 
     pub(crate) fn origin(&self) -> &Url {
@@ -216,6 +299,10 @@ impl PmGeoblockHttpConfig {
         self.selected_local_egress.as_ref()
     }
 
+    pub(crate) const fn fixed_tls_peer(&self) -> Option<&PmFixedTlsPeerSelection> {
+        self.fixed_tls_peer.as_ref()
+    }
+
     #[must_use]
     pub const fn production_order_entry_authorized(&self) -> bool {
         false
@@ -235,6 +322,7 @@ pub struct PmPrivateHttpConfig {
     exact_order_scope: PmWireScope,
     mode: OriginMode,
     selected_local_egress: Option<PmLocalEgressSelection>,
+    fixed_tls_peer: Option<PmFixedTlsPeerSelection>,
 }
 
 impl PmPrivateHttpConfig {
@@ -252,6 +340,7 @@ impl PmPrivateHttpConfig {
             exact_order_scope,
             mode: OriginMode::Production,
             selected_local_egress: None,
+            fixed_tls_peer: None,
         })
     }
 
@@ -263,6 +352,22 @@ impl PmPrivateHttpConfig {
     ) -> Result<Self, PmLiveAdapterError> {
         require_production_local_egress(&selected_local_egress)?;
         let mut config = Self::production(connect_timeout, request_timeout, exact_order_scope)?;
+        config.selected_local_egress = Some(selected_local_egress);
+        Ok(config)
+    }
+
+    pub fn production_on_fixed_tls_peer_and_selected_local_egress(
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        exact_order_scope: PmWireScope,
+        fixed_tls_peer: PmFixedTlsPeerSelection,
+        selected_local_egress: PmLocalEgressSelection,
+    ) -> Result<Self, PmLiveAdapterError> {
+        require_production_fixed_tls_peer(&fixed_tls_peer, "clob.polymarket.com")?;
+        require_production_local_egress(&selected_local_egress)?;
+        require_same_address_family(&fixed_tls_peer, &selected_local_egress)?;
+        let mut config = Self::production(connect_timeout, request_timeout, exact_order_scope)?;
+        config.fixed_tls_peer = Some(fixed_tls_peer);
         config.selected_local_egress = Some(selected_local_egress);
         Ok(config)
     }
@@ -303,6 +408,7 @@ impl PmPrivateHttpConfig {
             exact_order_scope,
             mode: OriginMode::LocalEvidence,
             selected_local_egress: None,
+            fixed_tls_peer: None,
         })
     }
 
@@ -329,6 +435,29 @@ impl PmPrivateHttpConfig {
             Self::local_evidence(origin, connect_timeout, request_timeout, exact_order_scope)?;
         config.selected_local_egress = Some(selected_local_egress);
         Ok(config)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn loopback_evidence_on_fixed_tls_peer_and_selected_local_egress(
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        exact_order_scope: PmWireScope,
+        fixed_tls_peer: PmFixedTlsPeerSelection,
+        selected_local_egress: PmLocalEgressSelection,
+    ) -> Result<Self, PmLiveAdapterError> {
+        require_loopback_fixed_tls_peer(&fixed_tls_peer)?;
+        require_loopback_local_egress(&selected_local_egress)?;
+        require_same_address_family(&fixed_tls_peer, &selected_local_egress)?;
+        validate_timeouts(connect_timeout, request_timeout)?;
+        Ok(Self {
+            origin: fixed_tls_peer_loopback_origin(&fixed_tls_peer)?,
+            connect_timeout,
+            request_timeout,
+            exact_order_scope,
+            mode: OriginMode::LocalEvidence,
+            selected_local_egress: Some(selected_local_egress),
+            fixed_tls_peer: Some(fixed_tls_peer),
+        })
     }
 
     #[must_use]
@@ -360,6 +489,10 @@ impl PmPrivateHttpConfig {
     pub(crate) const fn selected_local_egress(&self) -> Option<&PmLocalEgressSelection> {
         self.selected_local_egress.as_ref()
     }
+
+    pub(crate) const fn fixed_tls_peer(&self) -> Option<&PmFixedTlsPeerSelection> {
+        self.fixed_tls_peer.as_ref()
+    }
 }
 
 impl PmPublicHttpConfig {
@@ -376,6 +509,7 @@ impl PmPublicHttpConfig {
             request_timeout,
             mode: OriginMode::Production,
             selected_local_egress: None,
+            fixed_tls_peer: None,
         })
     }
 
@@ -387,6 +521,22 @@ impl PmPublicHttpConfig {
     ) -> Result<Self, PmLiveAdapterError> {
         require_production_local_egress(&selected_local_egress)?;
         let mut config = Self::production(origin, connect_timeout, request_timeout)?;
+        config.selected_local_egress = Some(selected_local_egress);
+        Ok(config)
+    }
+
+    pub(crate) fn production_on_fixed_tls_peer_and_selected_local_egress(
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        fixed_tls_peer: PmFixedTlsPeerSelection,
+        selected_local_egress: PmLocalEgressSelection,
+    ) -> Result<Self, PmLiveAdapterError> {
+        require_production_fixed_tls_peer(&fixed_tls_peer, "clob.polymarket.com")?;
+        require_production_local_egress(&selected_local_egress)?;
+        require_same_address_family(&fixed_tls_peer, &selected_local_egress)?;
+        let mut config =
+            Self::production(PM_CLOB_PRODUCTION_ORIGIN, connect_timeout, request_timeout)?;
+        config.fixed_tls_peer = Some(fixed_tls_peer);
         config.selected_local_egress = Some(selected_local_egress);
         Ok(config)
     }
@@ -423,6 +573,7 @@ impl PmPublicHttpConfig {
             request_timeout,
             mode: OriginMode::LocalEvidence,
             selected_local_egress: None,
+            fixed_tls_peer: None,
         })
     }
 
@@ -446,6 +597,27 @@ impl PmPublicHttpConfig {
         let mut config = Self::local_evidence(origin, connect_timeout, request_timeout)?;
         config.selected_local_egress = Some(selected_local_egress);
         Ok(config)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn loopback_evidence_on_fixed_tls_peer_and_selected_local_egress(
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        fixed_tls_peer: PmFixedTlsPeerSelection,
+        selected_local_egress: PmLocalEgressSelection,
+    ) -> Result<Self, PmLiveAdapterError> {
+        require_loopback_fixed_tls_peer(&fixed_tls_peer)?;
+        require_loopback_local_egress(&selected_local_egress)?;
+        require_same_address_family(&fixed_tls_peer, &selected_local_egress)?;
+        validate_timeouts(connect_timeout, request_timeout)?;
+        Ok(Self {
+            origin: fixed_tls_peer_loopback_origin(&fixed_tls_peer)?,
+            connect_timeout,
+            request_timeout,
+            mode: OriginMode::LocalEvidence,
+            selected_local_egress: Some(selected_local_egress),
+            fixed_tls_peer: Some(fixed_tls_peer),
+        })
     }
 
     #[must_use]
@@ -474,6 +646,72 @@ impl PmPublicHttpConfig {
     pub(crate) const fn selected_local_egress(&self) -> Option<&PmLocalEgressSelection> {
         self.selected_local_egress.as_ref()
     }
+
+    pub(crate) const fn fixed_tls_peer(&self) -> Option<&PmFixedTlsPeerSelection> {
+        self.fixed_tls_peer.as_ref()
+    }
+}
+
+fn require_production_fixed_tls_peer(
+    fixed_tls_peer: &PmFixedTlsPeerSelection,
+    exact_dns_name: &'static str,
+) -> Result<(), PmLiveAdapterError> {
+    fixed_tls_peer.require_production().map_err(|_| {
+        PmLiveAdapterError::InvalidConfiguration(
+            "production HTTP requires a production fixed TLS peer",
+        )
+    })?;
+    if fixed_tls_peer.dns_name() != exact_dns_name || fixed_tls_peer.peer_addr().port() != 443 {
+        return Err(PmLiveAdapterError::InvalidConfiguration(
+            "fixed TLS peer DNS identity does not match the fixed production role",
+        ));
+    }
+    Ok(())
+}
+
+fn require_same_address_family(
+    fixed_tls_peer: &PmFixedTlsPeerSelection,
+    selected_local_egress: &PmLocalEgressSelection,
+) -> Result<(), PmLiveAdapterError> {
+    fixed_tls_peer
+        .require_same_address_family(selected_local_egress)
+        .map_err(|_| {
+            PmLiveAdapterError::InvalidConfiguration(
+                "fixed TLS peer and selected local egress require one address family",
+            )
+        })
+}
+
+#[cfg(test)]
+fn require_loopback_fixed_tls_peer(
+    fixed_tls_peer: &PmFixedTlsPeerSelection,
+) -> Result<(), PmLiveAdapterError> {
+    fixed_tls_peer.require_loopback_evidence().map_err(|_| {
+        PmLiveAdapterError::InvalidConfiguration(
+            "loopback HTTP evidence requires a loopback fixed TLS peer",
+        )
+    })
+}
+
+#[cfg(test)]
+fn fixed_tls_peer_loopback_origin(
+    fixed_tls_peer: &PmFixedTlsPeerSelection,
+) -> Result<Url, PmLiveAdapterError> {
+    let origin = format!(
+        "http://{}:{}",
+        fixed_tls_peer.dns_name(),
+        fixed_tls_peer.peer_addr().port()
+    );
+    let url = validate_base_origin(&origin)?;
+    if url.scheme() != "http"
+        || url.host_str() != Some(fixed_tls_peer.dns_name())
+        || url.port() != Some(fixed_tls_peer.peer_addr().port())
+    {
+        return Err(PmLiveAdapterError::InvalidConfiguration(
+            "loopback fixed-peer origin does not match its DNS identity and TCP port",
+        ));
+    }
+    Ok(url)
 }
 
 fn require_production_local_egress(
@@ -743,6 +981,161 @@ mod tests {
                 CONNECT,
                 REQUEST,
                 selection,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fixed_tls_peer_configs_bind_exact_role_host_and_reject_mode_crossing() {
+        let production_local =
+            PmLocalEgressSelection::production("pm-tunnel0", "192.0.2.10".parse().unwrap())
+                .unwrap();
+        let clob_peer =
+            PmFixedTlsPeerSelection::production("clob.polymarket.com", "8.8.8.8").unwrap();
+        let geoblock_peer =
+            PmFixedTlsPeerSelection::production("polymarket.com", "8.8.4.4").unwrap();
+        let status_peer =
+            PmFixedTlsPeerSelection::production("status.polymarket.com", "1.1.1.1").unwrap();
+
+        let public = PmPublicHttpConfig::production_on_fixed_tls_peer_and_selected_local_egress(
+            CONNECT,
+            REQUEST,
+            clob_peer.clone(),
+            production_local.clone(),
+        )
+        .unwrap();
+        let geoblock =
+            PmGeoblockHttpConfig::production_on_fixed_tls_peer_and_selected_local_egress(
+                CONNECT,
+                REQUEST,
+                geoblock_peer.clone(),
+                production_local.clone(),
+            )
+            .unwrap();
+        let status = PmStatusHttpConfig::production_on_fixed_tls_peer_and_selected_local_egress(
+            CONNECT,
+            REQUEST,
+            status_peer.clone(),
+            production_local.clone(),
+        )
+        .unwrap();
+        for (config_peer, expected_name) in [
+            (public.fixed_tls_peer(), "clob.polymarket.com"),
+            (geoblock.fixed_tls_peer(), "polymarket.com"),
+            (status.fixed_tls_peer(), "status.polymarket.com"),
+        ] {
+            let config_peer = config_peer.unwrap();
+            assert_eq!(config_peer.dns_name(), expected_name);
+            assert_eq!(config_peer.peer_addr().port(), 443);
+            assert!(!config_peer.production_order_entry_authorized());
+        }
+        assert!(
+            PmPublicHttpConfig::production_on_fixed_tls_peer_and_selected_local_egress(
+                CONNECT,
+                REQUEST,
+                geoblock_peer,
+                production_local.clone(),
+            )
+            .is_err()
+        );
+
+        let loopback_local =
+            PmLocalEgressSelection::loopback_evidence("lo", "127.0.0.2".parse().unwrap()).unwrap();
+        let loopback_peer = PmFixedTlsPeerSelection::loopback_evidence(
+            "clob.polymarket.test",
+            "127.0.0.1:18080".parse().unwrap(),
+        )
+        .unwrap();
+        let loopback =
+            PmPublicHttpConfig::loopback_evidence_on_fixed_tls_peer_and_selected_local_egress(
+                CONNECT,
+                REQUEST,
+                loopback_peer.clone(),
+                loopback_local.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            loopback.origin().as_str(),
+            "http://clob.polymarket.test:18080/"
+        );
+        assert_eq!(
+            loopback.fixed_tls_peer().unwrap().peer_addr(),
+            "127.0.0.1:18080".parse().unwrap()
+        );
+        let loopback_geoblock =
+            PmGeoblockHttpConfig::loopback_evidence_on_fixed_tls_peer_and_selected_local_egress(
+                CONNECT,
+                REQUEST,
+                PmFixedTlsPeerSelection::loopback_evidence(
+                    "geoblock-source.test",
+                    "127.0.0.1:18081".parse().unwrap(),
+                )
+                .unwrap(),
+                loopback_local.clone(),
+            )
+            .unwrap();
+        let loopback_status =
+            PmStatusHttpConfig::loopback_evidence_on_fixed_tls_peer_and_selected_local_egress(
+                CONNECT,
+                REQUEST,
+                PmFixedTlsPeerSelection::loopback_evidence(
+                    "status-source.test",
+                    "127.0.0.1:18082".parse().unwrap(),
+                )
+                .unwrap(),
+                loopback_local.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            loopback_geoblock.origin().as_str(),
+            "http://geoblock-source.test:18081/"
+        );
+        assert_eq!(
+            loopback_status.origin().as_str(),
+            "http://status-source.test:18082/"
+        );
+        assert!(
+            PmPublicHttpConfig::production_on_fixed_tls_peer_and_selected_local_egress(
+                CONNECT,
+                REQUEST,
+                loopback_peer,
+                production_local.clone(),
+            )
+            .is_err()
+        );
+        assert!(
+            PmPublicHttpConfig::loopback_evidence_on_fixed_tls_peer_and_selected_local_egress(
+                CONNECT,
+                REQUEST,
+                clob_peer.clone(),
+                loopback_local.clone(),
+            )
+            .is_err()
+        );
+        assert!(
+            PmPublicHttpConfig::loopback_evidence_on_fixed_tls_peer_and_selected_local_egress(
+                CONNECT,
+                REQUEST,
+                PmFixedTlsPeerSelection::loopback_evidence(
+                    "clob.polymarket.test",
+                    "127.0.0.1:18080".parse().unwrap(),
+                )
+                .unwrap(),
+                production_local,
+            )
+            .is_err()
+        );
+        assert!(
+            PmPublicHttpConfig::loopback_evidence_on_fixed_tls_peer_and_selected_local_egress(
+                CONNECT,
+                REQUEST,
+                PmFixedTlsPeerSelection::loopback_evidence(
+                    "clob.polymarket.test",
+                    "[::1]:18080".parse().unwrap(),
+                )
+                .unwrap(),
+                loopback_local,
             )
             .is_err()
         );

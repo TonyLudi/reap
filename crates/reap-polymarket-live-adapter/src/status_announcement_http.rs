@@ -465,6 +465,25 @@ impl PmStatusAnnouncementHttpRole {
         )?)
     }
 
+    /// Construct the fixed production status-page role with one exact TLS
+    /// peer and one selected Linux interface/source address. The paired values
+    /// are private transport configuration, not observation or mutation proof.
+    pub fn production_on_fixed_tls_peer_and_selected_local_egress(
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        fixed_tls_peer: reap_polymarket_egress_binding::PmFixedTlsPeerSelection,
+        selected_local_egress: reap_polymarket_egress_binding::PmLocalEgressSelection,
+    ) -> Result<Self, PmLiveAdapterError> {
+        Self::from_config(
+            PmStatusHttpConfig::production_on_fixed_tls_peer_and_selected_local_egress(
+                connect_timeout,
+                request_timeout,
+                fixed_tls_peer,
+                selected_local_egress,
+            )?,
+        )
+    }
+
     #[cfg(any(test, feature = "read-only-evidence"))]
     pub fn read_only_evidence(
         origin: &str,

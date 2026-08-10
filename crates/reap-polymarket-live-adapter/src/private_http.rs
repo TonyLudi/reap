@@ -1,7 +1,8 @@
-use std::fmt;
+use std::{fmt, net::SocketAddr};
 
 use reap_pm_core::{EvmAddress, PmTokenId};
 use reap_polymarket_auth::{AuthenticatedL2Headers, EoaAddress, FixedOrderId, L2HeaderSink};
+use reap_polymarket_egress_binding::{PmFixedTlsPeerSelection, PmLocalEgressSelection};
 use reap_polymarket_wire::{
     MAX_PM_CLOSED_ONLY_BODY_BYTES, MAX_PM_LIVE_BODY_BYTES, PmClosedOnlyStatus, PmWireScope,
     parse_pm_closed_only,
@@ -140,6 +141,7 @@ pub(crate) struct PmPrivateHttpTransport {
     origin: Url,
     mode: OriginMode,
     configured_address: EoaAddress,
+    expected_peer: Option<SocketAddr>,
 }
 
 impl PmPrivateHttpTransport {
@@ -154,6 +156,7 @@ impl PmPrivateHttpTransport {
             config.mode(),
             configured_address,
             config.selected_local_egress(),
+            config.fixed_tls_peer(),
         )
     }
 
@@ -168,6 +171,7 @@ impl PmPrivateHttpTransport {
             config.mode(),
             configured_address,
             config.selected_local_egress(),
+            config.fixed_tls_peer(),
         )
     }
 
@@ -177,8 +181,14 @@ impl PmPrivateHttpTransport {
         request_timeout: std::time::Duration,
         mode: OriginMode,
         configured_address: EoaAddress,
-        selected_local_egress: Option<&reap_polymarket_egress_binding::PmLocalEgressSelection>,
+        selected_local_egress: Option<&PmLocalEgressSelection>,
+        fixed_tls_peer: Option<&PmFixedTlsPeerSelection>,
     ) -> Result<Self, PmLiveAdapterError> {
+        if fixed_tls_peer.is_some() && selected_local_egress.is_none() {
+            return Err(PmLiveAdapterError::InvalidConfiguration(
+                "fixed TLS peer requires an inseparable selected local egress",
+            ));
+        }
         let mut builder = Client::builder()
             .connect_timeout(connect_timeout)
             .timeout(request_timeout)
@@ -203,6 +213,9 @@ impl PmPrivateHttpTransport {
                 ));
             }
         }
+        if let Some(fixed_tls_peer) = fixed_tls_peer {
+            builder = builder.resolve(fixed_tls_peer.dns_name(), fixed_tls_peer.peer_addr());
+        }
         let client = builder
             .build()
             .map_err(|_| PmLiveAdapterError::TransportBuild)?;
@@ -211,6 +224,7 @@ impl PmPrivateHttpTransport {
             origin,
             mode,
             configured_address,
+            expected_peer: fixed_tls_peer.map(PmFixedTlsPeerSelection::peer_addr),
         })
     }
 
@@ -234,6 +248,7 @@ impl PmPrivateHttpTransport {
         let mut sink = FixedReadHeaderSink::new(request, self.configured_address);
         authenticated.apply_to(&mut sink)?;
         let mut response = sink.finish()?.send().await.map_err(map_request_error)?;
+        validate_response_peer(self.expected_peer, response.remote_addr())?;
         let status = response.status();
         if status.is_redirection() {
             return Err(PmLiveAdapterError::Redirect {
@@ -319,6 +334,16 @@ impl PmPrivateHttpTransport {
         }
         url
     }
+}
+
+fn validate_response_peer(
+    expected_peer: Option<SocketAddr>,
+    observed_peer: Option<SocketAddr>,
+) -> Result<(), PmLiveAdapterError> {
+    if expected_peer.is_some() && expected_peer != observed_peer {
+        return Err(PmLiveAdapterError::RequestFailed);
+    }
+    Ok(())
 }
 
 /// Move-only custody for one exact authenticated account transport.
@@ -661,7 +686,7 @@ mod tests {
 
     use reap_pm_core::{PmConditionId, PmMarketId, PmTokenId, U256};
     use reap_polymarket_auth::{L2CredentialInput, L2Credentials};
-    use reap_polymarket_egress_binding::PmLocalEgressSelection;
+    use reap_polymarket_egress_binding::{PmFixedTlsPeerSelection, PmLocalEgressSelection};
     use reap_polymarket_wire::PmWireScope;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -1179,6 +1204,86 @@ mod tests {
         assert_eq!(peer_ip, "127.0.0.2".parse::<IpAddr>().unwrap());
         assert!(request.starts_with("GET /auth/ban-status/closed-only HTTP/1.1\r\n"));
         supervisor.shutdown().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fixed_peer_private_get_uses_exact_host_source_and_peer_with_idle_decoy() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let exact_peer = listener.local_addr().unwrap();
+        let decoy = TcpListener::bind(("127.0.0.3", exact_peer.port()))
+            .await
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, source) = listener.accept().await.unwrap();
+            let mut raw = Vec::new();
+            let mut chunk = [0_u8; 1_024];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&chunk[..read]);
+                if raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8(raw).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 21\r\nConnection: close\r\n\r\n{\"closed_only\":false}",
+                )
+                .await
+                .unwrap();
+            (source, request)
+        });
+        let selected_source = "127.0.0.2".parse::<IpAddr>().unwrap();
+        let local_egress =
+            PmLocalEgressSelection::loopback_evidence("lo", selected_source).unwrap();
+        let fixed_peer =
+            PmFixedTlsPeerSelection::loopback_evidence("clob.polymarket.test", exact_peer).unwrap();
+        let config =
+            PmPrivateHttpConfig::loopback_evidence_on_fixed_tls_peer_and_selected_local_egress(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                scope(),
+                fixed_peer,
+                local_egress,
+            )
+            .unwrap();
+        let (mut owner, supervisor) =
+            crate::PmAuthenticatedHttpOwner::new(config, credentials()).unwrap();
+        let status = owner.preflight().closed_only(timestamp()).await.unwrap();
+        assert!(!status.closed_only());
+        let (source, request) = server.await.unwrap();
+        assert_eq!(source.ip(), selected_source);
+        assert!(request.starts_with("GET /auth/ban-status/closed-only HTTP/1.1\r\n"));
+        assert!(request.to_ascii_lowercase().contains(&format!(
+            "host: clob.polymarket.test:{}\r\n",
+            exact_peer.port()
+        )));
+        assert!(
+            timeout(Duration::from_millis(100), decoy.accept())
+                .await
+                .is_err()
+        );
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn fixed_peer_private_response_rejects_missing_or_different_remote() {
+        let expected = "127.0.0.1:443".parse().unwrap();
+        let different = "127.0.0.3:443".parse().unwrap();
+        assert_eq!(
+            validate_response_peer(Some(expected), None),
+            Err(PmLiveAdapterError::RequestFailed)
+        );
+        assert_eq!(
+            validate_response_peer(Some(expected), Some(different)),
+            Err(PmLiveAdapterError::RequestFailed)
+        );
+        assert!(validate_response_peer(Some(expected), Some(expected)).is_ok());
+        assert!(validate_response_peer(None, None).is_ok());
     }
 
     #[cfg(target_os = "linux")]

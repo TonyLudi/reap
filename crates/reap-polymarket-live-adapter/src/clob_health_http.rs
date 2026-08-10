@@ -172,6 +172,25 @@ impl PmClobLivenessHealthHttpRole {
         Self::from_config(config)
     }
 
+    /// Construct the fixed production `GET /ok` role with one exact TLS peer
+    /// and one selected Linux interface/source address. The public CLOB config
+    /// constructor remains crate-private and this role exposes no HMAC or
+    /// mutation path.
+    pub fn production_on_fixed_tls_peer_and_selected_local_egress(
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        fixed_tls_peer: reap_polymarket_egress_binding::PmFixedTlsPeerSelection,
+        selected_local_egress: reap_polymarket_egress_binding::PmLocalEgressSelection,
+    ) -> Result<Self, PmLiveAdapterError> {
+        let config = PmPublicHttpConfig::production_on_fixed_tls_peer_and_selected_local_egress(
+            connect_timeout,
+            request_timeout,
+            fixed_tls_peer,
+            selected_local_egress,
+        )?;
+        Self::from_config(config)
+    }
+
     #[cfg(any(test, feature = "read-only-evidence"))]
     pub fn read_only_evidence(
         origin: &str,
