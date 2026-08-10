@@ -19,6 +19,7 @@ pub(crate) enum ProtectedFileKind {
     OnlineAuthorizationV2,
     ReviewedProductionDestinationProfileV1,
     ReviewedFreshCredentialSlotLocatorV1,
+    FreshCredentialDeliveryBindingV1,
     OnlineAuthorizationConsumptionV2,
     ConsumptionEvidence,
     PrivateKey,
@@ -40,6 +41,7 @@ impl std::fmt::Display for ProtectedFileKind {
             Self::ReviewedFreshCredentialSlotLocatorV1 => {
                 "reviewed fresh credential-slot locator V1"
             }
+            Self::FreshCredentialDeliveryBindingV1 => "fresh credential delivery binding V1",
             Self::OnlineAuthorizationConsumptionV2 => {
                 "online-authorization-consumption V2 evidence"
             }

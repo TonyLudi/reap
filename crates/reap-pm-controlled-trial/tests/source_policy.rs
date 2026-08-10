@@ -11,6 +11,8 @@ const REVIEWED_DESTINATION_PROFILE_V1: &str =
     include_str!("../src/reviewed_destination_profile_v1.rs");
 const REVIEWED_FRESH_CREDENTIAL_SLOT_LOCATOR_V1: &str =
     include_str!("../src/reviewed_fresh_credential_slot_locator_v1.rs");
+const FRESH_CREDENTIAL_DELIVERY_BINDING_V1: &str =
+    include_str!("../src/fresh_credential_delivery_binding_v1.rs");
 const MAIN: &str = include_str!("../src/main.rs");
 
 #[test]
@@ -43,6 +45,7 @@ fn source_exposes_only_offline_dry_run_commands_and_no_mutation_route_or_body() 
         PROTECTED,
         REVIEWED_DESTINATION_PROFILE_V1,
         REVIEWED_FRESH_CREDENTIAL_SLOT_LOCATOR_V1,
+        FRESH_CREDENTIAL_DELIVERY_BINDING_V1,
         MAIN,
     ]
     .join("\n");
@@ -67,6 +70,238 @@ fn source_exposes_only_offline_dry_run_commands_and_no_mutation_route_or_body() 
     assert!(!MAIN.contains("Place"));
     assert!(!MAIN.contains("Cancel"));
     assert!(!MAIN.contains("ConsumeAuthorization"));
+}
+
+#[test]
+fn fresh_credential_delivery_binding_v1_is_unsigned_exact_move_only_and_denied_only() {
+    for required in [
+        "FRESH_CREDENTIAL_DELIVERY_BINDING_V1_FINGERPRINT_DOMAIN",
+        "reap.pm-t2.controlled-trial.fresh-credential-delivery-binding.v1\\0",
+        "pm-t2-fresh-credential-delivery-binding-v1.json",
+        "pub struct FreshCredentialSlotLocatorPinsV1",
+        "pub locator_id: String,",
+        "pub canonical_sha256: String,",
+        "pub canonical_length: u64,",
+        "pub fingerprint: String,",
+        "self.locator_id == pins.locator_id",
+        "&& self.canonical_sha256 == pins.canonical_sha256",
+        "&& self.canonical_length == pins.canonical_length",
+        "&& self.fingerprint == pins.fingerprint",
+        "struct FreshCredentialSlotLocatorPinsViewV1<'a>",
+        "struct FreshCredentialLinuxTimesViewV1",
+        "pub struct UnattestedFreshCredentialProviderGenerationV1",
+        "pub provider_id: String,",
+        "pub provider_key_id: String,",
+        "pub rotation_namespace_id: String,",
+        "pub delivery_id: String,",
+        "pub rotation_generation: u64,",
+        "pub struct FreshCredentialLinuxDirectoryIdentityV1",
+        "pub struct FreshCredentialLinuxFileIdentityV1",
+        "pub struct FreshCredentialLinuxFileIdentitiesV1",
+        "pub private_key: FreshCredentialLinuxFileIdentityV1,",
+        "pub api_key: FreshCredentialLinuxFileIdentityV1,",
+        "pub l2_secret: FreshCredentialLinuxFileIdentityV1,",
+        "pub passphrase: FreshCredentialLinuxFileIdentityV1,",
+        "pub filesystem_device: u64,",
+        "pub inode: u64,",
+        "pub owner_uid: u32,",
+        "pub permission_mode: u32,",
+        "pub hard_link_count: u64,",
+        "pub modified_seconds: i64,",
+        "pub modified_nanoseconds: i64,",
+        "pub status_changed_seconds: i64,",
+        "pub status_changed_nanoseconds: i64,",
+        "permission_mode != required_permission_mode",
+        "self.hard_link_count != 1",
+        "file.filesystem_device != self.directory.filesystem_device",
+        "file.owner_uid != self.directory.owner_uid",
+        "files[left].inode_key() == files[right].inode_key()",
+        "pub unattested_delivery_recorded_at_utc: String,",
+        "pub unattested_valid_not_before_utc: String,",
+        "pub unattested_valid_not_after_utc: String,",
+        "binding_times.recorded_at < authorization_times.reviewed_at",
+        "binding_times.valid_not_before < authorization_times.not_before",
+        "binding_times.valid_not_after > authorization_times.cleanup_not_after",
+        "directory.owner_uid != authorization.value().host.linux_euid",
+        "not an active placement-window",
+        "current-time, provider-freshness, or unrevoked-lease check",
+        "future V3",
+        "both locator and delivery records by schema/ID/exact",
+        "schema defines no designated secret/value, credential-file-length",
+        "credential-content-digest field",
+        "must never place secret material or",
+        "secret-derived values in any label field",
+        "there is no provider signature",
+        "including its private path",
+        "offers no public path projection",
+        "Initial combined construction needs no process-local `Arc` correlation",
+        "do not prove same-invocation or same-load",
+        "provider-owned descriptor delivery",
+        "authenticated descriptor-delivery receipt must commit",
+        "this exact binding fingerprint and ultimately the exact V3 Prepared",
+        "actor/generation audience",
+        "generic provider proof is not this",
+        "pub struct CanonicalFreshCredentialDeliveryBindingV1",
+        "pub struct CanonicalFreshCredentialDeliveryBindingEvidenceV1",
+        "pub struct FreshCredentialDeliveryLoadTokenV1",
+        "pub fn bind_fresh_credential_delivery_binding_v1(",
+        "locator: CanonicalReviewedFreshCredentialSlotLocatorV1,",
+        "binding: CanonicalFreshCredentialDeliveryBindingV1,",
+        "bind_reviewed_fresh_credential_slot_locator_v1(config, policy, authorization, locator)",
+        "pub fn verify_fresh_credential_delivery_binding_evidence_v1(",
+        "pub fn into_parts(",
+        "ReviewedFreshCredentialLoadTokenV1,",
+        "FreshCredentialLinuxObjectSetV1,",
+        "source_owned_current_time_checked: false",
+        "protected_credential_directory_and_four_files_checked: false",
+        "loaded_linux_objects_match_unattested_binding: false",
+        "same_loaded_holder_attested: false",
+        "globally_unique_delivery_attested: false",
+        "provider_authorship_attested: false",
+        "provider_signature_verified: false",
+        "provider_lease_fresh_and_unrevoked: false",
+        "rotation_generation_attested: false",
+        "delivery_freshness_attested: false",
+        "loaded_bundle_matches_credential_slot_generation: false",
+        "remote_api_key_owner_attested: false",
+        "locator_fingerprint_pinned_by_v2: false",
+        "delivery_binding_fingerprint_pinned_by_v2: false",
+        "delivery_consumption_durably_recorded: false",
+        "authorization_consumption_checked: false",
+        "credential_mutation_authority_attested: false",
+        "OfflineAuthorizationState::DENIED",
+        "ProtectedFileKind::FreshCredentialDeliveryBindingV1",
+        "CanonicalFreshCredentialDeliveryBindingV1(<unsigned-exact-canonical-bytes; redacted; denied>)",
+        "CanonicalFreshCredentialDeliveryBindingEvidenceV1(<retained-exact-evidence; no-path-or-provider-projection; redacted; denied>)",
+        "FreshCredentialDeliveryLoadTokenV1(<one-shot-local-load; path-signer-and-metadata-redacted; denied>)",
+    ] {
+        assert!(
+            FRESH_CREDENTIAL_DELIVERY_BINDING_V1.contains(required),
+            "missing fresh credential delivery binding V1 source pin `{required}`"
+        );
+    }
+
+    for forbidden in [
+        "reqwest",
+        "tokio",
+        "TcpStream",
+        "connect_async",
+        "L2Credentials",
+        "EoaPrivateKeyInput",
+        "CredentialSlotId",
+        "authenticated_journal_credential_slot",
+        "read_four(",
+        "Arc<",
+        "production_order_entry_authorized: true",
+        "real_order_submission_authorized: true",
+        "source_owned_current_time_checked: true",
+        "protected_credential_directory_and_four_files_checked: true",
+        "loaded_linux_objects_match_unattested_binding: true",
+        "same_loaded_holder_attested: true",
+        "globally_unique_delivery_attested: true",
+        "provider_authorship_attested: true",
+        "provider_signature_verified: true",
+        "provider_lease_fresh_and_unrevoked: true",
+        "rotation_generation_attested: true",
+        "delivery_freshness_attested: true",
+        "loaded_bundle_matches_credential_slot_generation: true",
+        "remote_api_key_owner_attested: true",
+        "locator_fingerprint_pinned_by_v2: true",
+        "delivery_binding_fingerprint_pinned_by_v2: true",
+        "delivery_consumption_durably_recorded: true",
+        "authorization_consumption_checked: true",
+        "credential_mutation_authority_attested: true",
+        "impl Clone for CanonicalFreshCredentialDeliveryBindingV1",
+        "impl Serialize for CanonicalFreshCredentialDeliveryBindingV1",
+        "Deserialize<'de> for CanonicalFreshCredentialDeliveryBindingV1",
+        "impl Clone for CanonicalFreshCredentialDeliveryBindingEvidenceV1",
+        "impl Serialize for CanonicalFreshCredentialDeliveryBindingEvidenceV1",
+        "Deserialize<'de> for CanonicalFreshCredentialDeliveryBindingEvidenceV1",
+        "impl Clone for FreshCredentialDeliveryLoadTokenV1",
+        "impl Serialize for FreshCredentialDeliveryLoadTokenV1",
+        "Deserialize<'de> for FreshCredentialDeliveryLoadTokenV1",
+        "pub const fn value(&self)",
+        "pub fn value(&self)",
+        "pub fn path(&self)",
+        "pub fn provider_id(&self)",
+        "pub fn rotation_generation(&self)",
+    ] {
+        assert!(
+            !FRESH_CREDENTIAL_DELIVERY_BINDING_V1.contains(forbidden),
+            "forbidden secret, transport, clone, projection, or authority surface: {forbidden}"
+        );
+    }
+
+    let file_identity = FRESH_CREDENTIAL_DELIVERY_BINDING_V1
+        .split_once("pub struct FreshCredentialLinuxFileIdentityV1 {")
+        .and_then(|(_, tail)| tail.split_once("\n}").map(|(body, _)| body))
+        .expect("fresh credential file identity declaration must remain recognizable");
+    for forbidden_field in ["length", "sha256", "hash", "digest", "content", "value"] {
+        assert!(
+            !file_identity.contains(forbidden_field),
+            "credential file identity gained forbidden field `{forbidden_field}`"
+        );
+    }
+
+    let binder_signature = FRESH_CREDENTIAL_DELIVERY_BINDING_V1
+        .split_once("pub fn bind_fresh_credential_delivery_binding_v1(")
+        .and_then(|(_, tail)| {
+            tail.split_once(") -> Result<")
+                .map(|(signature, _)| signature)
+        })
+        .expect("fresh credential delivery binder signature must remain recognizable");
+    for forbidden_input in [
+        "EvidenceV1",
+        "LoadTokenV1",
+        "signer",
+        "provider_signature",
+        "Arc",
+    ] {
+        assert!(
+            !binder_signature.contains(forbidden_input),
+            "fresh credential delivery binder gained forbidden input `{forbidden_input}`"
+        );
+    }
+
+    for declaration in [
+        "pub struct CanonicalFreshCredentialDeliveryBindingV1 {",
+        "pub struct CanonicalFreshCredentialDeliveryBindingEvidenceV1 {",
+        "pub struct FreshCredentialDeliveryLoadTokenV1 {",
+    ] {
+        let before = FRESH_CREDENTIAL_DELIVERY_BINDING_V1
+            .split_once(declaration)
+            .map(|(before, _)| before)
+            .expect("delivery binding move-only declaration must remain recognizable");
+        let declaration_attributes = before
+            .rsplit_once("\n}\n\n")
+            .map_or(before, |(_, attributes)| attributes);
+        assert!(
+            !declaration_attributes.contains("#[derive"),
+            "move-only delivery binding type gained a derive: {declaration}"
+        );
+
+        let type_name = declaration
+            .strip_prefix("pub struct ")
+            .and_then(|value| value.strip_suffix(" {"))
+            .expect("delivery binding declaration name must remain recognizable");
+        for implementation in FRESH_CREDENTIAL_DELIVERY_BINDING_V1.split("\nimpl") {
+            let header = implementation
+                .split_once('{')
+                .map_or(implementation, |(header, _)| header);
+            assert!(
+                !(header.contains(type_name) && header.contains("Deserialize")),
+                "move-only delivery binding type gained manual Deserialize: {type_name}"
+            );
+        }
+    }
+
+    assert!(PROTECTED.contains("FreshCredentialDeliveryBindingV1"));
+    assert!(LIB.contains("mod fresh_credential_delivery_binding_v1;"));
+    assert!(!ONLINE_POLICY_V2.contains("FreshCredentialDeliveryBindingV1"));
+    assert!(!ONLINE_CONSUMPTION_V2.contains("FreshCredentialDeliveryBindingV1"));
+    assert!(
+        !REVIEWED_FRESH_CREDENTIAL_SLOT_LOCATOR_V1.contains("FreshCredentialDeliveryBindingV1")
+    );
 }
 
 #[test]

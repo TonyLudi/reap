@@ -8,6 +8,7 @@
 mod config;
 mod consumption;
 mod custody;
+mod fresh_credential_delivery_binding_v1;
 mod online_consumption_v2;
 mod online_policy_v2;
 mod preflight;
@@ -37,6 +38,18 @@ pub use consumption::{
 };
 pub use custody::{
     CustodyInspection, CustodyPaths, CustodySummary, PmTrialCustodyError, inspect_custody,
+};
+pub use fresh_credential_delivery_binding_v1::{
+    CanonicalFreshCredentialDeliveryBindingEvidenceV1, CanonicalFreshCredentialDeliveryBindingV1,
+    FRESH_CREDENTIAL_DELIVERY_BINDING_V1_SCHEMA_VERSION, FreshCredentialDeliveryBindingV1,
+    FreshCredentialDeliveryBindingVerificationV1, FreshCredentialDeliveryLoadTokenV1,
+    FreshCredentialLinuxDirectoryIdentityV1, FreshCredentialLinuxFileIdentitiesV1,
+    FreshCredentialLinuxFileIdentityV1, FreshCredentialLinuxObjectSetV1,
+    FreshCredentialSlotLocatorPinsV1, PM_T2_FRESH_CREDENTIAL_DELIVERY_BINDING_FILE_V1,
+    PmFreshCredentialDeliveryBindingV1Error, UnattestedFreshCredentialProviderGenerationV1,
+    bind_fresh_credential_delivery_binding_v1, load_canonical_fresh_credential_delivery_binding_v1,
+    verify_fresh_credential_delivery_binding_evidence_v1,
+    verify_fresh_credential_delivery_binding_v1,
 };
 pub use online_consumption_v2::{
     ConsumedOnlineAuthorizationConsumptionV2, ONLINE_AUTHORIZATION_CONSUMPTION_V2_SCHEMA_VERSION,
