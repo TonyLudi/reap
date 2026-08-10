@@ -7,6 +7,8 @@ const ONLINE_CONSUMPTION_V2: &str = include_str!("../src/online_consumption_v2.r
 const ONLINE_POLICY_V2: &str = include_str!("../src/online_policy_v2.rs");
 const PREFLIGHT: &str = include_str!("../src/preflight.rs");
 const PROTECTED: &str = include_str!("../src/protected_file.rs");
+const REVIEWED_DESTINATION_PROFILE_V1: &str =
+    include_str!("../src/reviewed_destination_profile_v1.rs");
 const MAIN: &str = include_str!("../src/main.rs");
 
 #[test]
@@ -37,6 +39,7 @@ fn source_exposes_only_offline_dry_run_commands_and_no_mutation_route_or_body() 
         ONLINE_POLICY_V2,
         PREFLIGHT,
         PROTECTED,
+        REVIEWED_DESTINATION_PROFILE_V1,
         MAIN,
     ]
     .join("\n");
@@ -61,6 +64,92 @@ fn source_exposes_only_offline_dry_run_commands_and_no_mutation_route_or_body() 
     assert!(!MAIN.contains("Place"));
     assert!(!MAIN.contains("Cancel"));
     assert!(!MAIN.contains("ConsumeAuthorization"));
+}
+
+#[test]
+fn reviewed_destination_v1_is_exact_additive_denied_peer_evidence_only() {
+    for required in [
+        "REVIEWED_PRODUCTION_DESTINATION_PROFILE_V1_FINGERPRINT_DOMAIN",
+        "reap.pm-t2.controlled-trial.reviewed-production-destinations.v1\\0",
+        "pm-t2-reviewed-production-destinations-v1.json",
+        "MAX_REVIEWED_DNS_ANSWER_AGE_SECONDS_V1: i64 = 300",
+        "ReviewerCapturedFixedAnswers",
+        "pub peer_ip: String,",
+        "pub geoblock_https: ReviewedFixedTlsDestinationV1,",
+        "pub clob_https: ReviewedFixedTlsDestinationV1,",
+        "pub status_https: ReviewedFixedTlsDestinationV1,",
+        "pub data_api_https: ReviewedFixedTlsDestinationV1,",
+        "pub polygon_rpc_https: ReviewedFixedTlsDestinationV1,",
+        "pub clob_websocket_wss: ReviewedFixedWebSocketDestinationV1,",
+        "polymarket.com",
+        "clob.polymarket.com",
+        "status.polymarket.com",
+        "data-api.polymarket.com",
+        "polygon.drpc.org",
+        "ws-subscriptions-clob.polymarket.com",
+        "/ws/market",
+        "/ws/user",
+        "dns_name != expected_host",
+        "tls_server_name != expected_host",
+        "http_host != expected_host",
+        "tcp_port != REVIEWED_TLS_PORT_V1",
+        "validate_online_authorization_contract_v2",
+        "profile_times.valid_not_before != authorization_times.not_before",
+        "profile_times.valid_not_after != authorization_times.cleanup_not_after",
+        ".checked_sub(profile_times.dns_resolved_at.timestamp())",
+        "reviewed DNS answers are older than 300 seconds at authorization start",
+        "same_address_family(local_source_ip, peer_ip)",
+        "is_public_global_unicast_v4",
+        "is_public_global_unicast_v6",
+        "live_dns_observation_checked: false",
+        "destination_nat_equivalence_checked: false",
+        "authorization_consumption_checked: false",
+        "OfflineAuthorizationState::DENIED",
+        "Loading or verifying it performs no DNS lookup and proves no",
+        "live DNS answer, DNSSEC result, TTL",
+        "must not fall back to DNS or another",
+        "profile makes no destination-independent NAT or common-public-IP",
+        "validity window neither resets nor extends the V2 status-history quiet",
+        "reusable sidecar is not consumed by the frozen V2 ledger",
+        "without consulting a caller clock",
+        "ProtectedFileKind::ReviewedProductionDestinationProfileV1",
+        "CanonicalReviewedProductionDestinationProfileV1(<reviewed-evidence; exact-canonical-bytes>)",
+    ] {
+        assert!(
+            REVIEWED_DESTINATION_PROFILE_V1.contains(required),
+            "missing reviewed destination V1 source pin `{required}`"
+        );
+    }
+    for forbidden in [
+        "reqwest",
+        "tokio",
+        "lookup_host",
+        "ToSocketAddrs",
+        "TcpStream",
+        "connect_async",
+        "pub peer_ips:",
+        "pub destination_independent_nat_assumption:",
+        "production_order_entry_authorized: true",
+        "real_order_submission_authorized: true",
+        "impl Clone for CanonicalReviewedProductionDestinationProfileV1",
+        "impl Serialize for CanonicalReviewedProductionDestinationProfileV1",
+    ] {
+        assert!(
+            !REVIEWED_DESTINATION_PROFILE_V1.contains(forbidden),
+            "forbidden resolver, transport, NAT, or authority surface: {forbidden}"
+        );
+    }
+    assert_eq!(
+        REVIEWED_DESTINATION_PROFILE_V1
+            .matches("pub peer_ip: String,")
+            .count(),
+        2,
+        "each destination record shape must expose one scalar peer, never a list",
+    );
+    assert!(PROTECTED.contains("ReviewedProductionDestinationProfileV1"));
+    assert!(LIB.contains("mod reviewed_destination_profile_v1;"));
+    assert!(!ONLINE_POLICY_V2.contains("ReviewedProductionDestinationProfileV1"));
+    assert!(!ONLINE_CONSUMPTION_V2.contains("ReviewedProductionDestinationProfileV1"));
 }
 
 #[test]

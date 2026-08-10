@@ -12,6 +12,7 @@ mod online_consumption_v2;
 mod online_policy_v2;
 mod preflight;
 mod protected_file;
+mod reviewed_destination_profile_v1;
 
 pub use config::{
     AuthorizationApproval, AuthorizationBuildBinding, AuthorizationHostBinding,
@@ -83,6 +84,20 @@ pub use reap_polymarket_auth::{
     ExpectedOrderId, FixedOrderId, OwnedCancelSemanticRequestCommitment,
     PlacePublicRequestIdentity, PlaceSemanticRequestCommitment,
     derive_owned_cancel_semantic_request_commitment,
+};
+pub use reviewed_destination_profile_v1::{
+    CanonicalReviewedProductionDestinationProfileV1, MAX_REVIEWED_DNS_ANSWER_AGE_SECONDS_V1,
+    PM_T2_REVIEWED_PRODUCTION_DESTINATION_PROFILE_FILE_V1,
+    PmReviewedProductionDestinationProfileV1Error, REVIEWED_CLOB_HTTPS_HOST_V1,
+    REVIEWED_CLOB_WEBSOCKET_PUBLIC_PATH_V1, REVIEWED_CLOB_WEBSOCKET_USER_PATH_V1,
+    REVIEWED_CLOB_WEBSOCKET_WSS_HOST_V1, REVIEWED_DATA_API_HTTPS_HOST_V1,
+    REVIEWED_GEOBLOCK_HTTPS_HOST_V1, REVIEWED_POLYGON_RPC_HTTPS_HOST_V1,
+    REVIEWED_PRODUCTION_DESTINATION_PROFILE_V1_SCHEMA_VERSION, REVIEWED_STATUS_HTTPS_HOST_V1,
+    ReviewedDnsAnswerEvidenceV1, ReviewedDnsAnswerSourceV1, ReviewedFixedTlsDestinationV1,
+    ReviewedFixedWebSocketDestinationV1, ReviewedOnlineAuthorizationPinsV1,
+    ReviewedProductionDestinationProfileV1, ReviewedProductionDestinationProfileVerificationV1,
+    ReviewedProductionDestinationsV1, load_canonical_reviewed_production_destination_profile_v1,
+    verify_reviewed_production_destination_profile_v1,
 };
 
 /// Hard offline outcome of every command in this A0 executable.
