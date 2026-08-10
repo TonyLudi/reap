@@ -81,19 +81,36 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
         "CanonicalReviewedProductionDestinationProfileV1",
         "verify_reviewed_production_destination_profile_v1(",
         "verification.authorization != OfflineAuthorizationState::DENIED",
-        "unattested_fresh_credential_directory: PathBuf",
-        "caller-supplied credential directory is explicitly unattested",
-        "does not bind the directory to the canonical credential",
-        "does not claim that the credential task",
-        "or positive-preflight tranche requires a separate reviewed slot-locator",
+        "CanonicalReviewedFreshCredentialSlotLocatorV1",
+        "reviewed_fresh_credential_locator: CanonicalReviewedFreshCredentialSlotLocatorV1",
+        "CanonicalReviewedFreshCredentialSlotLocatorEvidenceV1",
+        "ReviewedFreshCredentialLoadTokenV1",
+        "bind_reviewed_fresh_credential_slot_locator_v1(",
+        "verify_reviewed_fresh_credential_slot_locator_evidence_v1(",
+        "canonical_credential_slot_binding_structurally_valid",
+        "fixed_fresh_credential_locator_structurally_valid",
+        "protected_credential_directory_and_four_files_checked",
+        "loaded_bundle_matches_credential_slot_generation",
+        "remote_api_key_owner_attested",
+        "locator_fingerprint_pinned_by_v2",
+        "reviewer_authorship_attested",
+        "load_token_consumption_durably_recorded",
+        "one caller-supplied protected canonical,",
+        "retained no-path evidence and one non-clone load token",
+        "`Path`, basename, and independent signer inputs are removed",
+        "one-shot only for that loaded holder",
+        "protected sidecar can be loaded",
+        "frozen V2 neither pins its fingerprint nor records consumption",
+        "locator and directory therefore remain caller-selected and unattested",
+        "staged bytes are the reviewed slot generation",
+        "source plus immutable locator-evidence revalidation succeeded",
+        "that the credential task ran",
+        "positive-preflight tranche still requires separately authorized delivery",
+        "and remote-owner proof",
         "generation is only an actor-lifecycle topology check",
         "is not embedded in any selected HTTP/WS source fact",
         "is not positive",
         "provenance for a socket, observation, or authorization",
-        "const FRESH_PRIVATE_KEY_ENTRY: &str = \"private-key\";",
-        "const FRESH_API_KEY_ENTRY: &str = \"api-key\";",
-        "const FRESH_L2_SECRET_ENTRY: &str = \"l2-secret\";",
-        "const FRESH_PASSPHRASE_ENTRY: &str = \"passphrase\";",
         "PmMarketId::parse(&value.market.question_id)",
         "PmTokenId::new(",
         "PmWireScope::new(condition, market, token)",
@@ -125,11 +142,7 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
         "production_on_fixed_tls_peer_and_selected_local_egress(",
         "PmProductClockOwner::system()",
         "PmDeferredObservationRuntimeRoles::from_owner(observation_owner)",
-        "FreshCredentialAuthorityOwner::load_from_protected_files(",
-        "FRESH_PRIVATE_KEY_ENTRY.to_owned()",
-        "FRESH_API_KEY_ENTRY.to_owned()",
-        "FRESH_L2_SECRET_ENTRY.to_owned()",
-        "FRESH_PASSPHRASE_ENTRY.to_owned()",
+        "FreshStagedObservationCredentialAuthorityOwner::load_from_reviewed_fresh_token(",
         ".production_selected(",
         "reviewed_fixed_tls_peers.clob_https.clone()",
         "reviewed_fixed_tls_peers.clob_websocket_wss.clone()",
@@ -157,8 +170,8 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
         "generation_revalidated: bool",
         "pub(super) struct PmDeniedSelectedEgressShutdownEvidence",
         "PmDeniedSelectedEgressActorError::CredentialShutdownAbnormal",
-        "A runtime-construction failure is therefore pre-arm",
-        "intentionally leaves all protected staged files available for retry",
+        "A runtime-construction failure is therefore",
+        "pre-arm and intentionally leaves all staged secret files for retry",
     ] {
         assert!(
             production.contains(required),
@@ -192,17 +205,36 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
     let profile_verification = startup_inputs
         .find("verify_reviewed_production_destination_profile_v1(")
         .unwrap();
+    let reviewed_locator_bind = startup_inputs
+        .find("bind_reviewed_fresh_credential_slot_locator_v1(")
+        .unwrap();
+    let reviewed_evidence_revalidation = startup_inputs
+        .find("revalidate_reviewed_fresh_credential_locator_evidence(")
+        .unwrap();
     let position_scope = startup_inputs.find("let proxy_funder =").unwrap();
-    assert!(profile_verification < position_scope);
+    assert!(profile_verification < reviewed_locator_bind);
+    assert!(reviewed_locator_bind < reviewed_evidence_revalidation);
+    assert!(reviewed_evidence_revalidation < position_scope);
     for owned in [
         "config: &CanonicalTrialConfig",
         "online_policy: CanonicalOnlinePolicyV2",
         "online_authorization: CanonicalOnlineAuthorizationV2",
         "reviewed_destination_profile: CanonicalReviewedProductionDestinationProfileV1",
-        "unattested_fresh_credential_directory: &Path",
+        "reviewed_fresh_credential_locator: CanonicalReviewedFreshCredentialSlotLocatorV1",
     ] {
         assert!(startup_inputs.contains(owned));
     }
+    let startup_state = between(
+        production,
+        "struct PmDeniedSelectedEgressActorStartup {",
+        "impl PmDeniedSelectedEgressActorStartup",
+    );
+    assert!(startup_state.contains("reviewed_fresh_credential_locator_evidence:"));
+    assert!(startup_state.contains("CanonicalReviewedFreshCredentialSlotLocatorEvidenceV1"));
+    assert!(
+        startup_state
+            .contains("reviewed_fresh_credential_load_token: ReviewedFreshCredentialLoadTokenV1")
+    );
     for forbidden_caller_choice in [
         "private_key_entry:",
         "api_key_entry:",
@@ -215,6 +247,7 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
         "request_timeout:",
         "user_ws_bounds:",
         "parser_config:",
+        "credential_directory:",
     ] {
         let spawn_signature = between(
             production,
@@ -292,8 +325,11 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
     let public_observation = setup
         .find("PmPublicObservationWithDeferredMutationClockOwner::")
         .unwrap();
+    let reviewed_locator_revalidation = setup
+        .find("revalidate_reviewed_fresh_credential_locator_evidence(")
+        .unwrap();
     let credential_load = setup
-        .find("FreshCredentialAuthorityOwner::load_from_protected_files(")
+        .find("FreshStagedObservationCredentialAuthorityOwner::load_from_reviewed_fresh_token(")
         .unwrap();
     assert!(
         capture < revalidate
@@ -301,12 +337,19 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
             && selection < reviewed_peers
             && reviewed_peers < clients
             && clients < public_observation
-            && public_observation < credential_load
+            && public_observation < reviewed_locator_revalidation
+            && reviewed_locator_revalidation < credential_load
     );
     assert_eq!(setup.matches(".revalidate_for_current_runtime(").count(), 2);
     let post_constructor_revalidation = setup.rfind(".revalidate_for_current_runtime(").unwrap();
     assert!(clients < post_constructor_revalidation);
     assert!(post_constructor_revalidation < credential_load);
+    assert_eq!(
+        setup
+            .matches("reviewed_fresh_credential_load_token")
+            .count(),
+        2
+    );
 
     let owned_resources = between(
         production,
@@ -340,6 +383,10 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
     let policy_field = owned_resources
         .find("online_policy: CanonicalOnlinePolicyV2")
         .unwrap();
+    let credential_locator_field = owned_resources
+        .find("reviewed_fresh_credential_locator_evidence:")
+        .unwrap();
+    assert!(owned_resources.contains("CanonicalReviewedFreshCredentialSlotLocatorEvidenceV1"));
     let profile_field = owned_resources
         .find("reviewed_destination_profile: CanonicalReviewedProductionDestinationProfileV1")
         .unwrap();
@@ -351,7 +398,8 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
     assert!(custody_field < config_field);
     assert!(config_field < authorization_field);
     assert!(authorization_field < policy_field);
-    assert!(policy_field < profile_field);
+    assert!(policy_field < credential_locator_field);
+    assert!(credential_locator_field < profile_field);
 
     let supervisor_spawn = between(
         production,
@@ -430,10 +478,18 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
     let final_revalidation = assembly
         .find("local_egress_custody.revalidate_for_current_runtime(")
         .unwrap();
+    let locator_revalidation = assembly
+        .find("if revalidate_reviewed_fresh_credential_locator_evidence(")
+        .unwrap();
     let cleanup = assembly
         .find("shutdown_selected_after_failure(selected_observation, primary).await")
         .unwrap();
+    let locator_cleanup = assembly[locator_revalidation..]
+        .find("shutdown_selected_after_failure(")
+        .map(|offset| offset + locator_revalidation)
+        .unwrap();
     assert!(pair < final_revalidation && final_revalidation < cleanup);
+    assert!(cleanup < locator_revalidation && locator_revalidation < locator_cleanup);
     assert!(!assembly[pair..].contains(".await?"));
 
     let shutdown = between(
@@ -442,16 +498,23 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
         "fn spawn_selected_egress_actor_thread<",
     );
     let drop_inert = shutdown.find("drop(inert_observation);").unwrap();
+    let locator_revalidation = shutdown
+        .find("let reviewed_locator_revalidation = revalidate_reviewed_fresh_credential_locator_evidence(")
+        .unwrap();
     let credential_shutdown = shutdown
         .find("selected_observation\n            .shutdown_bounded")
+        .unwrap();
+    let drop_credential_locator = shutdown
+        .find("drop(reviewed_fresh_credential_locator_evidence);")
         .unwrap();
     let drop_clients = shutdown.find("drop(selected_http_bundle);").unwrap();
     let drop_peers = shutdown.find("drop(reviewed_fixed_tls_peers);").unwrap();
     let drop_local = shutdown.find("drop(selected_local_egress);").unwrap();
     let drop_facts = shutdown.find("drop(local_egress_custody);").unwrap();
     let drop_config = shutdown.find("drop(canonical_config);").unwrap();
-    assert!(drop_inert < credential_shutdown);
-    assert!(credential_shutdown < drop_clients);
+    assert!(locator_revalidation < drop_inert && drop_inert < credential_shutdown);
+    assert!(credential_shutdown < drop_credential_locator);
+    assert!(drop_credential_locator < drop_clients);
     assert!(drop_clients < drop_peers && drop_peers < drop_local && drop_local < drop_facts);
     assert!(drop_facts < drop_config);
 
@@ -524,10 +587,16 @@ fn selected_egress_actor_is_denied_thread_confined_and_capability_narrow() {
     assert_eq!(production.matches(".production_selected(").count(), 1);
     assert_eq!(
         production
-            .matches("FreshCredentialAuthorityOwner::load_from_protected_files(")
+            .matches(
+                "FreshStagedObservationCredentialAuthorityOwner::load_from_reviewed_fresh_token(",
+            )
             .count(),
         1
     );
+    assert!(!production.contains("unattested_fresh_credential_directory"));
+    assert!(!production.contains("FreshCredentialAuthorityOwner::load_from_protected_files("));
+    assert!(!production.contains("FreshCredentialAuthorityOwner"));
+    assert!(!production.contains("verify_reviewed_fresh_credential_slot_locator_v1("));
     assert!(MANIFEST.contains("reap-polymarket-egress-binding.workspace = true"));
     assert!(!MANIFEST.contains("reqwest"));
 }
@@ -1513,7 +1582,7 @@ fn staged_fresh_private_reads_are_actor_local_signer_bound_and_cleanup_on_build_
         "_configured_scope: PmWireScope",
         "pub(super) async fn production_selected_internal(",
         "_assembly: PmDeferredObservationAssemblyToken",
-        "credential_owner: FreshCredentialAuthorityOwner",
+        "credential_owner: FreshStagedObservationCredentialAuthorityOwner",
         "local_set: &tokio::task::LocalSet",
         "fixed_clob_http_peer: PmFixedTlsPeerSelection",
         "fixed_clob_ws_peer: PmFixedTlsPeerSelection",
@@ -1679,8 +1748,15 @@ fn staged_fresh_private_reads_are_actor_local_signer_bound_and_cleanup_on_build_
     assert!(observing_custody.contains("_actor_local: PhantomData<Rc<()>>"));
     assert!(observing_task.contains("None => common_open = false"));
     assert!(observing_task.contains("drop(credentials);\n    drop(signer);"));
-    assert!(PRIVATE_READS.contains("assert_send::<FreshCredentialAuthorityOwner>();"));
+    assert!(
+        PRIVATE_READS.contains("assert_send::<FreshStagedObservationCredentialAuthorityOwner>();")
+    );
     assert!(PRIVATE_READS.contains("credential_owner.spawn_staged_observation(local_set)"));
+    assert!(
+        PUBLIC_BOOK.contains("credential_owner: FreshStagedObservationCredentialAuthorityOwner")
+    );
+    assert!(!PRIVATE_READS.contains("credential_owner: FreshCredentialAuthorityOwner"));
+    assert!(!PUBLIC_BOOK.contains("credential_owner: FreshCredentialAuthorityOwner"));
     for regression in [
         "staged_production_builds_real_same_credential_rest_and_user_roles",
         "failed_staged_production_build_joins_and_removes_all_four_files",

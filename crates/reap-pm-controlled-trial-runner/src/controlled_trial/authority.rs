@@ -13,6 +13,10 @@ use std::{
 };
 
 use async_trait::async_trait;
+use reap_pm_controlled_trial::{
+    PM_T2_FRESH_API_KEY_ENTRY_V1, PM_T2_FRESH_L2_SECRET_ENTRY_V1, PM_T2_FRESH_PASSPHRASE_ENTRY_V1,
+    PM_T2_FRESH_PRIVATE_KEY_ENTRY_V1, ReviewedFreshCredentialLoadTokenV1,
+};
 use reap_pm_controlled_trial_live::{
     PmCancelDispatchClassV1, PmDurablePlacePreparedAckV1,
     PmRevalidatedPhaseALiveCancelDispatchOwnerV1,
@@ -257,7 +261,7 @@ impl Drop for TaskSignerCustody {
 
 /// Fresh-mode owner of the four-file custody handoff. Spawning transfers the
 /// signer and sole L2 bundle into one supervised task.
-pub(super) struct FreshCredentialAuthorityOwner {
+struct FreshCredentialAuthorityOwner {
     custody: FreshPlaceCredentialHandoff,
 }
 
@@ -266,7 +270,7 @@ impl FreshCredentialAuthorityOwner {
     /// authority owner. No raw signer, L2 bundle, handoff, or teardown value is
     /// exposed to the caller.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn load_from_protected_files(
+    fn load_from_protected_files(
         directory: PathBuf,
         private_key_entry: String,
         api_key_entry: String,
@@ -300,7 +304,7 @@ impl FreshCredentialAuthorityOwner {
     /// a time capability. The same local set must remain driven through
     /// `PmObservingFreshCredentialCustody::shutdown_bounded`; dropping it
     /// cancels the secret task but does not disarm the returned cleanup owner.
-    pub(super) fn spawn_staged_observation(
+    fn spawn_staged_observation(
         self,
         local_set: &tokio::task::LocalSet,
     ) -> Result<FreshStagedObservationAuthorityRoles, CredentialAuthorityError> {
@@ -334,7 +338,11 @@ impl FreshCredentialAuthorityOwner {
     }
     // END STAGED_OBSERVATION_SPAWN
 
-    pub(super) fn spawn_with_mutation_time_finalizers(
+    #[allow(
+        dead_code,
+        reason = "generic mutation authority remains covered by authority-local lifecycle tests"
+    )]
+    fn spawn_with_mutation_time_finalizers(
         self,
         place_time_finalizer: PmPlaceMutationTimeFinalizer,
         cancel_time_finalizer: PmCancelMutationTimeFinalizer,
@@ -390,6 +398,68 @@ impl FreshCredentialAuthorityOwner {
             place_time_finalizer,
             tests::unused_cancel_time_finalizer(),
         )
+    }
+}
+
+/// One-shot fresh custody owner whose only production transition is staged
+/// observation. It cannot project the generic fresh owner or reach place,
+/// cancel, mutation-time, or signing finalizers.
+pub(super) struct FreshStagedObservationCredentialAuthorityOwner {
+    owner: FreshCredentialAuthorityOwner,
+}
+
+impl FreshStagedObservationCredentialAuthorityOwner {
+    /// Consume the one directory-and-config-signer token minted from one
+    /// consumed loaded canonical holder by the exact reviewed-locator
+    /// conjunction. A failed protected load consumes this token, so this
+    /// boundary cannot retry or duplicate that holder. Reloading the protected
+    /// sidecar remains separately possible and is neither V2-pinned nor a
+    /// globally unique delivery claim.
+    pub(super) fn load_from_reviewed_fresh_token(
+        token: ReviewedFreshCredentialLoadTokenV1,
+    ) -> Result<Self, CredentialAuthorityError> {
+        let (directory, configured_signer_text) = token.into_parts();
+        let configured_signer = EoaAddress::parse(&configured_signer_text)
+            .map_err(|_| CredentialAuthorityError::CredentialCustodyLoadFailed)?;
+        drop(configured_signer_text);
+        let owner = FreshCredentialAuthorityOwner::load_from_protected_files(
+            directory,
+            PM_T2_FRESH_PRIVATE_KEY_ENTRY_V1.to_owned(),
+            PM_T2_FRESH_API_KEY_ENTRY_V1.to_owned(),
+            PM_T2_FRESH_L2_SECRET_ENTRY_V1.to_owned(),
+            PM_T2_FRESH_PASSPHRASE_ENTRY_V1.to_owned(),
+            configured_signer,
+        )?;
+        Ok(Self { owner })
+    }
+
+    #[cfg(test)]
+    pub(super) fn load_from_protected_files_for_test(
+        directory: PathBuf,
+        configured_signer: EoaAddress,
+    ) -> Result<Self, CredentialAuthorityError> {
+        let owner = FreshCredentialAuthorityOwner::load_from_protected_files(
+            directory,
+            PM_T2_FRESH_PRIVATE_KEY_ENTRY_V1.to_owned(),
+            PM_T2_FRESH_API_KEY_ENTRY_V1.to_owned(),
+            PM_T2_FRESH_L2_SECRET_ENTRY_V1.to_owned(),
+            PM_T2_FRESH_PASSPHRASE_ENTRY_V1.to_owned(),
+            configured_signer,
+        )?;
+        Ok(Self { owner })
+    }
+
+    pub(super) fn spawn_staged_observation(
+        self,
+        local_set: &tokio::task::LocalSet,
+    ) -> Result<FreshStagedObservationAuthorityRoles, CredentialAuthorityError> {
+        self.owner.spawn_staged_observation(local_set)
+    }
+}
+
+impl fmt::Debug for FreshStagedObservationCredentialAuthorityOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FreshStagedObservationCredentialAuthorityOwner([REDACTED])")
     }
 }
 

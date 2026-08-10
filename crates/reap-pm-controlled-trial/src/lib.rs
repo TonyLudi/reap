@@ -13,6 +13,7 @@ mod online_policy_v2;
 mod preflight;
 mod protected_file;
 mod reviewed_destination_profile_v1;
+mod reviewed_fresh_credential_slot_locator_v1;
 
 pub use config::{
     AuthorizationApproval, AuthorizationBuildBinding, AuthorizationHostBinding,
@@ -98,6 +99,20 @@ pub use reviewed_destination_profile_v1::{
     ReviewedProductionDestinationProfileV1, ReviewedProductionDestinationProfileVerificationV1,
     ReviewedProductionDestinationsV1, load_canonical_reviewed_production_destination_profile_v1,
     verify_reviewed_production_destination_profile_v1,
+};
+pub use reviewed_fresh_credential_slot_locator_v1::{
+    CanonicalReviewedFreshCredentialSlotLocatorEvidenceV1,
+    CanonicalReviewedFreshCredentialSlotLocatorV1, PM_T2_FRESH_API_KEY_ENTRY_V1,
+    PM_T2_FRESH_L2_SECRET_ENTRY_V1, PM_T2_FRESH_PASSPHRASE_ENTRY_V1,
+    PM_T2_FRESH_PRIVATE_KEY_ENTRY_V1, PM_T2_REVIEWED_FRESH_CREDENTIAL_SLOT_LOCATOR_FILE_V1,
+    PmReviewedFreshCredentialSlotLocatorV1Error,
+    REVIEWED_FRESH_CREDENTIAL_SLOT_LOCATOR_V1_SCHEMA_VERSION, ReviewedFreshCredentialFilesV1,
+    ReviewedFreshCredentialLoadTokenV1, ReviewedFreshCredentialSlotLocatorV1,
+    ReviewedFreshCredentialSlotLocatorVerificationV1,
+    bind_reviewed_fresh_credential_slot_locator_v1,
+    load_canonical_reviewed_fresh_credential_slot_locator_v1,
+    verify_reviewed_fresh_credential_slot_locator_evidence_v1,
+    verify_reviewed_fresh_credential_slot_locator_v1,
 };
 
 /// Hard offline outcome of every command in this A0 executable.

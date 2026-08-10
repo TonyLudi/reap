@@ -207,18 +207,103 @@ fn credential_custody_is_a_private_authority_child_with_no_raw_sibling_escape() 
         );
     }
 
-    let fresh_owner = authority_production
-        .split_once("impl FreshCredentialAuthorityOwner {")
-        .map(|(_, owner)| owner)
-        .expect("fresh credential owner implementation");
-    let fresh_loader = function_signature(fresh_owner, "pub(super) fn load_from_protected_files");
+    let fresh_owner = between(
+        authority_production,
+        "impl FreshCredentialAuthorityOwner {",
+        "/// One-shot fresh custody owner whose only production transition is staged",
+    );
+    let staged_owner = between(
+        authority_production,
+        "pub(super) struct FreshStagedObservationCredentialAuthorityOwner {",
+        "impl fmt::Debug for FreshStagedObservationCredentialAuthorityOwner",
+    );
+    let fresh_loader = function_signature(fresh_owner, "fn load_from_protected_files");
+    let reviewed_fresh_loader =
+        function_signature(staged_owner, "pub(super) fn load_from_reviewed_fresh_token");
     let recovery_owner = authority_production
         .split_once("impl RecoveryCredentialAuthorityOwner {")
         .map(|(_, owner)| owner)
         .expect("recovery credential owner implementation");
     let recovery_loader =
         function_signature(recovery_owner, "pub(super) fn load_from_protected_files");
+    assert!(!authority_production.contains("pub(super) struct FreshCredentialAuthorityOwner"));
+    assert!(
+        authority_production
+            .contains("pub(super) struct FreshStagedObservationCredentialAuthorityOwner")
+    );
     assert!(fresh_loader.contains("private_key_entry: String"));
+    assert!(reviewed_fresh_loader.contains("token: ReviewedFreshCredentialLoadTokenV1"));
+    assert!(!reviewed_fresh_loader.contains("directory:"));
+    assert!(!reviewed_fresh_loader.contains("_entry:"));
+    assert!(!reviewed_fresh_loader.contains("configured_signer:"));
+    for forbidden in [
+        "pub fn load_from_protected_files(",
+        "pub(super) fn load_from_protected_files(",
+        "pub(crate) fn load_from_protected_files(",
+        "pub(in ",
+    ] {
+        assert!(
+            !fresh_owner.contains(forbidden),
+            "raw fresh loader gained sibling visibility `{forbidden}`",
+        );
+    }
+    for required in [
+        "token.into_parts()",
+        "EoaAddress::parse(&configured_signer_text)",
+        "drop(configured_signer_text);",
+        "one directory-and-config-signer token minted from one",
+        "cannot retry or duplicate that holder",
+        "Reloading the protected",
+        "neither V2-pinned nor a",
+    ] {
+        assert!(
+            staged_owner.contains(required),
+            "reviewed fresh loader docs lost `{required}`",
+        );
+    }
+    for required in [
+        "PM_T2_FRESH_PRIVATE_KEY_ENTRY_V1.to_owned()",
+        "PM_T2_FRESH_API_KEY_ENTRY_V1.to_owned()",
+        "PM_T2_FRESH_L2_SECRET_ENTRY_V1.to_owned()",
+        "PM_T2_FRESH_PASSPHRASE_ENTRY_V1.to_owned()",
+    ] {
+        assert!(
+            staged_owner.contains(required),
+            "reviewed fresh loader lost `{required}`",
+        );
+    }
+    for forbidden in [
+        "pub(super) struct FreshCredentialAuthorityOwner",
+        "pub(super) fn spawn_with_mutation_time_finalizers(",
+        "pub(super) fn spawn_staged_observation(",
+    ] {
+        assert!(
+            !fresh_owner.contains(forbidden),
+            "generic fresh owner regained sibling authority `{forbidden}`",
+        );
+    }
+    for forbidden in [
+        "spawn_with_mutation_time_finalizers",
+        "fn into_owner(",
+        "fn into_parts(",
+        "fn owner(",
+        "PmPlaceMutationTimeFinalizer",
+        "PmCancelMutationTimeFinalizer",
+    ] {
+        assert!(
+            !staged_owner.contains(forbidden),
+            "staged-only owner gained mutation or raw projection `{forbidden}`",
+        );
+    }
+    assert!(staged_owner.contains("owner: FreshCredentialAuthorityOwner"));
+    assert!(staged_owner.contains("self.owner.spawn_staged_observation(local_set)"));
+    assert_eq!(staged_owner.matches("token.into_parts()").count(), 1);
+    assert!(!staged_owner.contains("directory.clone()"));
+    assert!(!staged_owner.contains("configured_signer_text.clone()"));
+    assert!(
+        staged_owner
+            .contains("#[cfg(test)]\n    pub(super) fn load_from_protected_files_for_test(")
+    );
     assert!(!recovery_loader.contains("private_key_entry"));
     for (owner, signature) in [("fresh", fresh_loader), ("recovery", recovery_loader)] {
         assert!(signature.contains(") -> Result<Self, CredentialAuthorityError>"));
@@ -303,7 +388,7 @@ fn staged_observation_is_a_distinct_armed_read_only_fresh_custody() {
         "// END STAGED_OBSERVATION_TASK",
     );
 
-    let signature = function_signature(spawn, "pub(super) fn spawn_staged_observation");
+    let signature = function_signature(spawn, "fn spawn_staged_observation");
     assert!(signature.contains("self,"));
     assert!(signature.contains("local_set: &tokio::task::LocalSet,"));
     assert!(
@@ -335,6 +420,22 @@ fn staged_observation_is_a_distinct_armed_read_only_fresh_custody() {
     assert_eq!(spawn.matches("mpsc::channel(").count(), 1);
     assert!(!spawn.contains("tokio::runtime::Handle"));
     assert!(!spawn.contains(".spawn("));
+
+    let staged_owner = between(
+        production,
+        "pub(super) struct FreshStagedObservationCredentialAuthorityOwner {",
+        "impl fmt::Debug for FreshStagedObservationCredentialAuthorityOwner",
+    );
+    let staged_spawn = function_signature(staged_owner, "pub(super) fn spawn_staged_observation");
+    assert!(staged_spawn.contains("self,"));
+    assert!(staged_spawn.contains("local_set: &tokio::task::LocalSet,"));
+    assert!(staged_owner.contains("self.owner.spawn_staged_observation(local_set)"));
+    for forbidden in ["finalizer", "proof", "timestamp", "place", "cancel"] {
+        assert!(
+            !staged_spawn.contains(forbidden),
+            "staged-only owner gained `{forbidden}` input authority",
+        );
+    }
 
     for required in [
         "pub(super) struct FreshStagedObservationAuthorityRoles",

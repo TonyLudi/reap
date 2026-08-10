@@ -37,8 +37,8 @@ use super::super::authority::FreshStagedObservationAuthorityRoles;
 use super::super::authority::{
     CredentialAuthorityShutdownBounds, CredentialAuthorityShutdownOutcome,
     ExactOwnedCancelAuthenticationRole, FixedHttpAuthenticationRole, FixedUserWsAuthenticationRole,
-    FreshCredentialAuthorityOwner, FreshCredentialAuthorityRoles,
-    FreshCredentialAuthoritySupervisor, FreshPlaceAuthenticationOnce,
+    FreshCredentialAuthorityRoles, FreshCredentialAuthoritySupervisor,
+    FreshPlaceAuthenticationOnce, FreshStagedObservationCredentialAuthorityOwner,
     PmObservingFreshCredentialCustody, PmObservingFreshCredentialShutdownError,
     RecoveryCredentialAuthorityRoles, RecoveryCredentialAuthoritySupervisor,
 };
@@ -1597,7 +1597,7 @@ impl PmFreshStagedSelectedObservationRoles {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn production_selected_internal(
         _assembly: PmDeferredObservationAssemblyToken,
-        credential_owner: FreshCredentialAuthorityOwner,
+        credential_owner: FreshStagedObservationCredentialAuthorityOwner,
         local_set: &tokio::task::LocalSet,
         profile: PmPrivateReadRuntimeProfile,
         clocks: PmPrivateReadClockBundle,
@@ -2029,8 +2029,8 @@ mod tests {
 
     use super::*;
     use crate::controlled_trial::authority::{
-        CredentialAuthorityShutdownBounds, FreshCredentialAuthorityOwner,
-        FreshStagedObservationAuthorityRoles, RecoveryCredentialAuthorityOwner,
+        CredentialAuthorityShutdownBounds, FreshStagedObservationAuthorityRoles,
+        FreshStagedObservationCredentialAuthorityOwner, RecoveryCredentialAuthorityOwner,
     };
 
     const KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -2326,9 +2326,9 @@ mod tests {
         (directory, roles)
     }
 
-    fn fresh_credential_owner() -> (TempDir, FreshCredentialAuthorityOwner) {
+    fn fresh_credential_owner() -> (TempDir, FreshStagedObservationCredentialAuthorityOwner) {
         fn assert_send<T: Send>() {}
-        assert_send::<FreshCredentialAuthorityOwner>();
+        assert_send::<FreshStagedObservationCredentialAuthorityOwner>();
 
         let directory = tempfile::tempdir().unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -2336,15 +2336,12 @@ mod tests {
         write_secret(directory.path(), "api-key", API_KEY);
         write_secret(directory.path(), "l2-secret", L2_SECRET);
         write_secret(directory.path(), "passphrase", PASSPHRASE);
-        let owner = FreshCredentialAuthorityOwner::load_from_protected_files(
-            directory.path().to_owned(),
-            "private-key".into(),
-            "api-key".into(),
-            "l2-secret".into(),
-            "passphrase".into(),
-            signer(),
-        )
-        .unwrap();
+        let owner =
+            FreshStagedObservationCredentialAuthorityOwner::load_from_protected_files_for_test(
+                directory.path().to_owned(),
+                signer(),
+            )
+            .unwrap();
         (directory, owner)
     }
 

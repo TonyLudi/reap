@@ -9,6 +9,8 @@ const PREFLIGHT: &str = include_str!("../src/preflight.rs");
 const PROTECTED: &str = include_str!("../src/protected_file.rs");
 const REVIEWED_DESTINATION_PROFILE_V1: &str =
     include_str!("../src/reviewed_destination_profile_v1.rs");
+const REVIEWED_FRESH_CREDENTIAL_SLOT_LOCATOR_V1: &str =
+    include_str!("../src/reviewed_fresh_credential_slot_locator_v1.rs");
 const MAIN: &str = include_str!("../src/main.rs");
 
 #[test]
@@ -40,6 +42,7 @@ fn source_exposes_only_offline_dry_run_commands_and_no_mutation_route_or_body() 
         PREFLIGHT,
         PROTECTED,
         REVIEWED_DESTINATION_PROFILE_V1,
+        REVIEWED_FRESH_CREDENTIAL_SLOT_LOCATOR_V1,
         MAIN,
     ]
     .join("\n");
@@ -64,6 +67,169 @@ fn source_exposes_only_offline_dry_run_commands_and_no_mutation_route_or_body() 
     assert!(!MAIN.contains("Place"));
     assert!(!MAIN.contains("Cancel"));
     assert!(!MAIN.contains("ConsumeAuthorization"));
+}
+
+#[test]
+fn reviewed_fresh_credential_slot_locator_v1_is_exact_additive_and_denied_only() {
+    for required in [
+        "REVIEWED_FRESH_CREDENTIAL_SLOT_LOCATOR_V1_FINGERPRINT_DOMAIN",
+        "reap.pm-t2.controlled-trial.reviewed-fresh-credential-slot-locator.v1\\0",
+        "pm-t2-reviewed-fresh-credential-slot-locator-v1.json",
+        "pub const PM_T2_FRESH_PRIVATE_KEY_ENTRY_V1: &str = \"private-key\";",
+        "pub const PM_T2_FRESH_API_KEY_ENTRY_V1: &str = \"api-key\";",
+        "pub const PM_T2_FRESH_L2_SECRET_ENTRY_V1: &str = \"l2-secret\";",
+        "pub const PM_T2_FRESH_PASSPHRASE_ENTRY_V1: &str = \"passphrase\";",
+        "pub protected_fresh_credential_directory: String,",
+        "pub credential_slot_id: String,",
+        "pub credential_slot_nonsecret_fingerprint_sha256: String,",
+        "validate_online_authorization_contract_v2",
+        "locator_times.valid_not_before != authorization_times.not_before",
+        "locator_times.valid_not_after != authorization_times.cleanup_not_after",
+        "locator.credential_slot_id != config.value().credential_slot.slot_id",
+        "nonsecret_fingerprint_sha256",
+        "validate_absolute_lexical_directory",
+        "normalized.as_os_str() != OsStr::new(value)",
+        "without consulting a caller clock",
+        "source_owned_current_time_checked: false",
+        "protected_credential_directory_and_four_files_checked: false",
+        "loaded_bundle_matches_credential_slot_generation: false",
+        "remote_api_key_owner_attested: false",
+        "locator_fingerprint_pinned_by_v2: false",
+        "reviewer_authorship_attested: false",
+        "load_token_consumption_durably_recorded: false",
+        "authorization_consumption_checked: false",
+        "OfflineAuthorizationState::DENIED",
+        "does not derive a fingerprint from an API key",
+        "protected sidecar and absolute directory remain caller-supplied",
+        "unattested by the frozen V2 lineage",
+        "they do not attest reviewer",
+        "authorship, and `issuing_reviewer` is only a reviewer label",
+        "caller cannot select a",
+        "non-fixed basename",
+        "Reviewer-labeled, non-authenticated",
+        "filesystem object currently exists at the locator",
+        "future positive gate needs",
+        "frozen online-authorization V2 consumption",
+        "pub struct CanonicalReviewedFreshCredentialSlotLocatorEvidenceV1",
+        "pub struct ReviewedFreshCredentialLoadTokenV1",
+        "pub fn bind_reviewed_fresh_credential_slot_locator_v1(",
+        "pub fn verify_reviewed_fresh_credential_slot_locator_evidence_v1(",
+        "let configured_signer = config.value().account.signer.clone();",
+        "pub fn into_parts(self) -> (PathBuf, String)",
+        "One-shot local projection capability for one loaded canonical holder",
+        "returns ordinary cloneable `PathBuf`",
+        "does not prevent their later copying or arbitrary",
+        "Actual single-load composition is enforced only when",
+        "runner's private staged loader immediately consumes this token",
+        "Loading the protected sidecar again can",
+        "issue another independently denied",
+        "ProtectedFileKind::ReviewedFreshCredentialSlotLocatorV1",
+        "CanonicalReviewedFreshCredentialSlotLocatorV1(<reviewed-locator-evidence; exact-canonical-bytes; redacted>)",
+    ] {
+        assert!(
+            REVIEWED_FRESH_CREDENTIAL_SLOT_LOCATOR_V1.contains(required),
+            "missing reviewed fresh credential-slot locator V1 source pin `{required}`"
+        );
+    }
+    for forbidden in [
+        "reqwest",
+        "tokio",
+        "TcpStream",
+        "connect_async",
+        "L2Credentials",
+        "EoaPrivateKeyInput",
+        "CredentialSlotId",
+        "authenticated_journal_credential_slot",
+        ".canonicalize(",
+        "symlink_metadata",
+        "production_order_entry_authorized: true",
+        "real_order_submission_authorized: true",
+        "remote_api_key_owner_attested: true",
+        "loaded_bundle_matches_credential_slot_generation: true",
+        "impl Clone for CanonicalReviewedFreshCredentialSlotLocatorV1",
+        "impl Serialize for CanonicalReviewedFreshCredentialSlotLocatorV1",
+        "impl Clone for CanonicalReviewedFreshCredentialSlotLocatorEvidenceV1",
+        "impl Serialize for CanonicalReviewedFreshCredentialSlotLocatorEvidenceV1",
+        "Deserialize<'de> for CanonicalReviewedFreshCredentialSlotLocatorEvidenceV1",
+        "impl Clone for ReviewedFreshCredentialLoadTokenV1",
+        "impl Serialize for ReviewedFreshCredentialLoadTokenV1",
+        "Deserialize<'de> for ReviewedFreshCredentialLoadTokenV1",
+        "Deserialize<'de> for CanonicalReviewedFreshCredentialSlotLocatorV1",
+        "pub const fn value(&self)",
+        "pub fn protected_fresh_credential_directory(&self)",
+    ] {
+        assert!(
+            !REVIEWED_FRESH_CREDENTIAL_SLOT_LOCATOR_V1.contains(forbidden),
+            "forbidden secret, filesystem, transport, or authority surface: {forbidden}"
+        );
+    }
+    assert!(PROTECTED.contains("ReviewedFreshCredentialSlotLocatorV1"));
+    assert!(LIB.contains("mod reviewed_fresh_credential_slot_locator_v1;"));
+    assert!(!ONLINE_POLICY_V2.contains("ReviewedFreshCredentialSlotLocatorV1"));
+    assert!(!ONLINE_CONSUMPTION_V2.contains("ReviewedFreshCredentialSlotLocatorV1"));
+
+    let binder_signature = REVIEWED_FRESH_CREDENTIAL_SLOT_LOCATOR_V1
+        .split_once("pub fn bind_reviewed_fresh_credential_slot_locator_v1(")
+        .and_then(|(_, tail)| {
+            tail.split_once(") -> Result<")
+                .map(|(signature, _)| signature)
+        })
+        .expect("reviewed locator binder signature must remain recognizable");
+    assert!(!binder_signature.contains("signer"));
+
+    let canonical_surface = REVIEWED_FRESH_CREDENTIAL_SLOT_LOCATOR_V1
+        .split_once("impl CanonicalReviewedFreshCredentialSlotLocatorV1 {")
+        .and_then(|(_, tail)| {
+            tail.split_once("impl fmt::Debug for CanonicalReviewedFreshCredentialSlotLocatorV1")
+                .map(|(surface, _)| surface)
+        })
+        .expect("canonical reviewed locator surface must remain recognizable");
+    assert!(!canonical_surface.contains("value("));
+    assert!(!canonical_surface.contains("directory("));
+
+    let evidence_surface = REVIEWED_FRESH_CREDENTIAL_SLOT_LOCATOR_V1
+        .split_once("impl CanonicalReviewedFreshCredentialSlotLocatorEvidenceV1 {")
+        .and_then(|(_, tail)| {
+            tail.split_once(
+                "impl fmt::Debug for CanonicalReviewedFreshCredentialSlotLocatorEvidenceV1",
+            )
+            .map(|(surface, _)| surface)
+        })
+        .expect("retained reviewed locator evidence surface must remain recognizable");
+    assert!(!evidence_surface.contains("value("));
+    assert!(!evidence_surface.contains("directory("));
+
+    for declaration in [
+        "pub struct CanonicalReviewedFreshCredentialSlotLocatorV1 {",
+        "pub struct CanonicalReviewedFreshCredentialSlotLocatorEvidenceV1 {",
+        "pub struct ReviewedFreshCredentialLoadTokenV1 {",
+    ] {
+        let before = REVIEWED_FRESH_CREDENTIAL_SLOT_LOCATOR_V1
+            .split_once(declaration)
+            .map(|(before, _)| before)
+            .expect("reviewed locator declaration must remain recognizable");
+        let declaration_attributes = before
+            .rsplit_once("\n}\n\n")
+            .map_or(before, |(_, attributes)| attributes);
+        assert!(
+            !declaration_attributes.contains("#[derive"),
+            "move-only reviewed locator type gained a derive: {declaration}"
+        );
+
+        let type_name = declaration
+            .strip_prefix("pub struct ")
+            .and_then(|value| value.strip_suffix(" {"))
+            .expect("reviewed locator declaration name must remain recognizable");
+        for implementation in REVIEWED_FRESH_CREDENTIAL_SLOT_LOCATOR_V1.split("\nimpl") {
+            let header = implementation
+                .split_once('{')
+                .map_or(implementation, |(header, _)| header);
+            assert!(
+                !(header.contains(type_name) && header.contains("Deserialize")),
+                "move-only reviewed locator type gained manual Deserialize: {type_name}"
+            );
+        }
+    }
 }
 
 #[test]

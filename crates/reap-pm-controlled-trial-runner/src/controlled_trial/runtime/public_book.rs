@@ -49,7 +49,9 @@ use reap_polymarket_wire::{
 use reap_transport::ReconnectPolicy;
 use thiserror::Error;
 
-use super::super::authority::{CredentialAuthorityShutdownBounds, FreshCredentialAuthorityOwner};
+use super::super::authority::{
+    CredentialAuthorityShutdownBounds, FreshStagedObservationCredentialAuthorityOwner,
+};
 use super::private_reads::{
     PmFreshStagedSelectedObservationRoles, PmPrivateReadRuntimeError, PmPrivateReadRuntimeProfile,
 };
@@ -122,7 +124,7 @@ impl PmDeferredObservationRuntimeRoles {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn production_selected(
         self,
-        credential_owner: FreshCredentialAuthorityOwner,
+        credential_owner: FreshStagedObservationCredentialAuthorityOwner,
         local_set: &tokio::task::LocalSet,
         profile: PmPrivateReadRuntimeProfile,
         fixed_clob_http_peer: PmFixedTlsPeerSelection,
