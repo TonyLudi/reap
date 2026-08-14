@@ -1,0 +1,17 @@
+[package]
+name = "reap-pm-emergency-runner"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "reap-pm-emergency-runner"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+reap-polymarket-credential-file.workspace = true
+reap-polymarket-egress-binding.workspace = true
+reap-polymarket-emergency-adapter.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

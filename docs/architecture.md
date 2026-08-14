@@ -60,7 +60,7 @@ code/evidence tree
 authenticated PM connectivity, an approved production quote model, target-host
 qualification, venue capacity, or trading approval.
 
-PM-T1 builds a separate, production-shaped connectivity edge on that Goal F
+PM-T1 built a separate, production-shaped connectivity edge on that Goal F
 foundation. `reap-polymarket-auth` owns the fixed EOA/L2 cryptographic
 authorities, `reap-polymarket-live-adapter` owns the allowlisted public and
 authenticated transports, and `reap-pm-live` remains the sole coordinator and
@@ -70,6 +70,32 @@ credentials and owner-local endpoints, and has no production constructor.
 The fixed profile remains GTC post-only place plus exact journal-owned cancel;
 `production_order_entry_authorized = false` is unchanged. PM-T1 is local
 connectivity and recovery proof, not a production strategy or trading approval.
+
+The later controlled-trial overlay adds a deliberately separate production
+canary executable. It can consume one explicit operator authorization and one
+create-new durable ledger to place a hard-capped current-BTC-five-minute order,
+cancel only its deterministic owned order ID, and reconcile exact fills against
+an independently polled position. Its consume-once authorization and ledger do
+not enter `reap-pm-live`; the underlying purpose-closed transports are also
+consumed by the later supervisor role. Neither boundary authorizes a continuous
+strategy or changes the false product-level `production_order_entry_authorized`
+value. The two scopes are named in code as
+`PRODUCTION_ORDER_ENTRY_AUTHORIZED = false` for the continuous product and
+`ONE_SHOT_PRODUCTION_ORDER_ENTRY_AVAILABLE = true` for the controlled-trial
+transport boundary.
+
+The production-infrastructure overlay adds a third, strategy-neutral boundary.
+`PmProductionSupervisor` joins independently owned heartbeat, private-WS,
+complete-poll, and mutation roles under one fail-closed actor and leased durable
+journal. `PmProductionSupervisedMutationRole` is a concrete default-build
+production constructor, but only after it consumes an exact selected
+place/cancel time capsule, one proxy signer/L2 bundle, one fixed CLOB domain and
+scope, and fixed-peer place/cancel transports. It signs only a validated GTC
+post-only request and cancels only an exact ID supplied by the supervisor.
+`PmSupervisorFixedHeartbeatRole` similarly joins fixed `/time`, L2, and
+`/v1/heartbeats` while retaining the venue heartbeat identifier. Neither value
+contains a model or strategy authorization; the ordinary `PmProduct<M>` still
+uses fake execution and `PRODUCTION_ORDER_ENTRY_AUTHORIZED` remains false.
 
 The separate `reap-pm-readiness` composition is the only operator-facing PM
 credentialed path. It owns a closed read-only config and protected runtime-file
@@ -331,7 +357,10 @@ production probability model.
 
 The Polymarket edges expose separate sealed roles for public observation,
 private lifecycle, order reconciliation, account/allowance/position snapshots,
-fixed placement, and exact-owned cancellation. A narrower account-only owner
+fixed placement, exact-owned cancellation, and credential-wide order heartbeat.
+A separate emergency crate exposes only unfiltered open-order reads and
+`DELETE /cancel-all`; it cannot submit and is not linked into the strategy
+supervisor. A narrower account-only owner
 can split only server-time, two fixed balance reads, and credential-shutdown
 roles; its closed signature-type enum contains only EOA `0` and proxy `1`.
 `PmConnectivityPlan` joins model requirements, mandatory safety/read
@@ -357,8 +386,10 @@ Reservation occurs before dispatch, the Goal F intent must be durably
 acknowledged before a prepared effect exists, and authenticated transport cannot
 write before its own Prepared and DispatchAuthorized records are durable.
 Prepared/send/result/bridge authorities are move-only and correlated to one
-journal runtime. No public runtime backend selector or production mutation
-constructor exists.
+journal runtime. No public runtime backend selector exists. The later
+production-supervisor constructor is a separate consuming root with its own
+leased journal and fixed role bundle; it cannot convert this product at runtime
+or authorize its fixture model.
 
 Network parsing, capture, durable writing, and telemetry remain at bounded
 edges. Typed queues have fixed capacities, deterministic ordering/age rules,
@@ -513,9 +544,11 @@ reap/
 | `reap-polymarket-auth` | Redacted, zeroizing fixed EOA/type-0 CLOB V2 signing and purpose-specific L2 request authentication; no strategy, canonical state, socket, generic signing, or arbitrary-request authority. |
 | `reap-pm-strategy` | Statically dispatched pure quote-model requirements/output and the exact side-aware passive quote-policy boundary. |
 | `reap-polymarket-adapter` | Separate sealed PM public, fixture/live normalization, read-only reconciliation/account, fill-cut, and in-process fake-execution roles; no broad client escape or credential owner. |
-| `reap-polymarket-live-adapter` | Allowlisted, bounded PM public/authenticated HTTP and WebSocket transports plus fixed place/exact-owned cancel roles. A separate production-read-only account owner admits only reviewed EOA/type-0 or proxy/type-1 profiles and can expose only time, collateral/configured-token balance, and joined credential-shutdown roles; no strategy decisions, canonical PM state, generic request, or production mutation constructor. |
+| `reap-polymarket-live-adapter` | Allowlisted, bounded PM public/authenticated HTTP and WebSocket transports plus fixed place/exact-owned cancel/order-heartbeat roles. Its production-supervised mutation owner consumes exact scope/domain/signer/L2/purpose-time/fixed-peer authority and exposes only post-only place plus exact cancel. A separate read-only account owner remains mutation-free; no generic request or strategy decision escapes. |
 | `reap-pm-live-contracts` | Secret-free scoped PM configuration, exact capability plan, role bindings, lanes, and readiness dependencies. |
-| `reap-pm-live` | Sibling PM public capture/replay, read-only monitor, deterministic lanes, one-owner coordinator, Goal F and authenticated journals, cross-journal recovery, fake product root, and feature-gated authenticated-loopback root with owned read supervision and controlled live-order shutdown. |
+| `reap-pm-live` | Sibling PM public capture/replay, read-only monitor, deterministic lanes, one-owner coordinator, Goal F/authenticated journals, fake and authenticated-loopback roots, plus the strategy-neutral production supervisor with leased recovery, independent heartbeat/WS/poll tasks, fixed mutation adapters, fill-derived positions, authoritative position reconciliation, and zero-order shutdown. |
+| `reap-polymarket-credential-file` | Protected owner-held Predarb credential loader fixed to the legacy type-1 proxy profile; returns typed signer/L2/funder authorities and never raw secret strings. |
+| `reap-polymarket-emergency-adapter` / `reap-pm-emergency-runner` | Separate L2-only account-wide cancel-all plane with complete unfiltered open-order pagination and terminal zero proof. The runner destroys signer authority before constructing it and requires an exact destructive authorization phrase. |
 | `reap-pm-readiness` | Dedicated operator-runnable PM credentialed-read-only certification and offline verification. The full type-0 composition covers metadata/reconciliation/user stream; the distinct EOA-or-proxy account-only composition makes exactly two time and two balance attempts and emits its own narrower artifact. Both use protected runtime-file credentials, bounded redacted evidence, explicit joined teardown, and literal false/zero mutation authority. |
 | `reap-okx-public-source` | Narrow credential-free OKX index-ticker source used by the PM product; no OKX private/account/order role. |
 | `reap-venue` | Existing credential-free Chaos/OKX protocol/parsing, exact OKX metadata, and connectivity keys; no signer or authenticated client, and not a universal PM adapter. |

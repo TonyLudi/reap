@@ -35,7 +35,7 @@ connectivity, or new order authority.
 | Reap safety hardening | Narrow readiness/host/metadata/reconciliation reads, regular CAA and owned cancellation, and read-only algo/spread zero proof remain required safety controls rather than new strategy features. |
 | Evidence and research | Credential-free public capture and deterministic backtest/research, separately composed authenticated-read-only collection, and offline certifications/verifiers are implemented evidence mechanisms. They have no mutation authority and no artifact authorizes entry. |
 | Account-wide emergency recovery | The separate executable may enumerate/cancel regular, algo, and spread orders and arm regular/spread deadmen, never submit, and is absent from live. |
-| Not implemented | Amend/batch amend, other regular profiles, algo/spread placement, margin-spot borrowing, master/group feeds, other live venues, generic plugins, and production order entry. |
+| Not implemented | Amend/batch amend, other regular profiles, algo/spread placement, margin-spot borrowing, master/group feeds, an operator-runnable continuously composed Polymarket strategy binary, generic plugins, and general production order entry. A strategy-neutral PM production supervisor plus fixed heartbeat/mutation adapters and a separately authorized one-shot canary exist, but neither grants continuous strategy authority. |
 
 This scope remains pinned to the supported call path in the clean
 `../imm-strategy` checkout at
@@ -63,6 +63,42 @@ This scope remains pinned to the supported call path in the clean
 | Demo fault injection | A loopback-only proxy independently routes OKX demo REST, public, private-state, and order-command traffic; strict owner-local commands inject disconnects, matched frame drops, and matched REST responses; create-new injector/run artifacts bind proxy config and pinned Java provenance, and the live fault matrix validates supported typed roles | Tooling is implemented and credential-free forwarding smokes passed, but no credentialed isolated campaign or target-host acceptance evidence exists |
 | Build/supply chain | Rust `1.95.0` is pinned; least-privilege CI checks formatting, all-target lint, all workspace tests, a locked release build, and RustSec advisories; Cargo and Actions updates are proposed weekly | CI must remain green and dependency updates reviewed, but this does not replace credentialed exchange or target-host evidence |
 | Exchange certification | Point-in-time account certification, journal-bound process-death deadman replay, exact fill/bill collection, and offline normal-trade/funding economics are implemented, but no passing target-account artifact, OKX demo soak, economic artifact, deadman artifact, or broader fault campaign is recorded | Production blocker |
+
+## Current Polymarket Controlled-Canary Overlay
+
+The controlled-trial runner now has fixed-purpose production transports for a
+single hard-capped BTC five-minute place/cancel or minimum-fill canary. The
+checked-in evidence includes one real far-away place/cancel and one real
+minimum-size fill followed by exact-order, exact-fill, and published-position
+reconciliation. This proves the narrow transport and recovery mechanics only.
+
+`reap-pm-live` now also exposes a strategy-neutral production supervisor. It
+owns a leased mode-0600 JSONL journal, replays recovery before opening commands,
+supervises independent heartbeat/private-WS/poll roles, durably records place
+and exact-cancel intents before mutation, deduplicates WS and REST fills into a
+fill-derived position, gates entry on reconciliation with authoritative polled
+positions, and requires exact-owned cancellation plus a complete terminal
+zero-open-order cut during shutdown. The concrete heartbeat and mutation
+adapters use fixed CLOB peers/selected egress and purpose-specific server time;
+the mutation role validates the public order facts before signing.
+
+This is infrastructure, not a production strategy executable. A deployment
+still has to supply the exact BTC-five-minute public/private WS mapping, full
+open-order/trade/position poll role, rollover orchestration, risk/model command
+producer, host configuration, and soak evidence. Therefore
+`PRODUCTION_SUPERVISOR_INFRA_AVAILABLE = true` coexists with product-level
+`PRODUCTION_ORDER_ENTRY_AUTHORIZED = false` and the separate
+`ONE_SHOT_PRODUCTION_ORDER_ENTRY_AVAILABLE = true`. No one-shot ledger or
+supervisor library value authorizes an unattended strategy by itself.
+
+BTC five-minute lifecycle infrastructure now quiesces 30 seconds before the
+window end, requires a complete zero-open-order cut before rollover, reports
+skipped windows, and retains every retired condition until authoritative Up and
+Down positions are flat. Redeemable inventory becomes `ReadyToRedeem`, never
+tradable inventory. Actual proxy redemption remains outside the CLOB L2 plane:
+the Predarb-format credential profile carries no builder-relayer authorization,
+so the lifecycle can record an external redemption dispatch but cannot
+authorize one.
 
 ## Historical Polymarket Foundation Status (Goal F Complete; Phase 7 Green)
 

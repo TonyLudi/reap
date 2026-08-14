@@ -1595,6 +1595,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "reap-pm-emergency-runner"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "reap-polymarket-credential-file",
+ "reap-polymarket-egress-binding",
+ "reap-polymarket-emergency-adapter",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "reap-pm-live"
 version = "0.1.0"
 dependencies = [
@@ -1723,8 +1736,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "reap-polymarket-credential-file"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "reap-polymarket-auth",
+ "rustix",
+ "tempfile",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "reap-polymarket-egress-binding"
 version = "0.1.0"
+
+[[package]]
+name = "reap-polymarket-emergency-adapter"
+version = "0.1.0"
+dependencies = [
+ "reap-polymarket-auth",
+ "reap-polymarket-egress-binding",
+ "reap-polymarket-wire",
+ "reqwest",
+ "thiserror",
+ "tokio",
+ "url",
+ "zeroize",
+]
 
 [[package]]
 name = "reap-polymarket-live-adapter"

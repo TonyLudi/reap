@@ -41,10 +41,11 @@ pub use l1_credential_derivation_response::{
     L1CredentialDerivationResponseInput, MAX_L1_CREDENTIAL_DERIVATION_RESPONSE_BYTES,
 };
 pub use l2::{
-    AuthenticatedGtcFillPlaceRequest, AuthenticatedL2Headers, AuthenticatedOwnedCancelRequest,
-    AuthenticatedPlaceRequest, AuthenticatedUserSubscription, AuthenticatedUserSubscriptionSink,
-    FixedClosedOnlyRequestSink, FixedGtcFillPlaceRequestSink, FixedOwnedCancelRequestSink,
-    FixedPlaceRequestSink, L2HeaderSink, L2Timestamp,
+    AuthenticatedCancelAllRequest, AuthenticatedGtcFillPlaceRequest, AuthenticatedL2Headers,
+    AuthenticatedOrderHeartbeatRequest, AuthenticatedOwnedCancelRequest, AuthenticatedPlaceRequest,
+    AuthenticatedUserSubscription, AuthenticatedUserSubscriptionSink, FixedCancelAllRequestSink,
+    FixedClosedOnlyRequestSink, FixedGtcFillPlaceRequestSink, FixedOrderHeartbeatRequestSink,
+    FixedOwnedCancelRequestSink, FixedPlaceRequestSink, L2HeaderSink, L2Timestamp,
 };
 pub use legacy_type1_proxy::{
     POLYMARKET_LEGACY_TYPE1_PROXY_CHAIN_ID, derive_legacy_type1_proxy_address,

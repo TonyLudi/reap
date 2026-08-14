@@ -217,6 +217,19 @@ impl PmProductionSelectedPlaceCancelTimeOwner {
         self.scope
     }
 
+    /// Crate-internal consuming bridge used only by the production supervisor
+    /// mutation owner. Keeping this split private prevents standalone time
+    /// roles from escaping without signer, L2, journal, and transport custody.
+    pub(crate) fn into_supervised_purpose_owners(
+        self,
+    ) -> (
+        PmPlaceMutationTimeOwner,
+        PmCancelMutationTimeOwner,
+        PmWireScope,
+    ) {
+        (self.place, self.cancel, self.scope)
+    }
+
     /// Test-only inspection of atomic purpose-owner construction. Production
     /// code has no split until a future sealed actor bridge is introduced.
     #[cfg(test)]

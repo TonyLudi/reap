@@ -924,17 +924,15 @@ impl<'a> PmReconciliationHttpRole<'a> {
         exact_scope_filter: bool,
     ) -> Result<FetchedTradesPage, PmLiveAdapterError> {
         let headers = self.authority.authenticate_trades(timestamp).await?;
-        let body = found(
-            self.transport
-                .get(
-                    PmPrivateRoute::Trades {
-                        cursor,
-                        exact_scope: exact_scope_filter.then_some(self.source_binding().scope),
-                    },
-                    headers,
-                )
-                .await?,
-        )?;
+        let route = if exact_scope_filter {
+            PmPrivateRoute::ExactScopeTrades {
+                cursor,
+                scope: self.source_binding().scope,
+            }
+        } else {
+            PmPrivateRoute::Trades { cursor }
+        };
+        let body = found(self.transport.get(route, headers).await?)?;
         let parsed = if exact_scope_filter {
             parse_live_owned_fill_trade_page(&body)?
         } else {

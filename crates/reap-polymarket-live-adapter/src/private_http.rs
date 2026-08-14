@@ -22,6 +22,8 @@ use crate::{
     read_authority::PmHttpReadAuthorityProvider,
 };
 
+mod scoped_trades_route;
+
 const FIRST_PAGE_CURSOR: &str = "MA==";
 const POLY_ADDRESS: HeaderName = HeaderName::from_static("poly_address");
 const POLY_SIGNATURE: HeaderName = HeaderName::from_static("poly_signature");
@@ -104,7 +106,10 @@ pub(crate) enum PmPrivateRoute<'a> {
     },
     Trades {
         cursor: &'a str,
-        exact_scope: Option<PmWireScope>,
+    },
+    ExactScopeTrades {
+        cursor: &'a str,
+        scope: PmWireScope,
     },
     ExactOrder(FixedOrderId),
     CollateralBalanceAllowance(PmReadOnlySignatureType),
@@ -125,6 +130,7 @@ impl PmPrivateRoute<'_> {
             Self::ClosedOnly => MAX_PM_CLOSED_ONLY_BODY_BYTES,
             Self::OpenOrders { .. }
             | Self::Trades { .. }
+            | Self::ExactScopeTrades { .. }
             | Self::ExactOrder(_)
             | Self::CollateralBalanceAllowance(_)
             | Self::ConditionalBalanceAllowance { .. } => MAX_PM_LIVE_BODY_BYTES,
@@ -304,18 +310,12 @@ impl PmPrivateHttpTransport {
                 url.set_path("/data/orders");
                 url.query_pairs_mut().append_pair("next_cursor", cursor);
             }
-            PmPrivateRoute::Trades {
-                cursor,
-                exact_scope,
-            } => {
+            PmPrivateRoute::Trades { cursor } => {
                 url.set_path("/data/trades");
-                let mut query = url.query_pairs_mut();
-                if let Some(scope) = exact_scope {
-                    query
-                        .append_pair("market", &scope.condition().to_string())
-                        .append_pair("asset_id", &scope.token().units().to_string());
-                }
-                query.append_pair("next_cursor", cursor);
+                url.query_pairs_mut().append_pair("next_cursor", cursor);
+            }
+            PmPrivateRoute::ExactScopeTrades { cursor, scope } => {
+                return scoped_trades_route::url(&self.origin, cursor, scope);
             }
             PmPrivateRoute::ExactOrder(order_id) => {
                 // clob-client-v2's fixed endpoint constant remains

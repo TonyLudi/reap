@@ -21,6 +21,7 @@ reap-pm-strategy.workspace = true
 reap-polymarket-adapter.workspace = true
 reap-polymarket-auth.workspace = true
 reap-polymarket-live-adapter.workspace = true
+reap-polymarket-wire.workspace = true
 reap-transport.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -31,7 +32,6 @@ tokio.workspace = true
 [dev-dependencies]
 futures-util.workspace = true
 reap-polymarket-live-adapter = { workspace = true, features = ["test-support", "loopback-evidence"] }
-reap-polymarket-wire.workspace = true
 serde_json.workspace = true
 tempfile = "3"
 tokio-tungstenite.workspace = true

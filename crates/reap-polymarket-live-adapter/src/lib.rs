@@ -23,9 +23,11 @@ mod loopback_mutation_credentials;
 mod metadata_http;
 mod mutation;
 mod observation_clock;
+mod order_heartbeat;
 mod private_credentials;
 mod private_http;
 mod product_clock;
+mod production_supervised_mutation;
 mod public_connectivity;
 mod public_http;
 mod public_ws;
@@ -83,6 +85,13 @@ pub use mutation::{
     PmRetainedPlaceRequest,
 };
 pub use observation_clock::PmHttpReceiveClock;
+#[cfg(any(test, feature = "loopback-evidence"))]
+pub use order_heartbeat::PmOrderHeartbeatLoopbackRole;
+pub use order_heartbeat::{
+    PM_ORDER_HEARTBEAT_INTERVAL, PmOrderHeartbeatAuthority, PmOrderHeartbeatError,
+    PmOrderHeartbeatProductionRole, PmOrderHeartbeatReply, PmOrderHeartbeatStop,
+    PmOrderHeartbeatTransport, run_pm_order_heartbeat_loop,
+};
 pub use private_credentials::{
     PM_CREDENTIAL_AUTHORITY_DEFAULT_SHUTDOWN_BOUNDS,
     PM_CREDENTIAL_AUTHORITY_READ_ONLY_SHUTDOWN_BOUNDS, PmCredentialAuthorityShutdownBounds,
@@ -109,6 +118,10 @@ pub use product_clock::{
 pub use product_clock::{
     PmAuthorizedMutationServerTime, PmMutationServerTimeProductClock,
     PmMutationServerTimeValidator, PmPendingMutationServerTime,
+};
+pub use production_supervised_mutation::{
+    PmProductionPostOnlyPlaceRequest, PmProductionSupervisedMutationError,
+    PmProductionSupervisedMutationRole,
 };
 pub use public_connectivity::{
     PmPublicConnectivityOwner, PmPublicConnectivityRoles, PmPublicObservationConnectivityOwner,
@@ -177,5 +190,12 @@ pub use user_ws_config::{
     PM_USER_WS_ENDPOINT, PM_USER_WS_HEARTBEAT_INTERVAL, PmUserWsBounds, PmUserWsConfig,
 };
 
-/// This tranche has no production order-entry authority.
+/// The continuously composed PM product has no production strategy order-entry
+/// authority. This value does not describe the separately authorized,
+/// consume-once controlled-trial executable.
 pub const PRODUCTION_ORDER_ENTRY_AUTHORIZED: bool = false;
+
+/// The adapter exposes fixed-purpose production transports for the explicit
+/// one-shot controlled-trial boundary. The runner must still supply its own
+/// take-once operator authorization, durable ledger, fixed peer, and hard cap.
+pub const ONE_SHOT_PRODUCTION_ORDER_ENTRY_AVAILABLE: bool = true;

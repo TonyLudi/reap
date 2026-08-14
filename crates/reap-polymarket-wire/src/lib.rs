@@ -13,6 +13,7 @@ mod hash;
 mod limits;
 mod live_metadata;
 mod live_private;
+mod order_heartbeat;
 mod preflight;
 mod private_fixture;
 mod raw;
@@ -43,6 +44,9 @@ pub use live_private::{
     parse_live_balance_allowance, parse_live_cancel_result, parse_live_open_order_page,
     parse_live_order_detail, parse_live_owned_fill_trade_page, parse_live_place_result,
     parse_live_trade_page, parse_live_user_frame,
+};
+pub use order_heartbeat::{
+    PmOrderHeartbeatId, PmOrderHeartbeatWireError, parse_order_heartbeat_response,
 };
 pub use preflight::{
     MAX_PM_CLOSED_ONLY_BODY_BYTES, MAX_PM_GEOBLOCK_BODY_BYTES, PmClosedOnlyStatus,

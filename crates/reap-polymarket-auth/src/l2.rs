@@ -13,6 +13,7 @@ use crate::{
     PlaceSemanticRequestCommitment, PmAuthError, RuntimeExactBodyCommitment,
     SerializedGtcFillPlaceRequest, SerializedOwnedCancelRequest, SerializedPlaceRequest,
 };
+use reap_polymarket_wire::PmOrderHeartbeatId;
 
 type HmacSha256 = Hmac<Sha256>;
 const MIN_L2_TIMESTAMP: u64 = 1_000_000_000;
@@ -370,6 +371,103 @@ pub trait FixedOwnedCancelRequestSink {
     ) -> Result<Self::Output, Self::Error>;
 }
 
+/// One L2-authenticated, once-serialized credential-wide order heartbeat.
+///
+/// This carrier is deliberately distinct from place/cancel authority. It can
+/// reach only the current official `POST /v1/heartbeats` operation and cannot
+/// select a method, path, or body shape.
+pub struct AuthenticatedOrderHeartbeatRequest {
+    headers: L2Headers,
+    body: Zeroizing<Vec<u8>>,
+}
+
+impl AuthenticatedOrderHeartbeatRequest {
+    /// Consume the authority and expose the exact authenticated body only to
+    /// the fixed order-heartbeat transport operation.
+    pub fn dispatch<S: FixedOrderHeartbeatRequestSink>(
+        self,
+        sink: &mut S,
+    ) -> Result<S::Output, S::Error> {
+        let address = self.headers.address.to_string();
+        let timestamp = self.headers.timestamp.to_string();
+        sink.send_order_heartbeat(
+            &address,
+            self.headers.signature.as_str(),
+            &timestamp,
+            self.headers.api_key.as_str(),
+            self.headers.passphrase.as_str(),
+            self.body.as_slice(),
+        )
+    }
+}
+
+impl fmt::Debug for AuthenticatedOrderHeartbeatRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthenticatedOrderHeartbeatRequest([REDACTED])")
+    }
+}
+
+/// Trusted transport boundary for exactly `POST /v1/heartbeats`.
+pub trait FixedOrderHeartbeatRequestSink {
+    type Output;
+    type Error;
+
+    fn send_order_heartbeat(
+        &mut self,
+        poly_address: &str,
+        poly_signature: &str,
+        poly_timestamp: &str,
+        poly_api_key: &str,
+        poly_passphrase: &str,
+        exact_body: &[u8],
+    ) -> Result<Self::Output, Self::Error>;
+}
+
+/// One L2-authenticated credential-wide emergency cancel request.
+///
+/// It has no body and can reach only `DELETE /cancel-all`. The type is
+/// intentionally separate from exact-owned cancellation and is expected to
+/// be held only by an isolated emergency plane.
+pub struct AuthenticatedCancelAllRequest(L2Headers);
+
+impl AuthenticatedCancelAllRequest {
+    pub fn dispatch<S: FixedCancelAllRequestSink>(
+        self,
+        sink: &mut S,
+    ) -> Result<S::Output, S::Error> {
+        let address = self.0.address.to_string();
+        let timestamp = self.0.timestamp.to_string();
+        sink.send_cancel_all(
+            &address,
+            self.0.signature.as_str(),
+            &timestamp,
+            self.0.api_key.as_str(),
+            self.0.passphrase.as_str(),
+        )
+    }
+}
+
+impl fmt::Debug for AuthenticatedCancelAllRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthenticatedCancelAllRequest([REDACTED])")
+    }
+}
+
+/// Trusted transport boundary for exactly `DELETE /cancel-all`.
+pub trait FixedCancelAllRequestSink {
+    type Output;
+    type Error;
+
+    fn send_cancel_all(
+        &mut self,
+        poly_address: &str,
+        poly_signature: &str,
+        poly_timestamp: &str,
+        poly_api_key: &str,
+        poly_passphrase: &str,
+    ) -> Result<Self::Output, Self::Error>;
+}
+
 /// One exact, market-bound authenticated user-WebSocket subscription frame.
 pub struct AuthenticatedUserSubscription(Zeroizing<Vec<u8>>);
 
@@ -515,6 +613,48 @@ impl L2Credentials {
         })
     }
 
+    /// Authenticate the initial credential-wide order heartbeat. The empty
+    /// identifier is fixed by the protocol and cannot be caller-selected.
+    pub fn authenticate_initial_order_heartbeat(
+        &self,
+        timestamp: L2Timestamp,
+    ) -> Result<AuthenticatedOrderHeartbeatRequest, PmAuthError> {
+        self.authenticate_order_heartbeat_body(timestamp, "")
+    }
+
+    /// Authenticate a continuing credential-wide order heartbeat using only
+    /// an identifier admitted by the bounded response parser.
+    pub fn authenticate_order_heartbeat(
+        &self,
+        timestamp: L2Timestamp,
+        heartbeat_id: &PmOrderHeartbeatId,
+    ) -> Result<AuthenticatedOrderHeartbeatRequest, PmAuthError> {
+        self.authenticate_order_heartbeat_body(timestamp, heartbeat_id.as_str())
+    }
+
+    fn authenticate_order_heartbeat_body(
+        &self,
+        timestamp: L2Timestamp,
+        heartbeat_id: &str,
+    ) -> Result<AuthenticatedOrderHeartbeatRequest, PmAuthError> {
+        let body = Zeroizing::new(
+            serde_json::to_vec(&OrderHeartbeatBody { heartbeat_id })
+                .map_err(|_| PmAuthError::SerializationFailure)?,
+        );
+        let headers = self.headers(timestamp, b"POST", b"/v1/heartbeats", Some(&body))?;
+        Ok(AuthenticatedOrderHeartbeatRequest { headers, body })
+    }
+
+    /// Authenticate the separately scoped credential-wide emergency cleanup
+    /// operation. There is no generic route and no request body.
+    pub fn authenticate_cancel_all(
+        &self,
+        timestamp: L2Timestamp,
+    ) -> Result<AuthenticatedCancelAllRequest, PmAuthError> {
+        self.headers(timestamp, b"DELETE", b"/cancel-all", None)
+            .map(AuthenticatedCancelAllRequest)
+    }
+
     /// Serialize the exact one-market initial authenticated user subscription.
     /// The resulting credential frame is consume-once and has no byte getter.
     pub fn user_subscription(
@@ -619,6 +759,11 @@ struct UserAuth<'a> {
     api_key: &'a str,
     secret: &'a str,
     passphrase: &'a str,
+}
+
+#[derive(Serialize)]
+struct OrderHeartbeatBody<'a> {
+    heartbeat_id: &'a str,
 }
 
 #[cfg(test)]

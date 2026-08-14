@@ -328,11 +328,11 @@ fn source_keeps_parsing_joining_and_comparison_narrow_and_non_authorizing() {
     );
     assert_eq!(
         source_sha256(l2_source),
-        "712c445b03e21a7d82d1bf6a1a7f339561b3e50a93ea3b37c48895af893a2e12"
+        "1ca14ef21ebe0f8ec7d807baf429dd4ebc92b1a518e5367de63d78e296776f45"
     );
     assert_eq!(
         source_sha256(lib_source),
-        "03d64af8ed27b253e6197f686dd8976732bad4370049a9f63137a7dffaa979a7"
+        "fcc5e92f1f16ff7cb34819e53fcdd50a976b482e05a28efa068bf111fffbb2ce"
     );
 
     for required in [

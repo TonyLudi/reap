@@ -5,23 +5,21 @@
 //! floating point, and do not confer account scope, ownership, completeness,
 //! or mutation authority by themselves.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt,
-};
+use std::{collections::BTreeSet, fmt};
 
 use reap_pm_core::{
     EvmAddress, PmBookQuantity, PmConditionId, PmFillId, PmOrderSide, PmPrice, PmQuantity,
     PmTokenId, PmVenueOrderId, U256,
 };
-use serde::{Deserialize, Deserializer, de::Visitor};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
 mod associate_trades_wire;
+mod raw;
 mod result_wire;
 
 use associate_trades_wire::RawAssociateTrades;
+use raw::*;
 use result_wire::{RawCancelResult, RawPlaceResult};
 
 pub const MAX_PM_LIVE_BODY_BYTES: usize = 1_048_576;
@@ -1324,199 +1322,6 @@ impl TryFrom<RawUserEvent> for PmLiveUserEvent {
             RawUserEvent::Trade(trade) => Ok(Self::Trade(Box::new(PmLiveTrade::try_from(trade)?))),
         }
     }
-}
-
-struct RawCredentialOwner(Zeroizing<Vec<u8>>);
-
-struct RawCredentialOwnerVisitor;
-
-impl<'de> Visitor<'de> for RawCredentialOwnerVisitor {
-    type Value = RawCredentialOwner;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a credential-owner UUID string")
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Ok(RawCredentialOwner(Zeroizing::new(
-            value.as_bytes().to_vec(),
-        )))
-    }
-
-    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Ok(RawCredentialOwner(Zeroizing::new(value.into_bytes())))
-    }
-}
-
-impl<'de> Deserialize<'de> for RawCredentialOwner {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_string(RawCredentialOwnerVisitor)
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum RawExactU64 {
-    Text(String),
-    Integer(u64),
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum RawUserFrame {
-    One(Box<RawUserEvent>),
-    Many(Vec<RawUserEvent>),
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "event_type")]
-enum RawUserEvent {
-    #[serde(rename = "order")]
-    Order(RawUserOrder),
-    #[serde(rename = "trade")]
-    Trade(RawUserTrade),
-}
-
-#[derive(Deserialize)]
-struct RawUserOrder {
-    id: String,
-    market: String,
-    asset_id: String,
-    side: String,
-    original_size: String,
-    size_matched: String,
-    price: String,
-    #[serde(rename = "type")]
-    event_kind: String,
-    #[serde(default)]
-    maker_address: Option<String>,
-    #[serde(default)]
-    expiration: Option<String>,
-    #[serde(default)]
-    order_type: Option<String>,
-    #[serde(default)]
-    outcome: Option<String>,
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    created_at: Option<String>,
-    #[serde(default)]
-    associate_trades: Option<RawAssociateTrades>,
-    owner: RawCredentialOwner,
-    #[serde(default)]
-    order_owner: Option<RawCredentialOwner>,
-    #[serde(default)]
-    timestamp: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct RawUserTrade {
-    #[serde(flatten)]
-    trade: RawTradeCore,
-    owner: RawCredentialOwner,
-    #[serde(default)]
-    trade_owner: Option<RawCredentialOwner>,
-    #[serde(default)]
-    timestamp: Option<String>,
-    #[serde(default)]
-    last_update: Option<String>,
-    #[serde(default, rename = "matchtime", alias = "match_time")]
-    match_time: Option<String>,
-    #[serde(default)]
-    maker_address: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct RawOrder {
-    id: String,
-    market: String,
-    asset_id: String,
-    side: String,
-    original_size: String,
-    size_matched: String,
-    price: String,
-    status: String,
-    maker_address: String,
-    owner: RawCredentialOwner,
-    expiration: String,
-    created_at: RawExactU64,
-    #[serde(default)]
-    outcome: Option<String>,
-    #[serde(default)]
-    order_type: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct RawTradeCore {
-    id: String,
-    market: String,
-    asset_id: String,
-    side: String,
-    size: String,
-    price: String,
-    status: String,
-    #[serde(default)]
-    order_id: Option<String>,
-    #[serde(default)]
-    taker_order_id: Option<String>,
-    #[serde(default)]
-    trader_side: Option<String>,
-    #[serde(default)]
-    transaction_hash: Option<String>,
-    #[serde(default)]
-    fee_rate_bps: Option<String>,
-    #[serde(default)]
-    maker_orders: Vec<RawMakerOrder>,
-}
-
-#[derive(Deserialize)]
-struct RawRestTrade {
-    #[serde(flatten)]
-    trade: RawTradeCore,
-    maker_address: String,
-    owner: RawCredentialOwner,
-    match_time: String,
-    last_update: String,
-}
-
-#[derive(Deserialize)]
-struct RawMakerOrder {
-    order_id: String,
-    asset_id: String,
-    side: String,
-    price: String,
-    matched_amount: String,
-    #[serde(default)]
-    fee_rate_bps: Option<String>,
-    owner: RawCredentialOwner,
-    maker_address: String,
-}
-
-#[derive(Deserialize)]
-#[serde(bound(deserialize = "T: Deserialize<'de>"))]
-struct RawPage<T> {
-    data: Vec<T>,
-    next_cursor: String,
-    limit: usize,
-    count: usize,
-}
-
-#[derive(Deserialize)]
-struct RawBalanceAllowance {
-    balance: String,
-    #[serde(default)]
-    allowance: Option<serde_json::Value>,
-    #[serde(default)]
-    allowances: Option<BTreeMap<String, String>>,
 }
 
 #[cfg(test)]

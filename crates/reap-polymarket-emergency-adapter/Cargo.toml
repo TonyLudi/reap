@@ -1,0 +1,16 @@
+[package]
+name = "reap-polymarket-emergency-adapter"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+reap-polymarket-auth.workspace = true
+reap-polymarket-egress-binding.workspace = true
+reap-polymarket-wire.workspace = true
+reqwest.workspace = true
+thiserror.workspace = true
+url.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

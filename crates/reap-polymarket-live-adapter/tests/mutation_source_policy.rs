@@ -4,9 +4,10 @@ const MUTATION: &str = include_str!("../src/mutation.rs");
 const RETAINED: &str = include_str!("../src/mutation/retained.rs");
 const TRANSPORT: &str = include_str!("../src/mutation/transport.rs");
 const LOOPBACK_CREDENTIALS: &str = include_str!("../src/loopback_mutation_credentials.rs");
+const PRODUCTION_SUPERVISED: &str = include_str!("../src/production_supervised_mutation.rs");
 
 #[test]
-fn production_surface_is_fixed_peer_selected_and_still_carries_no_order_authority() {
+fn continuous_product_authority_is_false_while_one_shot_transport_is_explicit() {
     assert!(MANIFEST.contains("default = []"));
     assert!(
         MANIFEST
@@ -34,6 +35,7 @@ fn production_surface_is_fixed_peer_selected_and_still_carries_no_order_authorit
     assert!(!TRANSPORT.contains("pub fn new_origin("));
     assert!(LIB.contains("PRODUCTION_ORDER_ENTRY_AUTHORIZED: bool = false"));
     assert!(!LIB.contains("PRODUCTION_ORDER_ENTRY_AUTHORIZED: bool = true"));
+    assert!(LIB.contains("ONE_SHOT_PRODUCTION_ORDER_ENTRY_AVAILABLE: bool = true"));
     for required in [
         "PmFixedTlsPeerSelection",
         "production_on_fixed_tls_peer_and_selected_local_egress",
@@ -62,6 +64,45 @@ fn production_surface_is_fixed_peer_selected_and_still_carries_no_order_authorit
                 "fixed transport configuration escaped its sole transport module: {forbidden}"
             );
         }
+    }
+}
+
+#[test]
+fn supervised_production_mutation_is_scope_bound_and_purpose_closed() {
+    for required in [
+        "pub struct PmProductionSupervisedMutationRole",
+        "PmProductionSelectedPlaceCancelTimeOwner",
+        "PmFixedPlaceProductionRole",
+        "PmExactOwnedCancelProductionRole",
+        "order.signature_profile() == PmClobV2SignatureType::Proxy",
+        "order.maker() == self.expected_proxy_maker",
+        "order.signer() == self.credentials.address().as_core()",
+        "order.token_id() == self.scope.token()",
+        "quantity_units == request.quantity.protocol_units()",
+        ".serialize_gtc_post_only(signed)",
+        ".serialize_owned_cancel(order_id)",
+        ".authenticate_exact_place(",
+        ".authenticate_exact_owned_cancel(",
+    ] {
+        assert!(
+            PRODUCTION_SUPERVISED.contains(required),
+            "supervised production mutation lost `{required}`"
+        );
+    }
+    for forbidden in [
+        "reqwest::",
+        "Url::",
+        "pub fn origin(",
+        "pub fn route(",
+        "pub fn client(",
+        "cancel_all(",
+        "batch_order(",
+        "market_order(",
+    ] {
+        assert!(
+            !PRODUCTION_SUPERVISED.contains(forbidden),
+            "supervised production capability escape: {forbidden}"
+        );
     }
 }
 

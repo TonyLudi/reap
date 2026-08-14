@@ -106,6 +106,50 @@ checks exact EOA/funder/condition/token/account/reconciliation/user-stream
 identity. Both shut down without constructing mutation roles. A later
 minimal-capital place/cancel trial requires a second explicit authorization.
 
+## Polymarket Continuous Production Infrastructure
+
+The production supervisor in `reap-pm-live` is a strategy-neutral library, not
+an operator-runnable strategy service. It composes fixed heartbeat and mutation
+roles with application-supplied complete private-WebSocket and poll roles. It
+does not authorize continuous order entry: the integrating BTC five-minute
+service must still bind the exact active market, implement complete scoped
+open-order/trade/position polling, supply the strategy, and pass a production
+soak before enabling placement.
+
+Startup replays the leased `0600`-mode journal and remains closed until a later
+complete poll reconciles every owned order and both scoped token positions.
+Unique fills update the supervisor's fill-derived position. Venue-reported
+cumulative fills close readiness until the matching fill ledger catches up,
+and authoritative position disagreement also closes readiness. A heartbeat,
+poll, WebSocket, durability, or ambiguous mutation failure closes entry and
+attempts exact cancellation of supervisor-owned nonterminal orders.
+
+The BTC five-minute lifecycle quiesces placement 30 seconds before the active
+window ends. It rolls only after the prior market has ended and a complete poll
+proves zero open orders. Resolved tokens are never made tradable again. Both
+retired-token positions remain tracked through resolution and redemption. A
+type-1 proxy account requires Polymarket's external builder/relayer authority
+for redemption; the CLOB L2 credential is not sufficient and the repository
+does not fabricate that authority.
+
+Account-wide cancellation is deliberately outside the normal supervisor. In
+an incident, run the isolated emergency binary with a separately reviewed
+fixed peer and local egress:
+
+```bash
+cargo run --locked -p reap-pm-emergency-runner -- \
+  --credential-env ../predarb/.env \
+  --fixed-peer-ip REVIEWED_CLOB_IP \
+  --interface-name REVIEWED_INTERFACE \
+  --local-source-ip REVIEWED_LOCAL_IP \
+  --authorization-phrase I_AUTHORIZE_POLYMARKET_ACCOUNT_WIDE_CANCEL_ALL
+```
+
+It performs fixed `GET /time`, `GET /data/orders`, and `DELETE /cancel-all`
+operations only; it has no placement route. Its stdout report is secret-free,
+but the binary does not durably persist that report, so capture it into the
+incident record outside the process.
+
 ## Polymarket Credentialed Read-Only Readiness
 
 `reap-pm-readiness` is a dedicated certification executable, not a trading

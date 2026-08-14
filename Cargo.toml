@@ -9,9 +9,11 @@ members = [
     "crates/reap-pm-state",
     "crates/reap-polymarket-wire",
     "crates/reap-polymarket-auth",
+    "crates/reap-polymarket-credential-file",
     "crates/reap-pm-strategy",
     "crates/reap-polymarket-adapter",
     "crates/reap-polymarket-live-adapter",
+    "crates/reap-polymarket-emergency-adapter",
     "crates/reap-polymarket-egress-binding",
     "crates/reap-pm-live-contracts",
     "crates/reap-pm-live",
@@ -32,6 +34,7 @@ members = [
     "crates/reap-okx-live-adapter",
     "crates/reap-emergency-core",
     "crates/reap-emergency-runner",
+    "crates/reap-pm-emergency-runner",
     "crates/reap-evidence-core",
     "crates/reap-okx-evidence-adapter",
     "crates/reap-okx-emergency-adapter",
@@ -86,6 +89,7 @@ reap-order = { path = "crates/reap-order" }
 reap-pm-core = { path = "crates/reap-pm-core" }
 reap-pm-state = { path = "crates/reap-pm-state" }
 reap-polymarket-auth = { path = "crates/reap-polymarket-auth" }
+reap-polymarket-credential-file = { path = "crates/reap-polymarket-credential-file" }
 reap-polymarket-wire = { path = "crates/reap-polymarket-wire" }
 reap-pm-live = { path = "crates/reap-pm-live" }
 reap-pm-live-contracts = { path = "crates/reap-pm-live-contracts" }
@@ -98,6 +102,7 @@ reap-polymarket-chain-source = { path = "crates/reap-polymarket-chain-source" }
 reap-pm-strategy = { path = "crates/reap-pm-strategy" }
 reap-polymarket-adapter = { path = "crates/reap-polymarket-adapter" }
 reap-polymarket-live-adapter = { path = "crates/reap-polymarket-live-adapter" }
+reap-polymarket-emergency-adapter = { path = "crates/reap-polymarket-emergency-adapter" }
 reap-polymarket-egress-binding = { path = "crates/reap-polymarket-egress-binding" }
 reap-okx-public-source = { path = "crates/reap-okx-public-source" }
 reap-okx-wire = { path = "crates/reap-okx-wire" }

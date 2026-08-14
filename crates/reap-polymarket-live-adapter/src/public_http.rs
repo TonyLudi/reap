@@ -356,6 +356,23 @@ impl PmReadServerTimeHttpRole {
         Self::with_product_clock(config, PmReadServerTimeProductClock::standalone_system())
     }
 
+    /// Construct the fixed `/time` read role on one exact production TLS
+    /// peer and selected local egress without exposing the HTTP config.
+    pub fn production_on_fixed_tls_peer_and_selected_local_egress(
+        connect_timeout: std::time::Duration,
+        request_timeout: std::time::Duration,
+        fixed_tls_peer: reap_polymarket_egress_binding::PmFixedTlsPeerSelection,
+        selected_local_egress: reap_polymarket_egress_binding::PmLocalEgressSelection,
+    ) -> Result<Self, PmLiveAdapterError> {
+        let config = PmPublicHttpConfig::production_on_fixed_tls_peer_and_selected_local_egress(
+            connect_timeout,
+            request_timeout,
+            fixed_tls_peer,
+            selected_local_egress,
+        )?;
+        Self::new(config)
+    }
+
     pub(crate) fn with_product_clock(
         config: PmPublicHttpConfig,
         clock: PmReadServerTimeProductClock,

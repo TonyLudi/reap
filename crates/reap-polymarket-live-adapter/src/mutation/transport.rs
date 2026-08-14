@@ -98,6 +98,24 @@ impl PmProductionMutationConfig {
             selected_local_egress,
         })
     }
+
+    pub(crate) fn into_http_parts(
+        self,
+    ) -> (
+        Url,
+        Duration,
+        Duration,
+        PmFixedTlsPeerSelection,
+        PmLocalEgressSelection,
+    ) {
+        (
+            self.origin,
+            self.connect_timeout,
+            self.request_timeout,
+            self.fixed_tls_peer,
+            self.selected_local_egress,
+        )
+    }
 }
 
 impl fmt::Debug for PmProductionMutationConfig {
@@ -124,6 +142,11 @@ impl PmLoopbackMutationConfig {
             connect_timeout,
             request_timeout,
         })
+    }
+
+    #[cfg(any(test, feature = "loopback-evidence"))]
+    pub(crate) fn into_http_parts(self) -> (Url, Duration, Duration) {
+        (self.origin, self.connect_timeout, self.request_timeout)
     }
 }
 

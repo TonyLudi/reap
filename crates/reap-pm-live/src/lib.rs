@@ -12,6 +12,7 @@ mod lanes;
 mod private_monitor;
 mod private_user_ws;
 mod production_private_user_ws;
+mod production_supervisor;
 mod public_routes;
 mod replay;
 mod schedule;
@@ -90,6 +91,20 @@ pub use private_monitor::{
 pub use production_private_user_ws::{
     PmProductionPrivateStateChange, PmProductionPrivateUserWsError,
     PmProductionPrivateUserWsHandler,
+};
+pub use production_supervisor::{
+    MAX_PM_SUPERVISOR_FILLS, MAX_PM_SUPERVISOR_ORDERS, MAX_PM_SUPERVISOR_TOKENS,
+    PRODUCTION_SUPERVISOR_INFRA_AVAILABLE, PmProductionSupervisor, PmProductionSupervisorConfig,
+    PmProductionSupervisorError, PmProductionSupervisorHandle, PmProductionSupervisorRoles,
+    PmSupervisorCancelResult, PmSupervisorCommandError, PmSupervisorEdgeError, PmSupervisorFill,
+    PmSupervisorFixedHeartbeatRole, PmSupervisorFixedMutationRole, PmSupervisorHeartbeatRole,
+    PmSupervisorJournal, PmSupervisorJournalError, PmSupervisorJournalFill,
+    PmSupervisorJournalRecord, PmSupervisorJournalRecovery, PmSupervisorMutationClassification,
+    PmSupervisorMutationRole, PmSupervisorOpenOrder, PmSupervisorOrderFacts,
+    PmSupervisorOrderProjection, PmSupervisorOrderStatus, PmSupervisorPlaceCommand,
+    PmSupervisorPlaceResult, PmSupervisorPollCut, PmSupervisorPollRole, PmSupervisorPosition,
+    PmSupervisorPositionReconciliation, PmSupervisorScope, PmSupervisorShutdownReport,
+    PmSupervisorWsEvent, PmSupervisorWsRole,
 };
 pub use public_routes::{
     OkxPublicReferenceDelivery, OkxPublicUnavailable, OkxPublicUnavailableDelivery,
