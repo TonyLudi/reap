@@ -3,6 +3,8 @@ use std::{fs, path::Path};
 const AUTHORITY_SOURCE: &str = include_str!("../src/controlled_trial/authority.rs");
 const CREDENTIAL_CUSTODY_SOURCE: &str =
     include_str!("../src/controlled_trial/authority/credential_custody.rs");
+const LOCAL_OPERATOR_COOPERATIVE_CUSTODY_V1_SOURCE: &str =
+    include_str!("../src/controlled_trial/authority/local_operator_cooperative_custody_v1.rs");
 const PARENT_SOURCE: &str = include_str!("../src/controlled_trial/mod.rs");
 const MAIN_SOURCE: &str = include_str!("../src/main.rs");
 const MANIFEST_SOURCE: &str = include_str!("../Cargo.toml");
@@ -357,7 +359,299 @@ fn credential_custody_is_a_private_authority_child_with_no_raw_sibling_escape() 
         &[
             "controlled_trial/authority.rs",
             "controlled_trial/authority/credential_custody.rs",
+            "controlled_trial/authority/local_operator_cooperative_custody_v1.rs",
+            "controlled_trial/authority/production_order_v1.rs",
         ],
+    );
+}
+
+#[test]
+fn local_operator_cooperative_custody_v1_is_one_private_non_authorizing_boundary() {
+    const EXACT_SOURCE_PATH: &str = "crates/reap-pm-controlled-trial-runner/src/controlled_trial/authority/local_operator_cooperative_custody_v1.rs";
+    const EXACT_SOURCE_SHA256: &str =
+        "42c893b410c3ecf62dab6b61290cfa1d10367fdd8a0e7e247a22acd90cf819f0";
+
+    assert!(
+        AUTHORITY_SOURCE
+            .contains("#[cfg(target_os = \"linux\")]\nmod local_operator_cooperative_custody_v1;")
+    );
+    for retained_boundary in [
+        "GenerationBoundUnopenedLocalOperatorFreshCredentialCustodyV1",
+        "PreparedUnopenedLocalOperatorFreshCredentialCustodyV1",
+        "prepare_unopened_local_operator_fresh_credential_custody_v1",
+    ] {
+        assert!(AUTHORITY_SOURCE.contains(retained_boundary));
+    }
+    assert!(!AUTHORITY_SOURCE.contains("pub mod local_operator_cooperative_custody_v1;"));
+    assert!(!PARENT_SOURCE.contains("local_operator_cooperative_custody_v1"));
+
+    let source = LOCAL_OPERATOR_COOPERATIVE_CUSTODY_V1_SOURCE;
+    let production = source
+        .split_once("#[cfg(all(test, target_os = \"linux\"))]")
+        .map(|(production, _)| production)
+        .expect("local cooperative custody tests must follow production code");
+    assert_eq!(
+        production.matches("pub(super) fn ").count(),
+        1,
+        "the module must retain exactly one parent-only realization constructor"
+    );
+    assert_eq!(
+        production
+            .matches("pub(in crate::controlled_trial) fn ")
+            .count(),
+        2,
+        "the controlled-trial subtree may only prepare and generation-bind unopened custody",
+    );
+    assert!(!production.contains("pub(crate)"));
+    for line in production.lines() {
+        let line = line.trim_start();
+        assert!(
+            !line.starts_with("pub struct")
+                && !line.starts_with("pub enum")
+                && !line.starts_with("pub fn"),
+            "local cooperative custody gained an externally public item: {line}",
+        );
+    }
+
+    let signature = function_signature(
+        production,
+        "pub(super) fn realize_local_operator_fresh_credential_custody_v1",
+    );
+    for required in [
+        "context: &ReviewedLocalOperatorCooperativeCustodyProfileContextV1<'_>",
+        "reviewed_profile: &CanonicalReviewedLocalOperatorCooperativeCustodyProfileV1",
+        "delivery_load_token: FreshCredentialDeliveryLoadTokenV1",
+        "retained_delivery_evidence: &CanonicalFreshCredentialDeliveryBindingEvidenceV1",
+        "Result<LocalOperatorFreshCredentialCustodyV1, LocalOperatorCooperativeCustodyV1Error>",
+    ] {
+        assert!(
+            signature.contains(required),
+            "constructor lost `{required}`"
+        );
+    }
+
+    let prepare_signature = function_signature(
+        production,
+        "pub(in crate::controlled_trial) fn prepare_unopened_local_operator_fresh_credential_custody_v1",
+    );
+    for required in [
+        "context: &ReviewedLocalOperatorCooperativeCustodyProfileContextV1<'_>",
+        "reviewed_profile: CanonicalReviewedLocalOperatorCooperativeCustodyProfileV1",
+        "delivery_load_token: FreshCredentialDeliveryLoadTokenV1",
+        "retained_delivery_evidence: CanonicalFreshCredentialDeliveryBindingEvidenceV1",
+        "PreparedUnopenedLocalOperatorFreshCredentialCustodyV1",
+    ] {
+        assert!(prepare_signature.contains(required));
+    }
+    assert!(production.contains(
+        "verify_reviewed_conjunction(context, &reviewed_profile, &retained_delivery_evidence)?;",
+    ));
+    let bind_signature = function_signature(
+        production,
+        "pub(in crate::controlled_trial) fn bind_to_actor_generation<G>",
+    );
+    assert!(bind_signature.contains("self"));
+    assert!(bind_signature.contains("selected_actor_generation: Rc<G>"));
+    assert!(
+        bind_signature.contains("GenerationBoundUnopenedLocalOperatorFreshCredentialCustodyV1<G>")
+    );
+    for forbidden in [
+        "ReviewedFreshCredentialLoadTokenV1",
+        "PathBuf",
+        "configured_signer",
+        "basename",
+        "FreshCredentialLinuxObjectSetV1",
+        "fingerprint:",
+        "VerificationV1",
+    ] {
+        assert!(
+            !signature.contains(forbidden),
+            "constructor gained forbidden raw or projected argument `{forbidden}`",
+        );
+    }
+    assert!(!production.contains("ReviewedFreshCredentialLoadTokenV1"));
+    assert_eq!(
+        production
+            .matches("delivery_load_token.into_parts()")
+            .count(),
+        1
+    );
+    assert_eq!(
+        production
+            .matches("reviewed_locator_load_token.into_parts()")
+            .count(),
+        1
+    );
+    let token_consumption = production
+        .find("delivery_load_token.into_parts()")
+        .expect("whole delivery token consumption");
+    let mismatch = production
+        .find("token_delivery_fingerprint != retained_delivery_evidence.fingerprint()")
+        .expect("whole-token/evidence mismatch check");
+    let first_open = production
+        .find("rustix::fs::open(")
+        .expect("exact directory open");
+    assert!(token_consumption < mismatch && mismatch < first_open);
+
+    for required in [
+        "verify_fresh_credential_delivery_binding_evidence_v1(",
+        "verify_reviewed_local_operator_cooperative_custody_profile_v1(context, reviewed_profile)",
+        "verification.authorization == OfflineAuthorizationState::DENIED",
+        "verification.authorization.place_dispatch_allowance == 0",
+        "FlockOperation::NonBlockingLockExclusive",
+        "OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC",
+        "OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK",
+        "rustix::fs::openat(",
+        "PM_T2_FRESH_PRIVATE_KEY_ENTRY_V1",
+        "PM_T2_FRESH_API_KEY_ENTRY_V1",
+        "PM_T2_FRESH_L2_SECRET_ENTRY_V1",
+        "PM_T2_FRESH_PASSPHRASE_ENTRY_V1",
+        "read_at(&mut bytes[length..], length as u64)",
+        "if after != source.snapshot",
+        "re_resolve_credential_source(",
+        "revalidate_directory_path(",
+        "FixedEoaSigner::bind(",
+        "L2Credentials::bind(",
+        "_credential_sources: [File; 4]",
+        "_cooperative_lease_and_directory: File",
+        "_signer: FixedEoaSigner",
+        "_l2: L2Credentials",
+        "On every pre-return failure those values are",
+        "every credential basename is left unchanged",
+    ] {
+        assert!(production.contains(required), "loader lost `{required}`");
+    }
+
+    let holder = between(
+        production,
+        "pub(super) struct LocalOperatorFreshCredentialCustodyV1 {",
+        "/// Structurally reviewed but unopened custody inputs",
+    );
+    assert!(
+        holder
+            .lines()
+            .all(|line| !line.trim_start().starts_with("pub"))
+    );
+    let signer_field = holder.find("_signer: FixedEoaSigner").unwrap();
+    let l2_field = holder.find("_l2: L2Credentials").unwrap();
+    let source_fields = holder.find("_credential_sources: [File; 4]").unwrap();
+    let lease_field = holder
+        .find("_cooperative_lease_and_directory: File")
+        .unwrap();
+    assert!(signer_field < l2_field && l2_field < source_fields && source_fields < lease_field);
+    let realization_initialization = production
+        .split_once("Ok(LocalOperatorFreshCredentialCustodyV1 {")
+        .map(|(_, initialization)| initialization)
+        .unwrap();
+    let signer_init = realization_initialization.find("_signer: signer").unwrap();
+    let l2_init = realization_initialization.find("_l2: l2").unwrap();
+    let source_init = realization_initialization
+        .find("_credential_sources: [")
+        .unwrap();
+    let lease_init = realization_initialization
+        .find("_cooperative_lease_and_directory: directory")
+        .unwrap();
+    assert!(signer_init < l2_init && l2_init < source_init && source_init < lease_init);
+    let holder_prefix = declaration_prefix(
+        production,
+        "pub(super) struct LocalOperatorFreshCredentialCustodyV1",
+    );
+    assert!(!holder_prefix.contains("derive"));
+    let prepared_holder = between(
+        production,
+        "pub(in crate::controlled_trial) struct PreparedUnopenedLocalOperatorFreshCredentialCustodyV1 {",
+        "impl fmt::Debug for PreparedUnopenedLocalOperatorFreshCredentialCustodyV1",
+    );
+    for field in [
+        "reviewed_profile: CanonicalReviewedLocalOperatorCooperativeCustodyProfileV1",
+        "retained_delivery_evidence: CanonicalFreshCredentialDeliveryBindingEvidenceV1",
+        "whole_delivery_load_token: FreshCredentialDeliveryLoadTokenV1",
+    ] {
+        assert!(prepared_holder.contains(field));
+    }
+    assert!(
+        prepared_holder
+            .lines()
+            .all(|line| !line.trim_start().starts_with("pub "))
+    );
+    let generation_holder = between(
+        production,
+        "pub(in crate::controlled_trial) struct GenerationBoundUnopenedLocalOperatorFreshCredentialCustodyV1<",
+        "impl<G> fmt::Debug for GenerationBoundUnopenedLocalOperatorFreshCredentialCustodyV1<G>",
+    );
+    for field in [
+        "_reviewed_profile: CanonicalReviewedLocalOperatorCooperativeCustodyProfileV1",
+        "_retained_delivery_evidence: CanonicalFreshCredentialDeliveryBindingEvidenceV1",
+        "_whole_delivery_load_token: FreshCredentialDeliveryLoadTokenV1",
+        "_selected_actor_generation: Rc<G>",
+    ] {
+        assert!(generation_holder.contains(field));
+    }
+    assert!(
+        generation_holder
+            .lines()
+            .all(|line| !line.trim_start().starts_with("pub "))
+    );
+    for forbidden in [
+        "#[derive(Clone",
+        "#[derive(Copy",
+        "impl Clone",
+        "impl Copy",
+        "serde::",
+        "Serialize",
+        "Deserialize",
+        "impl Clone for LocalOperatorFreshCredentialCustodyV1",
+        "impl Clone for PreparedUnopenedLocalOperatorFreshCredentialCustodyV1",
+        "impl Clone for GenerationBoundUnopenedLocalOperatorFreshCredentialCustodyV1",
+        "impl Serialize for LocalOperatorFreshCredentialCustodyV1",
+        "Deserialize<'de> for LocalOperatorFreshCredentialCustodyV1",
+        "unsafe impl Send",
+        "unsafe impl Sync",
+        "fn into_parts(",
+        "fn split(",
+        "fn directory(",
+        "fn path(",
+        "fn fd(",
+        "fn signer(",
+        "fn l2(",
+        "fn private_key(",
+        "fn api_key(",
+        "fn secret(",
+        "fn passphrase(",
+        "remove_file",
+        "unlinkat",
+        "ftruncate",
+        "truncate(",
+        "set_len(",
+        "write_all",
+        "OpenOptions",
+        "AuthenticatedL2Headers",
+        "AuthenticatedPlaceRequest",
+        "PmPlaceMutationTimeProof",
+        "PmCancelMutationTimeProof",
+        "DispatchOwner",
+        "reqwest",
+        "hyper::",
+        "http::",
+        "tokio::net",
+        "TcpStream",
+        "UdpSocket",
+        "Hmac",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "local custody gained forbidden authority or mutation surface `{forbidden}`",
+        );
+    }
+
+    use sha2::Digest as _;
+    let actual_sha256 = format!(
+        "{:x}",
+        sha2::Sha256::digest(LOCAL_OPERATOR_COOPERATIVE_CUSTODY_V1_SOURCE.as_bytes())
+    );
+    assert_eq!(
+        actual_sha256, EXACT_SOURCE_SHA256,
+        "audited local cooperative custody source changed at {EXACT_SOURCE_PATH}",
     );
 }
 

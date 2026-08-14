@@ -705,6 +705,25 @@ pub struct PmPublicHttpRole {
 }
 
 impl PmPublicHttpRole {
+    /// Construct the fixed credential-free production CLOB source on one
+    /// exact TLS peer and selected local egress. This adds no private or
+    /// mutation authority and retains the condition-bound parser requirement.
+    pub fn production_on_fixed_tls_peer_and_selected_local_egress(
+        connect_timeout: std::time::Duration,
+        request_timeout: std::time::Duration,
+        fixed_tls_peer: reap_polymarket_egress_binding::PmFixedTlsPeerSelection,
+        selected_local_egress: reap_polymarket_egress_binding::PmLocalEgressSelection,
+        parser_config: PmBookParserConfig,
+    ) -> Result<Self, PmLiveAdapterError> {
+        let config = PmPublicHttpConfig::production_on_fixed_tls_peer_and_selected_local_egress(
+            connect_timeout,
+            request_timeout,
+            fixed_tls_peer,
+            selected_local_egress,
+        )?;
+        Self::new(config, parser_config)
+    }
+
     pub fn new(
         config: PmPublicHttpConfig,
         parser_config: PmBookParserConfig,

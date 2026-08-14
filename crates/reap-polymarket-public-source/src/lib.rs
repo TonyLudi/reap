@@ -1,11 +1,16 @@
 #![forbid(unsafe_code)]
 
+mod btc_five_minute;
 mod config;
 mod decimal;
 mod error;
 mod position;
 mod source;
 
+pub use btc_five_minute::{
+    PM_GAMMA_API_PRODUCTION_ORIGIN, PmBtcFiveMinuteMarket, PmBtcFiveMinuteMarketSource,
+    PmBtcFiveMinuteSourceError,
+};
 pub use config::{PM_DATA_API_PRODUCTION_ORIGIN, PmDataApiPositionConfig, PmDataApiPositionScope};
 pub use decimal::{MAX_POSITION_DECIMAL_BYTES, PmExactPositionDecimal};
 pub use error::{PmDataApiFixedPeerSourceError, PmPublicPositionError};

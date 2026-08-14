@@ -30,9 +30,9 @@ use crate::lanes::{
 };
 use crate::private_monitor::{
     PmAccountFixtureInput, PmLiveAccountInput, PmLiveConnectionInput, PmLiveIngressReport,
-    PmLiveOpenOrdersInput, PmLiveOrderDetailInput, PmLivePrivateInput, PmLiveReconciliationInput,
-    PmLiveRetirementInput, PmOpenOrdersFixtureInput, PmOrderDetailFixtureInput,
-    PmReconciliationFixtureInput,
+    PmLiveInternalControlOccurrence, PmLiveOpenOrdersInput, PmLiveOrderDetailInput,
+    PmLivePrivateInput, PmLiveReconciliationInput, PmLiveRetirementInput, PmOpenOrdersFixtureInput,
+    PmOrderDetailFixtureInput, PmReconciliationFixtureInput,
 };
 #[cfg(test)]
 use crate::private_monitor::{
@@ -456,6 +456,15 @@ impl<M: PmQuoteModel> PmProductRun<M> {
             .map_err(PmProductRunError::service)
     }
 
+    pub(crate) fn request_live_shutdown(
+        &mut self,
+        occurrence: PmLiveInternalControlOccurrence,
+    ) -> Result<(), PmProductRunError> {
+        self.coordinator
+            .request_live_shutdown(occurrence)
+            .map_err(PmProductRunError::service)
+    }
+
     pub fn request_global_stop(
         &mut self,
         occurrence: PmFixtureCompletionOccurrence,
@@ -597,6 +606,13 @@ impl<M: PmQuoteModel> PmProductRun<M> {
         &self,
     ) -> crate::private_monitor::PmReadOnlyPrivateProjection<'_> {
         self.coordinator.private_projection_for_test()
+    }
+
+    /// Immutable private order/fill/account view for live state consumers.
+    /// The projection cannot mutate or recover the coordinator owner.
+    #[must_use]
+    pub fn private_projection(&self) -> crate::private_monitor::PmReadOnlyPrivateProjection<'_> {
+        self.coordinator.private_projection()
     }
 
     pub fn scheduler_metrics(

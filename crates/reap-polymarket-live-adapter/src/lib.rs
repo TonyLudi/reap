@@ -4,8 +4,10 @@
 //! exact-token `/book`, the atomic `/markets` + `/clob-markets` metadata pair,
 //! fixed authenticated reads for complete account cuts, exact local order
 //! detail and balance/allowance, one scoped public market-WebSocket role, and
-//! feature-gated literal-loopback evidence roles for fixed place/exact-owned
-//! cancel. It has no generic transport or production order-entry authority.
+//! feature-gated literal-loopback evidence roles and reviewed-fixed-peer
+//! production transports for fixed place/exact-owned cancel. It has no
+//! generic mutation transport; transport construction alone grants no order
+//! authority.
 
 #![forbid(unsafe_code)]
 
@@ -73,10 +75,12 @@ pub use metadata_http::{
     PmLiveMetadataPairSink, PmPublicMetadataHttpRole, PmTypedLiveMarketDetails,
 };
 pub use mutation::{
-    PmCancelMutationOutcome, PmExactOwnedCancelLoopbackRole, PmFixedPlaceLoopbackRole,
+    PmCancelMutationOutcome, PmExactOwnedCancelLoopbackRole, PmExactOwnedCancelProductionRole,
+    PmFixedGtcFillPlaceProductionRole, PmFixedPlaceLoopbackRole, PmFixedPlaceProductionRole,
     PmLoopbackMutationConfig, PmMutationClassification, PmMutationDiagnostic,
     PmMutationDiagnosticKind, PmMutationEdgeError, PmPlaceMutationOutcome,
-    PmRetainedOwnedCancelRequest, PmRetainedPlaceRequest,
+    PmProductionMutationConfig, PmRetainedGtcFillPlaceRequest, PmRetainedOwnedCancelRequest,
+    PmRetainedPlaceRequest,
 };
 pub use observation_clock::PmHttpReceiveClock;
 pub use private_credentials::{

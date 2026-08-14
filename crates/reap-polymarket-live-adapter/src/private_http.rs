@@ -104,6 +104,7 @@ pub(crate) enum PmPrivateRoute<'a> {
     },
     Trades {
         cursor: &'a str,
+        exact_scope: Option<PmWireScope>,
     },
     ExactOrder(FixedOrderId),
     CollateralBalanceAllowance(PmReadOnlySignatureType),
@@ -303,9 +304,18 @@ impl PmPrivateHttpTransport {
                 url.set_path("/data/orders");
                 url.query_pairs_mut().append_pair("next_cursor", cursor);
             }
-            PmPrivateRoute::Trades { cursor } => {
+            PmPrivateRoute::Trades {
+                cursor,
+                exact_scope,
+            } => {
                 url.set_path("/data/trades");
-                url.query_pairs_mut().append_pair("next_cursor", cursor);
+                let mut query = url.query_pairs_mut();
+                if let Some(scope) = exact_scope {
+                    query
+                        .append_pair("market", &scope.condition().to_string())
+                        .append_pair("asset_id", &scope.token().units().to_string());
+                }
+                query.append_pair("next_cursor", cursor);
             }
             PmPrivateRoute::ExactOrder(order_id) => {
                 // clob-client-v2's fixed endpoint constant remains
@@ -1113,6 +1123,38 @@ mod tests {
         assert!(first_headers.contains(&format!("poly_timestamp: {AUTH_SECONDS}")));
         assert!(first_headers.contains(&format!("poly_api_key: {API_KEY}")));
         assert!(first_headers.contains(&format!("poly_passphrase: {PASSPHRASE}")));
+        task.await.unwrap();
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_scope_trade_cut_sends_only_the_configured_market_and_asset() {
+        let responses = vec![MockResponse::ok(page(
+            &trade(CONDITION, "123", ADDRESS, API_KEY),
+            "LTE=",
+        ))];
+        let (origin, mut requests, task) = mock_server(responses).await;
+        let (mut owner, supervisor) = local_owner(&origin, Duration::from_secs(1));
+
+        let cut = owner
+            .reconciliation()
+            .begin_exact_scope_trades(timestamp())
+            .await
+            .unwrap();
+        let crate::PmTradesCutProgress::Complete(cut) = cut else {
+            panic!("terminal trade cursor must complete cut")
+        };
+        assert_eq!(cut.row_count(), 1);
+
+        let request = requests.recv().await.unwrap();
+        assert_eq!(
+            request.lines().next().unwrap(),
+            format!(
+                "GET /data/trades?market={CONDITION}&asset_id=123&next_cursor=MA%3D%3D HTTP/1.1"
+            )
+        );
+        assert!(!request.lines().next().unwrap().contains("question="));
+
         task.await.unwrap();
         supervisor.shutdown().await.unwrap();
     }

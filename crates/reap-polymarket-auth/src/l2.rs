@@ -11,7 +11,7 @@ use crate::secret::SecretText;
 use crate::{
     FixedOrderId, L2Credentials, OwnedCancelSemanticRequestCommitment,
     PlaceSemanticRequestCommitment, PmAuthError, RuntimeExactBodyCommitment,
-    SerializedOwnedCancelRequest, SerializedPlaceRequest,
+    SerializedGtcFillPlaceRequest, SerializedOwnedCancelRequest, SerializedPlaceRequest,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -72,6 +72,68 @@ pub trait L2HeaderSink {
         poly_api_key: &str,
         poly_passphrase: &str,
     ) -> Result<(), Self::Error>;
+}
+
+/// Trusted transport boundary for the semantic operation exact
+/// `GET /auth/ban-status/closed-only` with no caller-supplied query, body, or
+/// content type.
+///
+/// The five arguments are, in order, `POLY_ADDRESS`, `POLY_SIGNATURE`,
+/// `POLY_TIMESTAMP`, `POLY_API_KEY`, and `POLY_PASSPHRASE`. An implementation
+/// can retain or replay them, route them elsewhere, perform network I/O, and
+/// fabricate any `Output` or `Error`. In particular, `Error` has no rollback
+/// meaning: the sink may have copied every argument before returning it. This
+/// trait therefore does not attest transport compliance, remote authentication acceptance,
+/// credential currentness, provider origin, proxy control, or
+/// mutation authorization.
+pub trait FixedClosedOnlyRequestSink {
+    type Output;
+    type Error;
+
+    fn send_exact_get_auth_ban_status_closed_only(
+        &mut self,
+        poly_address: &str,
+        poly_signature: &str,
+        poly_timestamp: &str,
+        poly_api_key: &str,
+        poly_passphrase: &str,
+    ) -> Result<Self::Output, Self::Error>;
+}
+
+/// Consume-once exact closed-only request used only by the L1-response
+/// same-holder continuation.
+pub(crate) struct AuthenticatedClosedOnlyRequest(L2Headers);
+
+impl AuthenticatedClosedOnlyRequest {
+    /// Expose the five exact headers only at the trusted fixed-route sink.
+    pub(crate) fn dispatch<S: FixedClosedOnlyRequestSink>(
+        self,
+        sink: &mut S,
+    ) -> Result<S::Output, S::Error> {
+        let address = self.0.address.to_string();
+        let timestamp = self.0.timestamp.to_string();
+        let result = sink.send_exact_get_auth_ban_status_closed_only(
+            &address,
+            self.0.signature.as_str(),
+            &timestamp,
+            self.0.api_key.as_str(),
+            self.0.passphrase.as_str(),
+        );
+        // The associated output/error cannot borrow these arguments. Drop the
+        // exact header carrier and formatting copies before either result is
+        // returned; a trusted sink's own retained copies remain outside this
+        // type-state boundary.
+        drop(self);
+        drop(address);
+        drop(timestamp);
+        result
+    }
+}
+
+impl fmt::Debug for AuthenticatedClosedOnlyRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthenticatedClosedOnlyRequest([REDACTED])")
+    }
 }
 
 /// One L2-authenticated, once-serialized fixed GTC/post-only place request.
@@ -146,6 +208,89 @@ pub trait FixedPlaceRequestSink {
         reason = "the fixed sink receives five exact auth headers, two signed integer amounts, and the once-serialized body without a generic request carrier"
     )]
     fn send_gtc_post_only(
+        &mut self,
+        poly_address: &str,
+        poly_signature: &str,
+        poly_timestamp: &str,
+        poly_api_key: &str,
+        poly_passphrase: &str,
+        expected_making_amount: U256,
+        expected_taking_amount: U256,
+        exact_body: &[u8],
+    ) -> Result<Self::Output, Self::Error>;
+}
+
+/// One L2-authenticated, once-serialized fixed GTC/non-post-only fill request.
+pub struct AuthenticatedGtcFillPlaceRequest {
+    headers: L2Headers,
+    body: Zeroizing<Vec<u8>>,
+    expected_order_id: crate::ExpectedOrderId,
+    expected_making_amount: U256,
+    expected_taking_amount: U256,
+    runtime_exact_body_commitment: RuntimeExactBodyCommitment,
+    semantic_request_commitment: PlaceSemanticRequestCommitment,
+}
+
+impl AuthenticatedGtcFillPlaceRequest {
+    #[must_use]
+    pub const fn expected_order_id(&self) -> crate::ExpectedOrderId {
+        self.expected_order_id
+    }
+
+    #[must_use]
+    pub const fn expected_making_amount(&self) -> U256 {
+        self.expected_making_amount
+    }
+
+    #[must_use]
+    pub const fn expected_taking_amount(&self) -> U256 {
+        self.expected_taking_amount
+    }
+
+    #[must_use]
+    pub const fn runtime_exact_body_commitment(&self) -> RuntimeExactBodyCommitment {
+        self.runtime_exact_body_commitment
+    }
+
+    #[must_use]
+    pub const fn semantic_request_commitment(&self) -> PlaceSemanticRequestCommitment {
+        self.semantic_request_commitment
+    }
+
+    pub fn dispatch<S: FixedGtcFillPlaceRequestSink>(
+        self,
+        sink: &mut S,
+    ) -> Result<S::Output, S::Error> {
+        let address = self.headers.address.to_string();
+        let timestamp = self.headers.timestamp.to_string();
+        sink.send_gtc_fill(
+            &address,
+            self.headers.signature.as_str(),
+            &timestamp,
+            self.headers.api_key.as_str(),
+            self.headers.passphrase.as_str(),
+            self.expected_making_amount,
+            self.expected_taking_amount,
+            self.body.as_slice(),
+        )
+    }
+}
+
+impl fmt::Debug for AuthenticatedGtcFillPlaceRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthenticatedGtcFillPlaceRequest([REDACTED])")
+    }
+}
+
+pub trait FixedGtcFillPlaceRequestSink {
+    type Output;
+    type Error;
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the fixed sink receives five exact auth headers, two signed integer amounts, and the once-serialized body without a generic request carrier"
+    )]
+    fn send_gtc_fill(
         &mut self,
         poly_address: &str,
         poly_signature: &str,
@@ -251,6 +396,16 @@ pub trait AuthenticatedUserSubscriptionSink {
 }
 
 impl L2Credentials {
+    /// Exact fixed-route request reserved for the consumed L1-response
+    /// same-holder continuation.
+    pub(crate) fn authenticate_exact_closed_only_request(
+        &self,
+        timestamp: L2Timestamp,
+    ) -> Result<AuthenticatedClosedOnlyRequest, PmAuthError> {
+        self.headers(timestamp, b"GET", b"/auth/ban-status/closed-only", None)
+            .map(AuthenticatedClosedOnlyRequest)
+    }
+
     /// Headers for `GET /data/orders`; query bytes are intentionally absent
     /// from the signed route.
     pub fn authenticate_open_orders(
@@ -309,6 +464,29 @@ impl L2Credentials {
         let runtime_exact_body_commitment = request.runtime_exact_body_commitment();
         let semantic_request_commitment = request.semantic_request_commitment();
         Ok(AuthenticatedPlaceRequest {
+            headers,
+            body: request.body,
+            expected_order_id,
+            expected_making_amount,
+            expected_taking_amount,
+            runtime_exact_body_commitment,
+            semantic_request_commitment,
+        })
+    }
+
+    pub fn authenticate_gtc_fill_place(
+        &self,
+        timestamp: L2Timestamp,
+        request: SerializedGtcFillPlaceRequest,
+    ) -> Result<AuthenticatedGtcFillPlaceRequest, PmAuthError> {
+        let request = request.0;
+        let headers = self.headers(timestamp, b"POST", b"/order", Some(&request.body))?;
+        let expected_order_id = request.expected_order_id();
+        let expected_making_amount = request.expected_making_amount();
+        let expected_taking_amount = request.expected_taking_amount();
+        let runtime_exact_body_commitment = request.runtime_exact_body_commitment();
+        let semantic_request_commitment = request.semantic_request_commitment();
+        Ok(AuthenticatedGtcFillPlaceRequest {
             headers,
             body: request.body,
             expected_order_id,

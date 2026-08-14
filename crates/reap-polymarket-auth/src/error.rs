@@ -8,6 +8,8 @@ use thiserror::Error;
 pub enum PmAuthError {
     #[error("configured EOA address is not canonical EIP-55")]
     InvalidEoaAddress,
+    #[error("legacy type-1 proxy address is not canonical EIP-55")]
+    InvalidLegacyType1ProxyAddress,
     #[error("injected EOA private key is not canonical lowercase prefixed hex")]
     InvalidPrivateKeyEncoding,
     #[error("injected EOA private key is not a valid secp256k1 scalar")]
@@ -26,6 +28,14 @@ pub enum PmAuthError {
     InvalidCredentialSlotId,
     #[error("L2 timestamp must be a canonical ten-digit Unix-seconds value")]
     InvalidL2Timestamp,
+    #[error("L1 credential-derivation timestamp must be a canonical ten-digit Unix-seconds value")]
+    InvalidL1CredentialDerivationTimestamp,
+    #[error("L1 credential-derivation response exceeds the fixed local bound")]
+    L1CredentialDerivationResponseTooLong,
+    #[error("L1 credential-derivation response is not the exact canonical credential object")]
+    InvalidL1CredentialDerivationResponse,
+    #[error("L1 credential-derivation response does not match the staged L2 credentials")]
+    L1CredentialDerivationCredentialMismatch,
     #[error("signed order identity does not match the fixed EOA signer")]
     OrderIdentityMismatch,
     #[error("signed order identity does not match the L2 credential binding")]

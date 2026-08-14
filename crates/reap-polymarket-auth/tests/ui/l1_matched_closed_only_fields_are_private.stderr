@@ -1,0 +1,51 @@
+error[E0451]: fields `original_l2_credentials` and `request` of struct `L1CredentialDerivationMatchedClosedOnlyRequest` are private
+  --> tests/ui/l1_matched_closed_only_fields_are_private.rs:12:9
+   |
+11 |     let L1CredentialDerivationMatchedClosedOnlyRequest {
+   |         ---------------------------------------------- in this type
+12 |         original_l2_credentials: _,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^ private field
+13 |         request: _,
+   |         ^^^^^^^ private field
+
+error[E0451]: fields `original_l2_credentials` and `request` of struct `L1CredentialDerivationMatchedClosedOnlyRequest` are private
+  --> tests/ui/l1_matched_closed_only_fields_are_private.rs:19:9
+   |
+18 |     L1CredentialDerivationMatchedClosedOnlyRequest {
+   |     ---------------------------------------------- in this type
+19 |         original_l2_credentials: credentials,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^ private field
+20 |         request: impossible(),
+   |         ^^^^^^^ private field
+
+error[E0451]: fields `_original_l2_credentials` and `_output` of struct `L1CredentialDerivationMatchedClosedOnlyDispatch` are private
+  --> tests/ui/l1_matched_closed_only_fields_are_private.rs:26:9
+   |
+25 |     let L1CredentialDerivationMatchedClosedOnlyDispatch {
+   |         ----------------------------------------------- in this type
+26 |         _original_l2_credentials: _,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^ private field
+27 |         _output: _,
+   |         ^^^^^^^ private field
+
+error[E0451]: fields `_original_l2_credentials` and `_output` of struct `L1CredentialDerivationMatchedClosedOnlyDispatch` are private
+  --> tests/ui/l1_matched_closed_only_fields_are_private.rs:35:9
+   |
+34 |     L1CredentialDerivationMatchedClosedOnlyDispatch {
+   |     ----------------------------------------------- in this type
+35 |         _original_l2_credentials: credentials,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^ private field
+36 |         _output: (),
+   |         ^^^^^^^ private field
+
+error: type `reap_polymarket_auth::l2::AuthenticatedClosedOnlyRequest` is private
+  --> tests/ui/l1_matched_closed_only_fields_are_private.rs:13:18
+   |
+13 |         request: _,
+   |                  ^ private type
+
+error: type `reap_polymarket_auth::l2::AuthenticatedClosedOnlyRequest` is private
+  --> tests/ui/l1_matched_closed_only_fields_are_private.rs:20:18
+   |
+20 |         request: impossible(),
+   |                  ^^^^^^^^^^^^ private type

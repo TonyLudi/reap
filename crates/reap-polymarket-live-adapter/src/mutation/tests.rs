@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 
 use reap_pm_core::{
     EvmAddress, PmOrderSalt, PmOrderSide, PmPrice, PmQuantity, PmTick, PmTokenId, U256,
@@ -7,7 +7,9 @@ use reap_polymarket_auth::{
     EoaPrivateKeyInput, FixedEoaSigner, FixedOrderId, L2CredentialInput, L2Credentials,
     L2Timestamp, PmClobDomain, SerializedOwnedCancelRequest, SerializedPlaceRequest,
 };
+use reap_polymarket_egress_binding::{PmFixedTlsPeerSelection, PmLocalEgressSelection};
 use reap_polymarket_wire::PmUnsignedClobV2Order;
+use reqwest::StatusCode;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -27,6 +29,7 @@ use crate::{
 
 const TEST_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 const ADDRESS: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+const PROXY_ADDRESS: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
 const API_KEY: &str = "00000000-0000-4000-8000-000000000001";
 const ROTATED_API_KEY: &str = "00000000-0000-4000-8000-000000000002";
 const API_SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
@@ -41,6 +44,22 @@ const EXPECTED_CANCEL_SIGNATURE: &str = "beMewzBZba3V05Un8qQtGM0NYW4KFt4wKc8KqZc
 const EXPECTED_PLACE_BODY: &str = r#"{"deferExec":false,"order":{"builder":"0x0000000000000000000000000000000000000000000000000000000000000000","expiration":"0","maker":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","makerAmount":"5200000","metadata":"0x0000000000000000000000000000000000000000000000000000000000000000","salt":479249096354,"side":"BUY","signature":"0xbb81b245ea7ebb9aa480ccbf15364a2cb2cd77d7adebcb56fd5f49b653683110055a3d5ad05adf1aa65b1701bf25c622275f098fd5724c7f782671829e6d4d0b1b","signatureType":0,"signer":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","takerAmount":"10000000","timestamp":"1780449126930","tokenId":"1234"},"orderType":"GTC","owner":"00000000-0000-4000-8000-000000000001","postOnly":true}"#;
 const EXPECTED_CANCEL_BODY: &str =
     r#"{"orderID":"0xfaf10599783c69b375a0f0d948d37eb711ec042dbf7d52fc2f8d8832d71af7f1"}"#;
+
+// Sanitized differential oracle derived from pinned Predarb object
+// 8222273a9c72033b760e1d2fec813bc77144556d at
+// `crates/venue-polymarket/src/signing/{funder,order_v2}.rs`,
+// `rest/private.rs`, and `auth/l2.rs`: type-1 funder/order identity,
+// POST+DELETE `/order`, and HMAC-SHA256 over
+// `<timestamp><method><path><exact-body>`. The EIP-712 body also matches the
+// official-client oracle frozen in `protocol_vectors.rs`; this test never
+// calls Predarb.
+const PREDARB_T1_ORDER_ID: &str =
+    "0xb5c738f05de98533825d2412e68eeda3e8c2a11d4001b062c81d27e38dd5bcac";
+const PREDARB_T1_PLACE_SIGNATURE: &str = "ZJzFdy9sUYOQ3g4UH6tnY0otQwsvkbkI4eYx7aOhU8w=";
+const PREDARB_T1_CANCEL_SIGNATURE: &str = "VxC3IBp2BB3rfo5fM_r0dcLnvX4ok5R1hy2G9jVB3QE=";
+const PREDARB_T1_PLACE_BODY: &str = r#"{"deferExec":false,"order":{"builder":"0x0000000000000000000000000000000000000000000000000000000000000000","expiration":"0","maker":"0x70997970C51812dc3A010C7d01b50e0d17dc79C8","makerAmount":"4000000","metadata":"0x0000000000000000000000000000000000000000000000000000000000000000","salt":1713398400000,"side":"BUY","signature":"0x62dec972666e737c6b51e6f13a209cb57f7f82f7bffc22ac4767e91d14d5da6051855b2d2397ee5f060f68bcbd7d6810639098cc22b85477dedf378e831d47fa1b","signatureType":1,"signer":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","takerAmount":"10000000","timestamp":"1713398400000","tokenId":"1234"},"orderType":"GTC","owner":"00000000-0000-4000-8000-000000000001","postOnly":true}"#;
+const PREDARB_T1_CANCEL_BODY: &str =
+    r#"{"orderID":"0xb5c738f05de98533825d2412e68eeda3e8c2a11d4001b062c81d27e38dd5bcac"}"#;
 
 // Response shapes are frozen against the current official place/manage order
 // pages and corroborated only for routes/body keys by pinned Predarb object
@@ -112,6 +131,46 @@ fn unsigned_order() -> PmUnsignedClobV2Order {
     .unwrap()
 }
 
+fn predarb_t1_unsigned_order() -> PmUnsignedClobV2Order {
+    PmUnsignedClobV2Order::new_pm_t2_proxy(
+        PmOrderSalt::from_u64(1_713_398_400_000).unwrap(),
+        EvmAddress::parse(PROXY_ADDRESS).unwrap(),
+        EvmAddress::parse(ADDRESS).unwrap(),
+        PmTokenId::new(U256::from_u64(1_234)).unwrap(),
+        PmOrderSide::Buy,
+        PmPrice::parse_decimal("0.40").unwrap(),
+        PmQuantity::parse_decimal("10").unwrap(),
+        PmTick::parse_decimal("0.01").unwrap(),
+        PmQuantity::parse_decimal("5").unwrap(),
+        1_713_398_400_000,
+    )
+    .unwrap()
+}
+
+fn retained_predarb_t1_place() -> PmRetainedPlaceRequest {
+    let credentials = credentials();
+    let signed = signer()
+        .sign_clob_v2_order(PmClobDomain::Standard, predarb_t1_unsigned_order())
+        .unwrap();
+    assert_eq!(signed.expected_order_id().to_string(), PREDARB_T1_ORDER_ID);
+    let body = credentials.serialize_gtc_post_only(signed).unwrap();
+    let authenticated = credentials
+        .authenticate_place(L2Timestamp::from_unix_seconds(AUTH_SECONDS).unwrap(), body)
+        .unwrap();
+    PmRetainedPlaceRequest::retain(authenticated).unwrap()
+}
+
+fn retained_predarb_t1_cancel() -> PmRetainedOwnedCancelRequest {
+    let credentials = credentials();
+    let body = credentials
+        .serialize_owned_cancel(FixedOrderId::parse(PREDARB_T1_ORDER_ID).unwrap())
+        .unwrap();
+    let authenticated = credentials
+        .authenticate_owned_cancel(L2Timestamp::from_unix_seconds(AUTH_SECONDS).unwrap(), body)
+        .unwrap();
+    PmRetainedOwnedCancelRequest::retain(authenticated).unwrap()
+}
+
 fn serialized_place(credentials: &L2Credentials) -> SerializedPlaceRequest {
     let signed = signer()
         .sign_clob_v2_order(PmClobDomain::Standard, unsigned_order())
@@ -144,6 +203,163 @@ fn retained_place_with_credentials(
         .authenticate_place(L2Timestamp::from_unix_seconds(AUTH_SECONDS).unwrap(), body)
         .unwrap();
     PmRetainedPlaceRequest::retain(authenticated).unwrap()
+}
+
+#[test]
+fn gtc_fill_classifier_accepts_exact_live_or_matched_and_rejects_profile_drift() {
+    let credentials = credentials();
+    let serialized = credentials
+        .serialize_gtc_fill(
+            signer()
+                .sign_gtc_fill_clob_v2_order(PmClobDomain::Standard, unsigned_order())
+                .unwrap(),
+        )
+        .unwrap();
+    let expected = serialized.expected_order_id();
+    let runtime = serialized.runtime_exact_body_commitment();
+    let semantic = serialized.semantic_request_commitment();
+    for (status, trades) in [("live", "[]"), ("matched", r#"["trade-1"]"#)] {
+        let body = place_success(EXPECTED_ID, status, trades);
+        let outcome = super::transport::classify_complete_gtc_fill_place_for_test(
+            expected,
+            runtime,
+            semantic,
+            U256::from_u64(5_200_000),
+            U256::from_u64(10_000_000),
+            StatusCode::OK,
+            body.as_bytes(),
+        );
+        assert_eq!(outcome.classification(), PmMutationClassification::Accepted);
+    }
+
+    for body in [
+        place_success(FOREIGN_ID, "matched", r#"["trade-1"]"#),
+        place_success(EXPECTED_ID, "delayed", "[]"),
+        place_success_amounts(EXPECTED_ID, "matched", "[]", "1", "2"),
+    ] {
+        let outcome = super::transport::classify_complete_gtc_fill_place_for_test(
+            expected,
+            runtime,
+            semantic,
+            U256::from_u64(5_200_000),
+            U256::from_u64(10_000_000),
+            StatusCode::OK,
+            body.as_bytes(),
+        );
+        assert_eq!(
+            outcome.classification(),
+            PmMutationClassification::OutOfProfile
+        );
+    }
+}
+
+#[test]
+fn production_mutation_transport_is_exact_peer_selected_egress_and_purpose_closed() {
+    let peer = PmFixedTlsPeerSelection::production("clob.polymarket.com", "8.8.8.8")
+        .expect("synthetic reviewed production peer");
+    let egress = PmLocalEgressSelection::production("pm-tunnel0", "10.0.0.2".parse().unwrap())
+        .expect("synthetic selected production egress");
+    let config =
+        PmProductionMutationConfig::production_on_fixed_tls_peer_and_selected_local_egress(
+            Duration::from_secs(3),
+            Duration::from_secs(5),
+            peer,
+            egress,
+        )
+        .expect("exact production mutation config");
+    assert_eq!(
+        format!("{config:?}"),
+        "PmProductionMutationConfig(<fixed clob TLS peer; selected local egress; no authority>)"
+    );
+    assert_eq!(
+        format!(
+            "{:?}",
+            PmFixedPlaceProductionRole::new(config.clone()).unwrap()
+        ),
+        "PmFixedPlaceProductionRole([FIXED PRODUCTION])"
+    );
+    assert_eq!(
+        format!(
+            "{:?}",
+            PmExactOwnedCancelProductionRole::new(config).unwrap()
+        ),
+        "PmExactOwnedCancelProductionRole([FIXED PRODUCTION])"
+    );
+}
+
+#[test]
+fn production_mutation_configuration_rejects_wrong_mode_host_family_and_bounds() {
+    let production_egress =
+        || PmLocalEgressSelection::production("pm-tunnel0", "10.0.0.2".parse().unwrap()).unwrap();
+    let exact_peer =
+        || PmFixedTlsPeerSelection::production("clob.polymarket.com", "8.8.8.8").unwrap();
+    let build = |peer, egress, connect, request| {
+        PmProductionMutationConfig::production_on_fixed_tls_peer_and_selected_local_egress(
+            connect, request, peer, egress,
+        )
+    };
+
+    let wrong_host = PmFixedTlsPeerSelection::production("api.polymarket.com", "8.8.8.8").unwrap();
+    assert!(matches!(
+        build(
+            wrong_host,
+            production_egress(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ),
+        Err(PmMutationEdgeError::InvalidProductionConfiguration(_))
+    ));
+
+    let loopback_peer = PmFixedTlsPeerSelection::loopback_evidence(
+        "clob.test",
+        SocketAddr::from(([127, 0, 0, 1], 443)),
+    )
+    .unwrap();
+    assert!(matches!(
+        build(
+            loopback_peer,
+            production_egress(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ),
+        Err(PmMutationEdgeError::InvalidProductionConfiguration(_))
+    ));
+
+    let loopback_egress =
+        PmLocalEgressSelection::loopback_evidence("lo", "127.0.0.1".parse().unwrap()).unwrap();
+    assert!(matches!(
+        build(
+            exact_peer(),
+            loopback_egress,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ),
+        Err(PmMutationEdgeError::InvalidProductionConfiguration(_))
+    ));
+
+    let ipv6_peer =
+        PmFixedTlsPeerSelection::production("clob.polymarket.com", "2606:4700:4700::1111").unwrap();
+    assert!(matches!(
+        build(
+            ipv6_peer,
+            production_egress(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ),
+        Err(PmMutationEdgeError::InvalidProductionConfiguration(_))
+    ));
+
+    for (connect, request) in [
+        (Duration::ZERO, Duration::from_secs(1)),
+        (Duration::from_secs(1), Duration::ZERO),
+        (Duration::from_secs(61), Duration::from_secs(1)),
+        (Duration::from_secs(1), Duration::from_secs(61)),
+    ] {
+        assert!(matches!(
+            build(exact_peer(), production_egress(), connect, request),
+            Err(PmMutationEdgeError::InvalidProductionConfiguration(_))
+        ));
+    }
 }
 
 #[test]
@@ -680,6 +896,108 @@ async fn cancel_transports_exact_body_and_classifies_exact_identity() {
     );
     assert_eq!(request_body(&raw), EXPECTED_CANCEL_BODY.as_bytes());
     assert_eq!(task.await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn pinned_predarb_t1_place_then_exact_cancel_is_one_attempt_each_without_retry() {
+    let (place_origin, mut place_requests, place_task) = mock_server(MockPlan::ok(
+        place_success_amounts(PREDARB_T1_ORDER_ID, "live", "[]", "4000000", "10000000"),
+    ))
+    .await;
+    let mut place_role =
+        PmFixedPlaceLoopbackRole::new(loopback_config(&place_origin, Duration::from_secs(1)))
+            .unwrap();
+
+    let place_outcome = place_role.send(retained_predarb_t1_place()).await;
+    assert_eq!(
+        place_outcome.classification(),
+        PmMutationClassification::Accepted
+    );
+    assert_eq!(
+        place_outcome.expected_order_id().to_string(),
+        PREDARB_T1_ORDER_ID
+    );
+    assert_eq!(
+        place_outcome.observed_order_id().unwrap().as_str(),
+        PREDARB_T1_ORDER_ID
+    );
+
+    let place_raw = place_requests.recv().await.unwrap();
+    assert_eq!(
+        std::str::from_utf8(&place_raw)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+        "POST /order HTTP/1.1"
+    );
+    assert_eq!(request_header(&place_raw, "poly_address"), ADDRESS);
+    assert_eq!(
+        request_header(&place_raw, "poly_signature"),
+        PREDARB_T1_PLACE_SIGNATURE
+    );
+    assert_eq!(
+        request_header(&place_raw, "poly_timestamp"),
+        AUTH_SECONDS.to_string()
+    );
+    assert_eq!(request_header(&place_raw, "poly_api_key"), API_KEY);
+    assert_eq!(request_header(&place_raw, "poly_passphrase"), PASSPHRASE);
+    assert_eq!(request_body(&place_raw), PREDARB_T1_PLACE_BODY.as_bytes());
+    let place_body: serde_json::Value = serde_json::from_slice(request_body(&place_raw)).unwrap();
+    assert_eq!(place_body["order"]["maker"], PROXY_ADDRESS);
+    assert_eq!(place_body["order"]["signer"], ADDRESS);
+    assert_eq!(place_body["order"]["signatureType"], 1);
+    assert_eq!(
+        place_task.await.unwrap(),
+        1,
+        "type-1 place transport retried"
+    );
+
+    let (cancel_origin, mut cancel_requests, cancel_task) =
+        mock_server(MockPlan::ok(cancel_success(PREDARB_T1_ORDER_ID))).await;
+    let mut cancel_role = PmExactOwnedCancelLoopbackRole::new(loopback_config(
+        &cancel_origin,
+        Duration::from_secs(1),
+    ))
+    .unwrap();
+
+    let cancel_outcome = cancel_role.send(retained_predarb_t1_cancel()).await;
+    assert_eq!(
+        cancel_outcome.classification(),
+        PmMutationClassification::Accepted
+    );
+    assert_eq!(cancel_outcome.order_id().to_string(), PREDARB_T1_ORDER_ID);
+    assert_eq!(
+        cancel_outcome.observed_order_id().unwrap().as_str(),
+        PREDARB_T1_ORDER_ID
+    );
+
+    let cancel_raw = cancel_requests.recv().await.unwrap();
+    assert_eq!(
+        std::str::from_utf8(&cancel_raw)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+        "DELETE /order HTTP/1.1"
+    );
+    assert_eq!(request_header(&cancel_raw, "poly_address"), ADDRESS);
+    assert_eq!(
+        request_header(&cancel_raw, "poly_signature"),
+        PREDARB_T1_CANCEL_SIGNATURE
+    );
+    assert_eq!(
+        request_header(&cancel_raw, "poly_timestamp"),
+        AUTH_SECONDS.to_string()
+    );
+    assert_eq!(request_header(&cancel_raw, "poly_api_key"), API_KEY);
+    assert_eq!(request_header(&cancel_raw, "poly_passphrase"), PASSPHRASE);
+    assert_eq!(request_body(&cancel_raw), PREDARB_T1_CANCEL_BODY.as_bytes());
+    assert_eq!(
+        cancel_task.await.unwrap(),
+        1,
+        "exact cancel transport retried"
+    );
 }
 
 #[tokio::test]

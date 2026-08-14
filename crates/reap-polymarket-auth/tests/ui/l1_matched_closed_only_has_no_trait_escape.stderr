@@ -1,0 +1,94 @@
+error[E0277]: the trait bound `L1CredentialDerivationMatchedClosedOnlyRequest: serde::de::DeserializeOwned` is not satisfied
+  --> tests/ui/l1_matched_closed_only_has_no_trait_escape.rs:15:27
+   |
+15 |     require_deserialize::<L1CredentialDerivationMatchedClosedOnlyRequest>();
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `for<'de> Deserialize<'de>` is not implemented for `L1CredentialDerivationMatchedClosedOnlyRequest`
+   |
+   = help: the following other types implement trait `Deserialize<'de>`:
+             &'a Path
+             &'a [u8]
+             &'a serde_json::raw::RawValue
+             &'a str
+             ()
+             (T,)
+             (T0, T1)
+             (T0, T1, T2)
+           and $N others
+   = note: required for `L1CredentialDerivationMatchedClosedOnlyRequest` to implement `DeserializeOwned`
+note: required by a bound in `require_deserialize`
+  --> tests/ui/l1_matched_closed_only_has_no_trait_escape.rs:8:27
+   |
+ 8 | fn require_deserialize<T: serde::de::DeserializeOwned>() {}
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `require_deserialize`
+
+error[E0277]: the trait bound `L1CredentialDerivationMatchedClosedOnlyDispatch<()>: serde::de::DeserializeOwned` is not satisfied
+  --> tests/ui/l1_matched_closed_only_has_no_trait_escape.rs:16:27
+   |
+16 |     require_deserialize::<L1CredentialDerivationMatchedClosedOnlyDispatch<()>>();
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `for<'de> Deserialize<'de>` is not implemented for `L1CredentialDerivationMatchedClosedOnlyDispatch<()>`
+   |
+   = help: the following other types implement trait `Deserialize<'de>`:
+             &'a Path
+             &'a [u8]
+             &'a serde_json::raw::RawValue
+             &'a str
+             ()
+             (T,)
+             (T0, T1)
+             (T0, T1, T2)
+           and $N others
+   = note: required for `L1CredentialDerivationMatchedClosedOnlyDispatch<()>` to implement `DeserializeOwned`
+note: required by a bound in `require_deserialize`
+  --> tests/ui/l1_matched_closed_only_has_no_trait_escape.rs:8:27
+   |
+ 8 | fn require_deserialize<T: serde::de::DeserializeOwned>() {}
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `require_deserialize`
+
+error[E0277]: the trait bound `L1CredentialDerivationMatchedClosedOnlyRequest: AsRef<L2Credentials>` is not satisfied
+  --> tests/ui/l1_matched_closed_only_has_no_trait_escape.rs:17:22
+   |
+17 |     require_as_ref::<L1CredentialDerivationMatchedClosedOnlyRequest>();
+   |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `AsRef<L2Credentials>` is not implemented for `L1CredentialDerivationMatchedClosedOnlyRequest`
+   |
+note: required by a bound in `require_as_ref`
+  --> tests/ui/l1_matched_closed_only_has_no_trait_escape.rs:9:22
+   |
+ 9 | fn require_as_ref<T: AsRef<L2Credentials>>() {}
+   |                      ^^^^^^^^^^^^^^^^^^^^ required by this bound in `require_as_ref`
+
+error[E0277]: the trait bound `L1CredentialDerivationMatchedClosedOnlyRequest: Deref` is not satisfied
+  --> tests/ui/l1_matched_closed_only_has_no_trait_escape.rs:18:21
+   |
+18 |     require_deref::<L1CredentialDerivationMatchedClosedOnlyRequest>();
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Deref` is not implemented for `L1CredentialDerivationMatchedClosedOnlyRequest`
+   |
+note: required by a bound in `require_deref`
+  --> tests/ui/l1_matched_closed_only_has_no_trait_escape.rs:11:21
+   |
+11 | fn require_deref<T: Deref<Target = L2Credentials>>() {}
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `require_deref`
+
+error[E0277]: the trait bound `L1CredentialDerivationMatchedClosedOnlyDispatch<()>: Borrow<L2Credentials>` is not satisfied
+  --> tests/ui/l1_matched_closed_only_has_no_trait_escape.rs:19:22
+   |
+19 |     require_borrow::<L1CredentialDerivationMatchedClosedOnlyDispatch<()>>();
+   |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Borrow<L2Credentials>` is not implemented for `L1CredentialDerivationMatchedClosedOnlyDispatch<()>`
+   |
+note: required by a bound in `require_borrow`
+  --> tests/ui/l1_matched_closed_only_has_no_trait_escape.rs:10:22
+   |
+10 | fn require_borrow<T: Borrow<L2Credentials>>() {}
+   |                      ^^^^^^^^^^^^^^^^^^^^^ required by this bound in `require_borrow`
+
+error[E0277]: the trait bound `L2Credentials: From<L1CredentialDerivationMatchedClosedOnlyDispatch<()>>` is not satisfied
+  --> tests/ui/l1_matched_closed_only_has_no_trait_escape.rs:20:20
+   |
+20 |     require_into::<L1CredentialDerivationMatchedClosedOnlyDispatch<()>>();
+   |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `From<L1CredentialDerivationMatchedClosedOnlyDispatch<()>>` is not implemented for `L2Credentials`
+   |
+   = note: required for `L1CredentialDerivationMatchedClosedOnlyDispatch<()>` to implement `Into<L2Credentials>`
+note: required by a bound in `require_into`
+  --> tests/ui/l1_matched_closed_only_has_no_trait_escape.rs:12:20
+   |
+12 | fn require_into<T: Into<L2Credentials>>() {}
+   |                    ^^^^^^^^^^^^^^^^^^^ required by this bound in `require_into`

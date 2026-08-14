@@ -1289,6 +1289,31 @@ impl PmControlledTrialLiveJournals {
         &mut self,
         proof: PmPreparedConsumedAuthorizationProofV1,
     ) -> Result<PmPhaseAPlaceLiveDispatchOwnerV1, PmTrialLiveJournalError> {
+        let mut no_additional_refresh = || Ok(());
+        let (owner, additional_refresh) = self
+            .record_phase_a_place_live_dispatch_authorized_with_refresh(
+                proof,
+                &mut no_additional_refresh,
+            )?;
+        additional_refresh?;
+        Ok(owner)
+    }
+
+    /// Preserve the exact public V1 transition while allowing one sealed
+    /// additive lineage to refresh its already-held evidence after the A3
+    /// barrier creates a directory entry. The callback returns evidence status
+    /// only and cannot receive or construct the V1 owner.
+    pub(crate) fn record_phase_a_place_live_dispatch_authorized_with_refresh(
+        &mut self,
+        proof: PmPreparedConsumedAuthorizationProofV1,
+        additional_refresh: &mut impl FnMut() -> Result<(), PmTrialLiveJournalError>,
+    ) -> Result<
+        (
+            PmPhaseAPlaceLiveDispatchOwnerV1,
+            Result<(), PmTrialLiveJournalError>,
+        ),
+        PmTrialLiveJournalError,
+    > {
         if self.phase_a_live_dispatch_context.is_none()
             || self.phase_a_live_dispatch_epoch.is_some()
             || self.phase_a_live_cancel_epoch.is_some()
@@ -1310,20 +1335,28 @@ impl PmControlledTrialLiveJournals {
             mint_evidence,
         )?;
         // The positive barrier is the sole additional fixed directory entry.
-        // Refresh every already-held directory view before exposing authority.
-        self.artifact_lease.refresh_after_bound_create()?;
-        self.intent.file.refresh_parent_after_bound_create()?;
-        self.dispatch.file.refresh_parent_after_bound_create()?;
-        authorization
-            .refresh_after_bound_artifact_create()
-            .map_err(|_| PmTrialLiveJournalError::Protection)?;
-        self.artifact_lease.validate()?;
-        Ok(PmPhaseAPlaceLiveDispatchOwnerV1 {
-            dispatch,
-            grant: pending_grant.into_grant(),
-            authorization,
-            epoch,
-        })
+        // Attempt every already-held refresh, including the sealed additive
+        // callback, before failing closed or exposing authority.
+        let artifact_refresh = self.artifact_lease.refresh_after_bound_create();
+        let intent_refresh = self.intent.file.refresh_parent_after_bound_create();
+        let dispatch_refresh = self.dispatch.file.refresh_parent_after_bound_create();
+        let authorization_refresh = authorization.refresh_after_bound_artifact_create();
+        let additional_refresh_result = additional_refresh();
+        let artifact_validation = self.artifact_lease.validate();
+        artifact_refresh?;
+        intent_refresh?;
+        dispatch_refresh?;
+        authorization_refresh.map_err(|_| PmTrialLiveJournalError::Protection)?;
+        artifact_validation?;
+        Ok((
+            PmPhaseAPlaceLiveDispatchOwnerV1 {
+                dispatch,
+                grant: pending_grant.into_grant(),
+                authorization,
+                epoch,
+            },
+            additional_refresh_result,
+        ))
     }
 
     fn record_place_dispatch_authorized_inner(
@@ -1416,6 +1449,30 @@ impl PmControlledTrialLiveJournals {
             authorization,
             epoch,
         })
+    }
+
+    /// Revalidate the complete held V1 place evidence without consuming it or
+    /// constructing the public network-boundary owner. This sealed seam exists
+    /// only so a crate-private additive denied-evidence lineage can perform a
+    /// fresh journal, dispatch-tail, barrier, consumption, and outstanding-epoch
+    /// check after its own final durable append. It returns no profile, grant,
+    /// permit, transport input, or mutation capability.
+    pub(crate) fn revalidate_phase_a_place_evidence_only(
+        &mut self,
+        owner: &mut PmRevalidatedPhaseAPlaceLiveDispatchOwnerV1,
+    ) -> Result<(), PmTrialLiveJournalError> {
+        self.require_phase_a_live_epoch(&owner.epoch)?;
+        owner.dispatch.core.require_runtime(&self.runtime)?;
+        self.require_phase_a_live_dispatch_tail(&owner.dispatch)?;
+        self.validate_phase_a_live_durable_set(&mut owner.grant, &mut owner.authorization)?;
+        if !grant_matches_v1_dispatch(
+            &owner.grant,
+            owner.dispatch.core.sequence,
+            &owner.dispatch.core.record_fingerprint,
+        ) {
+            return Err(PmTrialLiveJournalError::ForeignAcknowledgement);
+        }
+        Ok(())
     }
 
     /// Consume the sole combined DND token, durably record the terminal no-send

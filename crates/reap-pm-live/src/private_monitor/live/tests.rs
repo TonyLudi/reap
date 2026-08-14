@@ -1,7 +1,10 @@
 use reap_pm_core::{
-    ConnectionEpoch, EvmAddress, PmAllowanceValue, PmTokenId, PmVenueOrderId, PmVenueOrderKey, U256,
+    ConnectionEpoch, EvmAddress, PmAllowanceValue, PmOrderStatus, PmSign, PmSignedUnits, PmTokenId,
+    PmVenueOrderId, PmVenueOrderKey, U256,
 };
-use reap_pm_state::{PmAllowanceKnowledge, PmOpenOrdersApply, PmPositionKnowledge};
+use reap_pm_state::{
+    PmAllowanceKnowledge, PmOpenOrdersApply, PmPositionKnowledge, PmRefreshReason,
+};
 use reap_pm_state::{
     PmPrivateDependency, PmPrivateExternalIngressFailure, PmPrivateExternalIngressFault,
     PmPrivateExternalIngressLane, PmPrivateHaltReason,
@@ -150,6 +153,64 @@ fn user_order(id: &str) -> Value {
     })
 }
 
+fn user_partial_fill(id: &str) -> Value {
+    json!([
+        {
+            "event_type": "order",
+            "id": id,
+            "market": CONDITION,
+            "asset_id": TOKEN.to_string(),
+            "side": "BUY",
+            "original_size": "10",
+            "size_matched": "5",
+            "price": "0.42",
+            "type": "UPDATE",
+            "maker_address": PM_FUNDER,
+            "expiration": "0",
+            "order_type": "GTC",
+            "outcome": "Yes",
+            "status": "LIVE",
+            "created_at": "1700000000",
+            "associate_trades": ["fill-maker"],
+            "owner": OWNER,
+            "order_owner": OWNER,
+            "timestamp": "1700000000001"
+        },
+        {
+            "event_type": "trade",
+            "id": "fill-maker",
+            "market": CONDITION,
+            "asset_id": "999",
+            "side": "SELL",
+            "size": "5",
+            "price": "0.58",
+            "status": "MATCHED",
+            "trader_side": "MAKER",
+            "maker_orders": [{
+                "order_id": id,
+                "asset_id": TOKEN.to_string(),
+                "side": "BUY",
+                "price": "0.42",
+                "matched_amount": "5",
+                "owner": OWNER,
+                "maker_address": PM_FUNDER
+            }],
+            "owner": OWNER,
+            "trade_owner": OWNER,
+            "timestamp": "1700000000001",
+            "last_update": "1700000000002"
+        }
+    ])
+}
+
+fn duplicate_user_fill(id: &str) -> Value {
+    user_partial_fill(id)
+        .as_array()
+        .and_then(|events| events.get(1))
+        .cloned()
+        .expect("partial-fill fixture contains a trade")
+}
+
 fn rest_order(id: &str, condition: &str, maker: &str, price: &str) -> Value {
     json!({
         "id": id,
@@ -282,6 +343,87 @@ fn credential_owned_private_frame_reaches_the_existing_private_reducer() {
             .as_str(),
         ORDER_A
     );
+}
+
+#[test]
+fn live_fill_advances_order_and_provisional_position_once_until_reconciliation() {
+    let mut monitor = connected_monitor();
+    let (collateral, conditional) = account_pair(false);
+    monitor
+        .ingest_account_live(
+            PmLiveAccountInput::new(
+                query_occurrence(1, 1, 2, 1, 29_000).expect("initial account occurrence"),
+                collateral,
+                conditional,
+            )
+            .expect("initial account input"),
+        )
+        .expect("initial account cut applies");
+    monitor
+        .ingest_private_live(
+            PmLivePrivateInput::new(
+                completion(1, 3, None, 30_000),
+                authenticated(user_order(ORDER_A)),
+            ),
+            30_001,
+        )
+        .expect("live placement applies");
+
+    let applied = monitor
+        .ingest_private_live(
+            PmLivePrivateInput::new(
+                completion(1, 4, None, 31_000),
+                authenticated(user_partial_fill(ORDER_A)),
+            ),
+            31_001,
+        )
+        .expect("live partial fill applies");
+    assert_eq!(applied.apply().order_observations(), 1);
+    assert_eq!(applied.apply().fill_observations(), 1);
+
+    let provisional = {
+        let projection = monitor.private_projection();
+        let order = projection.orders().next().expect("tracked order");
+        assert_eq!(order.status(), Some(PmOrderStatus::PartiallyFilled));
+        let provisional = projection.provisional_deltas();
+        assert_eq!(
+            provisional.collateral(),
+            PmSignedUnits::from_parts(PmSign::Negative, U256::from_u64(2_100_000)).unwrap()
+        );
+        assert_eq!(
+            provisional.outcome(),
+            PmSignedUnits::from_parts(PmSign::Positive, U256::from_u64(5_000_000)).unwrap()
+        );
+        assert_eq!(provisional.uncovered_fills(), 1);
+        assert_eq!(
+            projection.effective_position(),
+            Some(PmSignedUnits::from_parts(PmSign::Positive, U256::from_u64(5_000_025)).unwrap())
+        );
+        assert!(
+            projection
+                .pending_refresh_keys()
+                .any(|key| key.reason() == PmRefreshReason::FillObserved)
+        );
+        assert_eq!(projection.fill_counters().principal_applications(), 1);
+        provisional
+    };
+
+    let duplicate = monitor
+        .ingest_private_live(
+            PmLivePrivateInput::new(
+                completion(1, 5, None, 32_000),
+                authenticated(duplicate_user_fill(ORDER_A)),
+            ),
+            32_001,
+        )
+        .expect("duplicate fill is classified without a second position move");
+    assert_eq!(duplicate.apply().fill_observations(), 1);
+    assert_eq!(duplicate.apply().duplicate_or_stale_observations(), 1);
+
+    let projection = monitor.private_projection();
+    assert_eq!(projection.provisional_deltas(), provisional);
+    assert_eq!(projection.fill_counters().principal_applications(), 1);
+    assert_eq!(projection.fill_counters().duplicates(), 1);
 }
 
 #[test]

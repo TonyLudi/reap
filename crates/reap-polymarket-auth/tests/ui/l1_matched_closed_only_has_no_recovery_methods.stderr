@@ -1,0 +1,29 @@
+error[E0599]: no method named `original_l2_credentials` found for struct `L1CredentialDerivationMatchedClosedOnlyRequest` in the current scope
+ --> tests/ui/l1_matched_closed_only_has_no_recovery_methods.rs:6:19
+  |
+6 |     let _ = value.original_l2_credentials();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^ private field, not a method
+
+error[E0599]: no method named `request` found for struct `L1CredentialDerivationMatchedClosedOnlyRequest` in the current scope
+ --> tests/ui/l1_matched_closed_only_has_no_recovery_methods.rs:7:19
+  |
+7 |     let _ = value.request();
+  |                   ^^^^^^^ private field, not a method
+
+error[E0599]: no method named `original_l2_credentials` found for struct `L1CredentialDerivationMatchedClosedOnlyDispatch<Output>` in the current scope
+  --> tests/ui/l1_matched_closed_only_has_no_recovery_methods.rs:11:19
+   |
+11 |     let _ = value.original_l2_credentials();
+   |                   ^^^^^^^^^^^^^^^^^^^^^^^ method not found in `L1CredentialDerivationMatchedClosedOnlyDispatch<()>`
+
+error[E0599]: no method named `output` found for struct `L1CredentialDerivationMatchedClosedOnlyDispatch<Output>` in the current scope
+  --> tests/ui/l1_matched_closed_only_has_no_recovery_methods.rs:12:19
+   |
+12 |     let _ = value.output();
+   |                   ^^^^^^ method not found in `L1CredentialDerivationMatchedClosedOnlyDispatch<()>`
+
+error[E0599]: no method named `into_output` found for struct `L1CredentialDerivationMatchedClosedOnlyDispatch<Output>` in the current scope
+  --> tests/ui/l1_matched_closed_only_has_no_recovery_methods.rs:13:19
+   |
+13 |     let _ = value.into_output();
+   |                   ^^^^^^^^^^^ method not found in `L1CredentialDerivationMatchedClosedOnlyDispatch<()>`

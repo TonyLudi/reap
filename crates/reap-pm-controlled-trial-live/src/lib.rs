@@ -16,6 +16,7 @@ mod hash;
 mod journal;
 mod live_dispatch;
 mod online_preflight_v2;
+mod phase_a_attempt_lineage_v4;
 mod protected;
 mod recovery;
 mod recovery_continuation;
@@ -53,6 +54,10 @@ pub use online_preflight_v2::{
     PmPhaseAOnlinePreflightPostA3FailureReasonV2, PmPhaseAOnlinePreflightPostA3FailureV2,
     PmPhaseAOnlinePreflightV2Error, create_phase_a_online_preflight_basis_v2,
     inspect_phase_a_online_preflight_v2,
+};
+pub use phase_a_attempt_lineage_v4::{
+    PM_PHASE_A_ATTEMPT_BURN_CLAIM_FILE_V4, PM_PHASE_A_ATTEMPT_LINEAGE_LEDGER_FILE_V4,
+    PmPhaseAAttemptLineageInspectionV4, inspect_phase_a_attempt_lineage_v4,
 };
 pub use recovery::{
     PmPhaseALiveCancelRecoveryRequiredActionV1, PmTrialLiveRecoveryClassificationV1,

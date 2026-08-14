@@ -86,6 +86,59 @@ impl fmt::Debug for EoaAddress {
     }
 }
 
+/// An address in exact canonical EIP-55 spelling that is used only for the
+/// deterministic legacy Polymarket type-1 proxy-address relation.
+///
+/// This value does not attest deployed code, current chain state, signer-key
+/// possession or exclusivity, proxy control, provider acceptance,
+/// authentication, or authorization.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LegacyType1ProxyAddress([u8; 20]);
+
+impl LegacyType1ProxyAddress {
+    pub fn parse(input: &str) -> Result<Self, PmAuthError> {
+        let bytes = parse_prefixed_hex::<20>(input, false)
+            .ok_or(PmAuthError::InvalidLegacyType1ProxyAddress)?;
+        let address = Self(bytes);
+        if input != address.to_string() {
+            return Err(PmAuthError::InvalidLegacyType1ProxyAddress);
+        }
+        Ok(address)
+    }
+
+    pub(crate) const fn from_bytes(bytes: [u8; 20]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn bytes(self) -> [u8; 20] {
+        self.0
+    }
+}
+
+impl FromStr for LegacyType1ProxyAddress {
+    type Err = PmAuthError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        Self::parse(input)
+    }
+}
+
+impl fmt::Display for LegacyType1ProxyAddress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_eip55(formatter, self.0)
+    }
+}
+
+impl fmt::Debug for LegacyType1ProxyAddress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("LegacyType1ProxyAddress")
+            .field(&self.to_string())
+            .finish()
+    }
+}
+
 /// Exact CLOB V2 EIP-712 order identity expected from the venue.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ExpectedOrderId([u8; 32]);

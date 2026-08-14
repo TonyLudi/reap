@@ -1,0 +1,16 @@
+error[E0382]: use of moved value: `request`
+  --> tests/ui/l1_matched_closed_only_request_cannot_retry.rs:28:18
+   |
+24 |     request: L1CredentialDerivationMatchedClosedOnlyRequest,
+   |     ------- move occurs because `request` has type `L1CredentialDerivationMatchedClosedOnlyRequest`, which does not implement the `Copy` trait
+...
+27 |     let _first_error = request.dispatch(sink).unwrap_err();
+   |                                -------------- `request` moved due to this method call
+28 |     let _retry = request.dispatch(sink);
+   |                  ^^^^^^^ value used here after move
+   |
+note: `L1CredentialDerivationMatchedClosedOnlyRequest::dispatch` takes ownership of the receiver `self`, which moves `request`
+  --> src/l1_credential_derivation_response.rs
+   |
+   |         self,
+   |         ^^^^

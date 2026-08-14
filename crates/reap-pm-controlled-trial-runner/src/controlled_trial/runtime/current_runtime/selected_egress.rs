@@ -3,36 +3,36 @@
 //! This child is intentionally private to `current_runtime`. It starts one
 //! named OS thread and allocates one private actor generation before capturing
 //! any local fact or constructing any role. Exact reviewed peers, one selected
-//! local route, credential-free HTTP clients, observation-only public roles,
-//! fixed authenticated REST, and paired selected public/user WebSocket roles
-//! are then constructed and retained on that thread. The same current-thread
-//! runtime and `LocalSet` drive both the actor and the staged secret task.
+//! local route, credential-free HTTP clients, and dormant observation-only
+//! public roles are then constructed and retained on that thread. The same
+//! current-thread runtime and `LocalSet` drive only the denied actor lifecycle;
+//! no credential or observation task is armed.
 //!
 //! This remains a permanently denied construction milestone. `Ready` means
-//! only that the denied carriers were constructed/scheduled and final local
-//! source plus immutable locator-evidence revalidation succeeded; it does not
-//! claim that the credential task ran, that a socket connected, that a source
-//! was called, or that any live freshness/preflight condition holds. The sole
-//! command is `Shutdown`. No
+//! only that the denied carriers were constructed and final local source
+//! revalidation succeeded. It does not claim that a delivery token was
+//! consumed, token/evidence pair identity was runtime-verified, a credential
+//! directory/EUID/lease/descriptor/credential binding was observed, a socket
+//! connected, a source was called, or any live freshness/preflight condition
+//! holds. The sole command is `Shutdown`. No
 //! role projection, WebSocket run, HTTP source call, deferred-clock promotion,
 //! seal, HMAC, request, mutation, or order-entry path is reachable here.
 //! The retained `Rc` generation is only an actor-lifecycle topology check; it
 //! is not embedded in any selected HTTP/WS source fact and is not positive
 //! provenance for a socket, observation, or authorization.
 //!
-//! Before the actor thread starts, one caller-supplied protected canonical,
-//! structurally reviewed lexical credential-slot locator is consumed into
-//! retained no-path evidence and one non-clone load token. Raw credential
-//! `Path`, basename, and independent signer inputs are removed; the token
-//! derives those facts from that consumed holder and the exact config. This is
-//! one-shot only for that loaded holder: the protected sidecar can be loaded
-//! again, and frozen V2 neither pins its fingerprint nor records consumption.
-//! The locator and directory therefore remain caller-selected and unattested.
-//! Protected-file loading proves local custody and signer/L2 structure only,
-//! not that the staged bytes are the reviewed slot generation or that the
-//! remote API key is owned by the configured signer. Any future source or
-//! positive-preflight tranche still requires separately authorized delivery
-//! and remote-owner proof.
+//! Before the actor thread starts, the complete denied local-operator profile
+//! context is structurally reverified and one whole delivery token is retained
+//! inseparably with its no-path evidence and reviewed profile. Only after all
+//! fallible non-secret construction, scope, local-fact, and generation checks
+//! does the actor bind that unopened aggregate to its private `Rc` generation.
+//! The token exposes no non-consuming fingerprint projection, so exact
+//! token/evidence pair identity remains deferred to a future realization
+//! boundary. This tranche deliberately does not realize it: the current owner
+//! has no reviewed cleanup/terminal API, and Linux supplies no atomic
+//! unlink-if-inode primitive. Shutdown only drops the unopened aggregate; it
+//! makes no credential-drop, lease-release, basename-removal, secure-erasure,
+//! provider, currentness, remote-owner, or mutation-authority claim.
 
 use std::{
     fmt,
@@ -46,12 +46,12 @@ use std::{
 
 use async_trait::async_trait;
 use reap_pm_controlled_trial::{
-    CanonicalOnlineAuthorizationV2, CanonicalOnlinePolicyV2,
-    CanonicalReviewedFreshCredentialSlotLocatorEvidenceV1,
-    CanonicalReviewedFreshCredentialSlotLocatorV1, CanonicalReviewedProductionDestinationProfileV1,
-    CanonicalTrialConfig, OfflineAuthorizationState, ReviewedFreshCredentialLoadTokenV1,
-    TrialDomain, TrialPhase, bind_reviewed_fresh_credential_slot_locator_v1,
-    verify_reviewed_fresh_credential_slot_locator_evidence_v1,
+    CanonicalFreshCredentialDeliveryBindingV1, CanonicalOnlineAuthorizationV2,
+    CanonicalOnlinePolicyV2, CanonicalReviewedFreshCredentialSlotLocatorV1,
+    CanonicalReviewedLocalOperatorCooperativeCustodyProfileV1,
+    CanonicalReviewedProductionDestinationProfileV1, CanonicalTrialConfig,
+    OfflineAuthorizationState, ReviewedLocalOperatorCooperativeCustodyProfileContextV1,
+    TrialDomain, TrialPhase, bind_fresh_credential_delivery_binding_v1,
     verify_reviewed_production_destination_profile_v1,
 };
 use reap_pm_core::{
@@ -63,26 +63,21 @@ use reap_polymarket_egress_binding::{PmFixedTlsPeerSelection, PmLocalEgressSelec
 use reap_polymarket_live_adapter::{
     PmClobLivenessHealthHttpRole, PmGeoblockHttpRole, PmProductClockOwner,
     PmPublicObservationWithDeferredMutationClockOwner, PmPublicWsBounds, PmPublicWsConfig,
-    PmStatusAnnouncementHttpRole, PmUserWsBounds,
+    PmStatusAnnouncementHttpRole,
 };
 use reap_polymarket_public_source::{PmDataApiCurrentPositionSource, PmDataApiPositionScope};
-use reap_polymarket_wire::{
-    MAX_PM_LIVE_BODY_BYTES, MAX_PUBLIC_WS_FRAME_BYTES, PmBookParserConfig, PmWireScope,
-};
+use reap_polymarket_wire::{MAX_PUBLIC_WS_FRAME_BYTES, PmBookParserConfig, PmWireScope};
 use thiserror::Error;
 use tokio::{runtime::Builder as TokioRuntimeBuilder, sync::mpsc as tokio_mpsc, task::LocalSet};
 
 use super::super::{
     linux_egress_local_facts::PmLinuxEgressLocalFactCustody,
-    private_reads::{
-        PmFreshStagedSelectedObservationRoles, PmPrivateReadRuntimeError,
-        PmPrivateReadRuntimeProfile,
-    },
-    public_book::{PmDeferredObservationRuntimeRoles, PmInertDeferredObservationCustody},
+    public_book::PmDeferredObservationRuntimeRoles,
 };
 use crate::controlled_trial::authority::{
-    CredentialAuthorityShutdownOutcome, DEFAULT_AUTHORITY_SHUTDOWN_BOUNDS,
-    FreshStagedObservationCredentialAuthorityOwner,
+    GenerationBoundUnopenedLocalOperatorFreshCredentialCustodyV1,
+    PreparedUnopenedLocalOperatorFreshCredentialCustodyV1,
+    prepare_unopened_local_operator_fresh_credential_custody_v1,
 };
 
 const SELECTED_EGRESS_ACTOR_THREAD_NAME: &str = "reap-pm-selected-egress";
@@ -99,22 +94,16 @@ pub(super) enum PmDeniedSelectedEgressActorError {
     AuthorizationConfigBinding,
     #[error("selected-egress actor reviewed destination profile binding is invalid")]
     ReviewedDestinationProfileBinding,
-    #[error("selected-egress actor reviewed fresh credential locator binding is invalid")]
-    ReviewedFreshCredentialLocatorBinding,
+    #[error("selected-egress actor reviewed local cooperative custody binding is invalid")]
+    ReviewedLocalCooperativeCustodyBinding,
     #[error("selected-egress actor could not derive the exact position scope")]
     InvalidPositionScope,
     #[error("selected-egress actor observation configuration is invalid")]
     ObservationConfiguration,
     #[error("selected-egress actor public observation roles could not be constructed")]
     PublicObservationConstruction,
-    #[error("selected-egress actor fresh credential custody could not be loaded")]
-    FreshCredentialLoad,
-    #[error("selected-egress actor selected private observation roles could not be assembled")]
-    SelectedObservationAssembly,
-    #[error("selected-egress actor credential cleanup failed")]
-    CredentialCleanup,
-    #[error("selected-egress actor credential task reached an abnormal but terminal shutdown")]
-    CredentialShutdownAbnormal,
+    #[error("selected-egress actor unopened custody shutdown was abnormal")]
+    CustodyShutdownAbnormal,
     #[error("selected-egress actor OS thread could not be spawned")]
     ThreadSpawn,
     #[error("selected-egress actor local facts could not be captured")]
@@ -153,6 +142,24 @@ pub(super) enum PmDeniedSelectedEgressActorError {
     ShutdownDelivery,
 }
 
+/// Complete non-secret reviewed input conjunction for one denied selected
+/// actor startup. The parent runtime can construct this move-only carrier but
+/// cannot replace any role with a raw credential path, signer, secret,
+/// runtime fact, transport, request, or authority value.
+pub(super) struct PmDeniedSelectedEgressReviewedInputConjunction<'input, 'holders> {
+    pub(super) config: &'input CanonicalTrialConfig,
+    pub(super) online_policy: CanonicalOnlinePolicyV2,
+    pub(super) online_authorization: CanonicalOnlineAuthorizationV2,
+    pub(super) reviewed_destination_profile: CanonicalReviewedProductionDestinationProfileV1,
+    pub(super) reviewed_nonsecret_profile_path: &'input Path,
+    pub(super) reviewed_local_operator_context:
+        &'input ReviewedLocalOperatorCooperativeCustodyProfileContextV1<'holders>,
+    pub(super) reviewed_local_operator_profile:
+        CanonicalReviewedLocalOperatorCooperativeCustodyProfileV1,
+    pub(super) delivery_locator: CanonicalReviewedFreshCredentialSlotLocatorV1,
+    pub(super) delivery_binding: CanonicalFreshCredentialDeliveryBindingV1,
+}
+
 /// Inputs derived from exact canonical config before entering the actor
 /// thread. No local-egress fact is accepted from the caller.
 struct PmDeniedSelectedEgressActorStartup {
@@ -161,26 +168,28 @@ struct PmDeniedSelectedEgressActorStartup {
     online_authorization: CanonicalOnlineAuthorizationV2,
     reviewed_destination_profile: CanonicalReviewedProductionDestinationProfileV1,
     reviewed_nonsecret_profile_path: PathBuf,
-    reviewed_fresh_credential_locator_evidence:
-        CanonicalReviewedFreshCredentialSlotLocatorEvidenceV1,
-    reviewed_fresh_credential_load_token: ReviewedFreshCredentialLoadTokenV1,
+    prepared_local_operator_custody: PreparedUnopenedLocalOperatorFreshCredentialCustodyV1,
     position_scope: PmDataApiPositionScope,
     scope: PmWireScope,
-    signer: EoaAddress,
-    proxy_funder: EvmAddress,
     parser_config: PmBookParserConfig,
     maximum_fact_age: Duration,
 }
 
 impl PmDeniedSelectedEgressActorStartup {
     fn from_exact_config(
-        config: &CanonicalTrialConfig,
-        online_policy: CanonicalOnlinePolicyV2,
-        online_authorization: CanonicalOnlineAuthorizationV2,
-        reviewed_destination_profile: CanonicalReviewedProductionDestinationProfileV1,
-        reviewed_nonsecret_profile_path: &Path,
-        reviewed_fresh_credential_locator: CanonicalReviewedFreshCredentialSlotLocatorV1,
+        inputs: PmDeniedSelectedEgressReviewedInputConjunction<'_, '_>,
     ) -> Result<Self, PmDeniedSelectedEgressActorError> {
+        let PmDeniedSelectedEgressReviewedInputConjunction {
+            config,
+            online_policy,
+            online_authorization,
+            reviewed_destination_profile,
+            reviewed_nonsecret_profile_path,
+            reviewed_local_operator_context,
+            reviewed_local_operator_profile,
+            delivery_locator,
+            delivery_binding,
+        } = inputs;
         // This is exact, clock-free reviewer-record verification only. It does
         // not claim that the profile or authorization is fresh at startup.
         let verification = verify_reviewed_production_destination_profile_v1(
@@ -199,20 +208,70 @@ impl PmDeniedSelectedEgressActorStartup {
         {
             return Err(PmDeniedSelectedEgressActorError::ReviewedDestinationProfileBinding);
         }
-        let (reviewed_fresh_credential_locator_evidence, reviewed_fresh_credential_load_token) =
-            bind_reviewed_fresh_credential_slot_locator_v1(
+        let joined = &reviewed_local_operator_context.phase_a_eligibility_context;
+        if joined.v1_config.canonical_sha256() != config.canonical_sha256()
+            || joined.v1_config.canonical_length() != config.canonical_length()
+            || joined.v1_config.fingerprint() != config.fingerprint()
+            || joined.online_policy_v2.canonical_sha256() != online_policy.canonical_sha256()
+            || joined.online_policy_v2.canonical_length() != online_policy.canonical_length()
+            || joined.online_policy_v2.fingerprint() != online_policy.fingerprint()
+            || joined.online_authorization_v2.canonical_sha256()
+                != online_authorization.canonical_sha256()
+            || joined.online_authorization_v2.canonical_length()
+                != online_authorization.canonical_length()
+            || joined.online_authorization_v2.fingerprint() != online_authorization.fingerprint()
+            || joined.reviewed_production_destination_v1.canonical_sha256()
+                != reviewed_destination_profile.canonical_sha256()
+            || joined.reviewed_production_destination_v1.canonical_length()
+                != reviewed_destination_profile.canonical_length()
+            || joined.reviewed_production_destination_v1.fingerprint()
+                != reviewed_destination_profile.fingerprint()
+            || joined
+                .reviewed_fresh_credential_slot_locator_v1
+                .canonical_sha256()
+                != delivery_locator.canonical_sha256()
+            || joined
+                .reviewed_fresh_credential_slot_locator_v1
+                .canonical_length()
+                != delivery_locator.canonical_length()
+            || joined
+                .reviewed_fresh_credential_slot_locator_v1
+                .fingerprint()
+                != delivery_locator.fingerprint()
+            || joined
+                .fresh_credential_delivery_binding_v1
+                .canonical_sha256()
+                != delivery_binding.canonical_sha256()
+            || joined
+                .fresh_credential_delivery_binding_v1
+                .canonical_length()
+                != delivery_binding.canonical_length()
+            || joined.fresh_credential_delivery_binding_v1.fingerprint()
+                != delivery_binding.fingerprint()
+        {
+            return Err(PmDeniedSelectedEgressActorError::ReviewedLocalCooperativeCustodyBinding);
+        }
+        let (retained_delivery_evidence, whole_delivery_load_token) =
+            bind_fresh_credential_delivery_binding_v1(
                 config,
                 &online_policy,
                 &online_authorization,
-                reviewed_fresh_credential_locator,
+                delivery_locator,
+                delivery_binding,
             )
-            .map_err(|_| PmDeniedSelectedEgressActorError::ReviewedFreshCredentialLocatorBinding)?;
-        revalidate_reviewed_fresh_credential_locator_evidence(
-            config,
-            &online_policy,
-            &online_authorization,
-            &reviewed_fresh_credential_locator_evidence,
-        )?;
+            .map_err(|_| {
+                PmDeniedSelectedEgressActorError::ReviewedLocalCooperativeCustodyBinding
+            })?;
+        let prepared_local_operator_custody =
+            prepare_unopened_local_operator_fresh_credential_custody_v1(
+                reviewed_local_operator_context,
+                reviewed_local_operator_profile,
+                whole_delivery_load_token,
+                retained_delivery_evidence,
+            )
+            .map_err(|_| {
+                PmDeniedSelectedEgressActorError::ReviewedLocalCooperativeCustodyBinding
+            })?;
         let pins = &online_authorization.value().v1_config;
         if config.value().phase != TrialPhase::APlaceCancel
             || pins.canonical_config_sha256 != config.canonical_sha256()
@@ -264,49 +323,13 @@ impl PmDeniedSelectedEgressActorStartup {
             online_authorization,
             reviewed_destination_profile,
             reviewed_nonsecret_profile_path: reviewed_nonsecret_profile_path.to_path_buf(),
-            reviewed_fresh_credential_locator_evidence,
-            reviewed_fresh_credential_load_token,
+            prepared_local_operator_custody,
             position_scope: PmDataApiPositionScope::new(proxy_funder, condition, token),
             scope,
-            signer,
-            proxy_funder,
             parser_config,
             maximum_fact_age: Duration::from_millis(maximum_fact_age_ms),
         })
     }
-}
-
-/// Recheck only immutable exact-record bindings. All live/delivery/ownership
-/// claims must remain explicitly false in this Shutdown-only actor.
-fn revalidate_reviewed_fresh_credential_locator_evidence(
-    config: &CanonicalTrialConfig,
-    online_policy: &CanonicalOnlinePolicyV2,
-    online_authorization: &CanonicalOnlineAuthorizationV2,
-    evidence: &CanonicalReviewedFreshCredentialSlotLocatorEvidenceV1,
-) -> Result<(), PmDeniedSelectedEgressActorError> {
-    let verification = verify_reviewed_fresh_credential_slot_locator_evidence_v1(
-        config,
-        online_policy,
-        online_authorization,
-        evidence,
-    )
-    .map_err(|_| PmDeniedSelectedEgressActorError::ReviewedFreshCredentialLocatorBinding)?;
-    if !verification.exact_v2_bindings_structurally_valid
-        || !verification.canonical_credential_slot_binding_structurally_valid
-        || !verification.fixed_fresh_credential_locator_structurally_valid
-        || verification.source_owned_current_time_checked
-        || verification.protected_credential_directory_and_four_files_checked
-        || verification.loaded_bundle_matches_credential_slot_generation
-        || verification.remote_api_key_owner_attested
-        || verification.authorization_consumption_checked
-        || verification.locator_fingerprint_pinned_by_v2
-        || verification.reviewer_authorship_attested
-        || verification.load_token_consumption_durably_recorded
-        || verification.authorization != OfflineAuthorizationState::DENIED
-    {
-        return Err(PmDeniedSelectedEgressActorError::ReviewedFreshCredentialLocatorBinding);
-    }
-    Ok(())
 }
 
 /// Six fixed TLS peer selections derived solely from the exact canonical
@@ -474,22 +497,20 @@ impl PmSelectedEgressActorGeneration {
     }
 }
 
-/// Synchronous actor-local construction result. It contains no armed task;
-/// the LocalSet-driven assembly transition below is the sole place that starts
-/// fresh credential custody.
+/// Synchronous actor-local construction result. It contains no loaded secret
+/// and no armed task. The whole delivery token remains inside one unopened,
+/// structurally reviewed aggregate until final assembly binds it to the actor
+/// generation.
 struct PmDeniedSelectedEgressActorColdResources {
     selected_http_bundle: PmFixedSelectedEgressHttpBundle,
     observation: PmDeferredObservationRuntimeRoles,
-    credential_owner: FreshStagedObservationCredentialAuthorityOwner,
-    private_read_profile: PmPrivateReadRuntimeProfile,
+    prepared_local_operator_custody: PreparedUnopenedLocalOperatorFreshCredentialCustodyV1,
     reviewed_fixed_tls_peers: PmReviewedFixedTlsPeerBundle,
     selected_local_egress: PmLocalEgressSelection,
     local_egress_custody: PmLinuxEgressLocalFactCustody,
     canonical_config: CanonicalTrialConfig,
     online_authorization: CanonicalOnlineAuthorizationV2,
     online_policy: CanonicalOnlinePolicyV2,
-    reviewed_fresh_credential_locator_evidence:
-        CanonicalReviewedFreshCredentialSlotLocatorEvidenceV1,
     reviewed_destination_profile: CanonicalReviewedProductionDestinationProfileV1,
     reviewed_nonsecret_profile_path: PathBuf,
     window_wall_started: SystemTime,
@@ -500,11 +521,14 @@ struct PmDeniedSelectedEgressActorColdResources {
     generation: Rc<PmSelectedEgressActorGeneration>,
 }
 
-/// All armed production resources remain inseparable and die on their source
-/// thread through the consuming async shutdown implementation.
+/// All denied production resources remain inseparable and die on their source
+/// thread through the consuming async shutdown implementation. The custody
+/// aggregate is unopened and has no realization or projection API here.
 struct PmDeniedSelectedEgressActorResources {
-    selected_observation: PmFreshStagedSelectedObservationRoles,
-    inert_observation: PmInertDeferredObservationCustody,
+    pending_local_operator_custody: GenerationBoundUnopenedLocalOperatorFreshCredentialCustodyV1<
+        PmSelectedEgressActorGeneration,
+    >,
+    observation: PmDeferredObservationRuntimeRoles,
     selected_http_bundle: PmFixedSelectedEgressHttpBundle,
     reviewed_fixed_tls_peers: PmReviewedFixedTlsPeerBundle,
     selected_local_egress: PmLocalEgressSelection,
@@ -512,8 +536,6 @@ struct PmDeniedSelectedEgressActorResources {
     canonical_config: CanonicalTrialConfig,
     online_authorization: CanonicalOnlineAuthorizationV2,
     online_policy: CanonicalOnlinePolicyV2,
-    reviewed_fresh_credential_locator_evidence:
-        CanonicalReviewedFreshCredentialSlotLocatorEvidenceV1,
     reviewed_destination_profile: CanonicalReviewedProductionDestinationProfileV1,
     reviewed_nonsecret_profile_path: PathBuf,
     generation: Rc<PmSelectedEgressActorGeneration>,
@@ -523,40 +545,23 @@ struct PmDeniedSelectedEgressActorResources {
 struct PmSelectedActorTaskShutdownProof {
     shutdown_requested: bool,
     abort_requested: bool,
-    task_joined: bool,
-    task_completed_cleanly: bool,
-    credentials_dropped: bool,
-    staged_files_removed: bool,
+    selected_actor_unopened_custody_holder_dropped: bool,
+    selected_actor_credential_loading_never_started: bool,
+    selected_actor_basename_mutation_never_started: bool,
     generation_revalidated: bool,
 }
 
 impl PmSelectedActorTaskShutdownProof {
-    fn from_credential(
-        credential: CredentialAuthorityShutdownOutcome,
-        generation_revalidated: bool,
-    ) -> Self {
-        Self {
-            shutdown_requested: credential.shutdown_requested(),
-            abort_requested: credential.abort_requested(),
-            task_joined: credential.task_joined(),
-            task_completed_cleanly: credential.task_completed_cleanly(),
-            credentials_dropped: credential.credentials_dropped(),
-            staged_files_removed: credential.staged_l2_files_removed(),
-            generation_revalidated,
-        }
-    }
-
-    const fn credential_clean_terminal(self) -> bool {
+    const fn custody_clean_terminal(self) -> bool {
         self.shutdown_requested
             && !self.abort_requested
-            && self.task_joined
-            && self.task_completed_cleanly
-            && self.credentials_dropped
-            && self.staged_files_removed
+            && self.selected_actor_unopened_custody_holder_dropped
+            && self.selected_actor_credential_loading_never_started
+            && self.selected_actor_basename_mutation_never_started
     }
 
     const fn clean_terminal(self) -> bool {
-        self.credential_clean_terminal() && self.generation_revalidated
+        self.custody_clean_terminal() && self.generation_revalidated
     }
 }
 
@@ -565,10 +570,9 @@ pub(super) struct PmDeniedSelectedEgressShutdownEvidence {
     actor_thread_joined: bool,
     shutdown_requested: bool,
     abort_requested: bool,
-    task_joined: bool,
-    task_completed_cleanly: bool,
-    credentials_dropped: bool,
-    staged_files_removed: bool,
+    selected_actor_unopened_custody_holder_dropped: bool,
+    selected_actor_credential_loading_never_started: bool,
+    selected_actor_basename_mutation_never_started: bool,
     generation_revalidated: bool,
 }
 
@@ -579,17 +583,16 @@ impl PmDeniedSelectedEgressShutdownEvidence {
             && self.generation_revalidated
             && self.shutdown_requested
             && !self.abort_requested
-            && self.task_joined
-            && self.task_completed_cleanly
-            && self.credentials_dropped
-            && self.staged_files_removed
+            && self.selected_actor_unopened_custody_holder_dropped
+            && self.selected_actor_credential_loading_never_started
+            && self.selected_actor_basename_mutation_never_started
     }
 }
 
 impl fmt::Debug for PmDeniedSelectedEgressShutdownEvidence {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(
-            "PmDeniedSelectedEgressShutdownEvidence(<thread joined; credentials terminal; redacted>)",
+            "PmDeniedSelectedEgressShutdownEvidence(<thread joined; unopened custody dropped; no credential load or basename mutation; denied>)",
         )
     }
 }
@@ -637,21 +640,9 @@ pub(super) struct PmDeniedSelectedEgressActorSupervisor {
 
 impl PmDeniedSelectedEgressActorSupervisor {
     pub(super) fn spawn(
-        config: &CanonicalTrialConfig,
-        online_policy: CanonicalOnlinePolicyV2,
-        online_authorization: CanonicalOnlineAuthorizationV2,
-        reviewed_destination_profile: CanonicalReviewedProductionDestinationProfileV1,
-        reviewed_nonsecret_profile_path: &Path,
-        reviewed_fresh_credential_locator: CanonicalReviewedFreshCredentialSlotLocatorV1,
+        inputs: PmDeniedSelectedEgressReviewedInputConjunction<'_, '_>,
     ) -> Result<Self, PmDeniedSelectedEgressActorError> {
-        let startup = PmDeniedSelectedEgressActorStartup::from_exact_config(
-            config,
-            online_policy,
-            online_authorization,
-            reviewed_destination_profile,
-            reviewed_nonsecret_profile_path,
-            reviewed_fresh_credential_locator,
-        )?;
+        let startup = PmDeniedSelectedEgressActorStartup::from_exact_config(inputs)?;
         spawn_selected_egress_actor_thread(move |generation| {
             build_production_cold_resources(startup, generation)
         })
@@ -673,8 +664,8 @@ impl PmDeniedSelectedEgressActorSupervisor {
         self.armed = false;
         let actor = joined.map_err(|_| PmDeniedSelectedEgressActorError::ActorThreadPanicked)??;
         if !actor.clean_terminal() {
-            return if !actor.credential_clean_terminal() {
-                Err(PmDeniedSelectedEgressActorError::CredentialShutdownAbnormal)
+            return if !actor.custody_clean_terminal() {
+                Err(PmDeniedSelectedEgressActorError::CustodyShutdownAbnormal)
             } else {
                 Err(PmDeniedSelectedEgressActorError::ActorThreadChanged)
             };
@@ -686,10 +677,12 @@ impl PmDeniedSelectedEgressActorSupervisor {
             actor_thread_joined: true,
             shutdown_requested: actor.shutdown_requested,
             abort_requested: actor.abort_requested,
-            task_joined: actor.task_joined,
-            task_completed_cleanly: actor.task_completed_cleanly,
-            credentials_dropped: actor.credentials_dropped,
-            staged_files_removed: actor.staged_files_removed,
+            selected_actor_unopened_custody_holder_dropped: actor
+                .selected_actor_unopened_custody_holder_dropped,
+            selected_actor_credential_loading_never_started: actor
+                .selected_actor_credential_loading_never_started,
+            selected_actor_basename_mutation_never_started: actor
+                .selected_actor_basename_mutation_never_started,
             generation_revalidated: actor.generation_revalidated,
         };
         debug_assert!(evidence.clean_terminal());
@@ -724,12 +717,9 @@ fn build_production_cold_resources(
         online_authorization,
         reviewed_destination_profile,
         reviewed_nonsecret_profile_path,
-        reviewed_fresh_credential_locator_evidence,
-        reviewed_fresh_credential_load_token,
+        prepared_local_operator_custody,
         position_scope,
         scope,
-        signer,
-        proxy_funder,
         parser_config,
         maximum_fact_age,
     } = startup;
@@ -742,13 +732,7 @@ fn build_production_cold_resources(
     .map_err(|_| PmDeniedSelectedEgressActorError::LocalFactCapture)?;
     let window_wall_completed = SystemTime::now();
     let window_monotonic_completed = Instant::now();
-    let (
-        selected_local_egress,
-        reviewed_fixed_tls_peers,
-        selected_http_bundle,
-        observation,
-        private_read_profile,
-    ) = {
+    let (selected_local_egress, reviewed_fixed_tls_peers, selected_http_bundle, observation) = {
         let revalidated_local_egress = local_egress_custody
             .revalidate_for_current_runtime(
                 &online_authorization,
@@ -784,17 +768,6 @@ fn build_production_cold_resources(
             ConnectionEpoch::new(1),
         )
         .map_err(|_| PmDeniedSelectedEgressActorError::ObservationConfiguration)?;
-        let user_ws_bounds = PmUserWsBounds::new(
-            FIXED_HTTP_CONNECT_TIMEOUT,
-            FIXED_WS_IDLE_TIMEOUT,
-            FIXED_WS_PONG_TIMEOUT,
-            MAX_PM_LIVE_BODY_BYTES,
-            FIXED_WS_RECONNECT_ATTEMPTS,
-            FIXED_WS_RECONNECT_BACKOFF,
-            FIXED_WS_EVENT_CHANNEL_CAPACITY,
-            ConnectionEpoch::new(1),
-        )
-        .map_err(|_| PmDeniedSelectedEgressActorError::ObservationConfiguration)?;
         let public_ws_config = PmPublicWsConfig::production(scope, public_ws_bounds)
             .map_err(|_| PmDeniedSelectedEgressActorError::ObservationConfiguration)?;
         let observation_owner = PmPublicObservationWithDeferredMutationClockOwner::
@@ -812,31 +785,16 @@ fn build_production_cold_resources(
             return Err(PmDeniedSelectedEgressActorError::ObservationConfiguration);
         }
         let observation = PmDeferredObservationRuntimeRoles::from_owner(observation_owner);
-        let private_read_profile = PmPrivateReadRuntimeProfile::new(
-            FIXED_HTTP_CONNECT_TIMEOUT,
-            FIXED_HTTP_REQUEST_TIMEOUT,
-            scope,
-            user_ws_bounds,
-            signer,
-            proxy_funder,
-        );
         if selection.interface_name() != revalidated_local_egress.interface_name()
             || selection.local_source_ip() != revalidated_local_egress.local_source_ip()
         {
             return Err(PmDeniedSelectedEgressActorError::LocalSelection);
         }
-        (
-            selection,
-            fixed_peers,
-            bundle,
-            observation,
-            private_read_profile,
-        )
+        (selection, fixed_peers, bundle, observation)
     };
-    // Close all nonsecret construction drift before the authority privately
-    // consumes the reviewed holder's one-shot load token into protected
-    // custody. This remains denied and makes no slot-generation or
-    // remote-owner claim.
+    // Close all non-secret construction drift before retaining the still-whole
+    // token in cold resources. No token consumption, credential load, lease,
+    // descriptor open, or remote-owner claim occurs here.
     let post_constructor_local_egress = local_egress_custody
         .revalidate_for_current_runtime(
             &online_authorization,
@@ -855,30 +813,16 @@ fn build_production_cold_resources(
     }
     drop(post_constructor_local_egress);
     generation.revalidate()?;
-    revalidate_reviewed_fresh_credential_locator_evidence(
-        &canonical_config,
-        &online_policy,
-        &online_authorization,
-        &reviewed_fresh_credential_locator_evidence,
-    )?;
-    let credential_owner =
-        FreshStagedObservationCredentialAuthorityOwner::load_from_reviewed_fresh_token(
-            reviewed_fresh_credential_load_token,
-        )
-        .map_err(|_| PmDeniedSelectedEgressActorError::FreshCredentialLoad)?;
-    generation.revalidate()?;
     Ok(PmDeniedSelectedEgressActorColdResources {
         selected_http_bundle,
         observation,
-        credential_owner,
-        private_read_profile,
+        prepared_local_operator_custody,
         reviewed_fixed_tls_peers,
         selected_local_egress,
         local_egress_custody,
         canonical_config,
         online_authorization,
         online_policy,
-        reviewed_fresh_credential_locator_evidence,
         reviewed_destination_profile,
         reviewed_nonsecret_profile_path,
         window_wall_started,
@@ -896,20 +840,18 @@ impl PmSelectedEgressActorColdResources for PmDeniedSelectedEgressActorColdResou
 
     async fn assemble(
         self,
-        local_set: &LocalSet,
+        _local_set: &LocalSet,
     ) -> Result<Self::Armed, PmDeniedSelectedEgressActorError> {
         let Self {
             selected_http_bundle,
             observation,
-            credential_owner,
-            private_read_profile,
+            prepared_local_operator_custody,
             reviewed_fixed_tls_peers,
             selected_local_egress,
             mut local_egress_custody,
             canonical_config,
             online_authorization,
             online_policy,
-            reviewed_fresh_credential_locator_evidence,
             reviewed_destination_profile,
             reviewed_nonsecret_profile_path,
             window_wall_started,
@@ -920,72 +862,33 @@ impl PmSelectedEgressActorColdResources for PmDeniedSelectedEgressActorColdResou
             generation,
         } = self;
         generation.revalidate()?;
-        let (selected_observation, inert_observation) = match observation
-            .production_selected(
-                credential_owner,
-                local_set,
-                private_read_profile,
-                reviewed_fixed_tls_peers.clob_https.clone(),
-                reviewed_fixed_tls_peers.clob_websocket_wss.clone(),
-                selected_local_egress.clone(),
-                DEFAULT_AUTHORITY_SHUTDOWN_BOUNDS,
-            )
-            .await
-        {
-            Ok(selected) => selected,
-            Err(error) => return Err(map_selected_observation_error(error)),
-        };
-
-        let post_assembly_revalidation = {
-            match local_egress_custody.revalidate_for_current_runtime(
+        let final_local_egress = local_egress_custody
+            .revalidate_for_current_runtime(
                 &online_authorization,
                 window_wall_started,
                 window_wall_completed,
                 window_monotonic_started,
                 window_monotonic_completed,
                 maximum_fact_age,
-            ) {
-                Ok(facts)
-                    if selected_local_egress.interface_name() == facts.interface_name()
-                        && selected_local_egress.local_source_ip() == facts.local_source_ip() =>
-                {
-                    Ok(())
-                }
-                Ok(_) => Err(PmDeniedSelectedEgressActorError::LocalSelection),
-                Err(_) => Err(PmDeniedSelectedEgressActorError::LocalFactRevalidation),
-            }
-        };
-        if let Err(primary) = post_assembly_revalidation {
-            drop(inert_observation);
-            return Err(shutdown_selected_after_failure(selected_observation, primary).await);
-        }
-        if revalidate_reviewed_fresh_credential_locator_evidence(
-            &canonical_config,
-            &online_policy,
-            &online_authorization,
-            &reviewed_fresh_credential_locator_evidence,
-        )
-        .is_err()
+            )
+            .map_err(|_| PmDeniedSelectedEgressActorError::LocalFactRevalidation)?;
+        if selected_local_egress.interface_name() != final_local_egress.interface_name()
+            || selected_local_egress.local_source_ip() != final_local_egress.local_source_ip()
         {
-            drop(inert_observation);
-            return Err(shutdown_selected_after_failure(
-                selected_observation,
-                PmDeniedSelectedEgressActorError::ReviewedFreshCredentialLocatorBinding,
-            )
-            .await);
+            return Err(PmDeniedSelectedEgressActorError::LocalSelection);
         }
-        if generation.revalidate().is_err() {
-            drop(inert_observation);
-            return Err(shutdown_selected_after_failure(
-                selected_observation,
-                PmDeniedSelectedEgressActorError::ActorThreadChanged,
-            )
-            .await);
-        }
+        drop(final_local_egress);
+        generation.revalidate()?;
+        let custody_generation = Rc::clone(&generation);
+        generation.revalidate()?;
+        // This is deliberately the last transition: it is infallible, retains
+        // the whole token unopened, and grants no way to realize or project it.
+        let pending_local_operator_custody =
+            prepared_local_operator_custody.bind_to_actor_generation(custody_generation);
 
         Ok(PmDeniedSelectedEgressActorResources {
-            selected_observation,
-            inert_observation,
+            pending_local_operator_custody,
+            observation,
             selected_http_bundle,
             reviewed_fixed_tls_peers,
             selected_local_egress,
@@ -993,48 +896,10 @@ impl PmSelectedEgressActorColdResources for PmDeniedSelectedEgressActorColdResou
             canonical_config,
             online_authorization,
             online_policy,
-            reviewed_fresh_credential_locator_evidence,
             reviewed_destination_profile,
             reviewed_nonsecret_profile_path,
             generation,
         })
-    }
-}
-
-fn map_selected_observation_error(
-    error: PmPrivateReadRuntimeError,
-) -> PmDeniedSelectedEgressActorError {
-    match error {
-        PmPrivateReadRuntimeError::StagedObservationCleanupFailed { .. } => {
-            PmDeniedSelectedEgressActorError::CredentialCleanup
-        }
-        PmPrivateReadRuntimeError::StagedObservationCleanupAbnormal { .. } => {
-            PmDeniedSelectedEgressActorError::CredentialShutdownAbnormal
-        }
-        _ => PmDeniedSelectedEgressActorError::SelectedObservationAssembly,
-    }
-}
-
-fn clean_credential_shutdown(outcome: CredentialAuthorityShutdownOutcome) -> bool {
-    outcome.shutdown_requested()
-        && !outcome.abort_requested()
-        && outcome.task_joined()
-        && outcome.task_completed_cleanly()
-        && outcome.credentials_dropped()
-        && outcome.staged_l2_files_removed()
-}
-
-async fn shutdown_selected_after_failure(
-    selected: PmFreshStagedSelectedObservationRoles,
-    primary: PmDeniedSelectedEgressActorError,
-) -> PmDeniedSelectedEgressActorError {
-    match selected
-        .shutdown_bounded(DEFAULT_AUTHORITY_SHUTDOWN_BOUNDS)
-        .await
-    {
-        Ok(outcome) if clean_credential_shutdown(outcome) => primary,
-        Ok(_) => PmDeniedSelectedEgressActorError::CredentialShutdownAbnormal,
-        Err(_) => PmDeniedSelectedEgressActorError::CredentialCleanup,
     }
 }
 
@@ -1048,8 +913,8 @@ impl PmSelectedEgressActorResources for PmDeniedSelectedEgressActorResources {
         self,
     ) -> Result<PmSelectedActorTaskShutdownProof, PmDeniedSelectedEgressActorError> {
         let Self {
-            selected_observation,
-            inert_observation,
+            pending_local_operator_custody,
+            observation,
             selected_http_bundle,
             reviewed_fixed_tls_peers,
             selected_local_egress,
@@ -1057,26 +922,16 @@ impl PmSelectedEgressActorResources for PmDeniedSelectedEgressActorResources {
             canonical_config,
             online_authorization,
             online_policy,
-            reviewed_fresh_credential_locator_evidence,
             reviewed_destination_profile,
             reviewed_nonsecret_profile_path,
             generation,
         } = self;
         let generation_revalidated = generation.revalidate().is_ok();
-        let reviewed_locator_revalidation = revalidate_reviewed_fresh_credential_locator_evidence(
-            &canonical_config,
-            &online_policy,
-            &online_authorization,
-            &reviewed_fresh_credential_locator_evidence,
-        );
-        drop(inert_observation);
-        let credential = selected_observation
-            .shutdown_bounded(DEFAULT_AUTHORITY_SHUTDOWN_BOUNDS)
-            .await;
-        // Credential providers and their task are terminal before the retained
-        // locator evidence, fixed clients, route selections, local-fact
-        // descriptor custody, and canonical records are released.
-        drop(reviewed_fresh_credential_locator_evidence);
+        // Only the unopened holder is dropped. No credential owner/task,
+        // credential directory/source descriptor, cooperative credential
+        // lease, or credential-basename mutation exists in this actor.
+        drop(pending_local_operator_custody);
+        drop(observation);
         drop(selected_http_bundle);
         drop(reviewed_fixed_tls_peers);
         drop(selected_local_egress);
@@ -1087,21 +942,14 @@ impl PmSelectedEgressActorResources for PmDeniedSelectedEgressActorResources {
         drop(reviewed_destination_profile);
         drop(reviewed_nonsecret_profile_path);
         drop(generation);
-
-        let credential = match credential {
-            Ok(credential) => credential,
-            Err(_) => return Err(PmDeniedSelectedEgressActorError::CredentialCleanup),
-        };
-        let proof =
-            PmSelectedActorTaskShutdownProof::from_credential(credential, generation_revalidated);
-        // Preserve credential abnormality and actor-generation failure ahead
-        // of an immutable locator-record error. All three remain ahead of a
-        // failed command delivery in the joined supervisor.
-        if !proof.credential_clean_terminal() || !generation_revalidated {
-            return Ok(proof);
-        }
-        reviewed_locator_revalidation?;
-        Ok(proof)
+        Ok(PmSelectedActorTaskShutdownProof {
+            shutdown_requested: true,
+            abort_requested: false,
+            selected_actor_unopened_custody_holder_dropped: true,
+            selected_actor_credential_loading_never_started: true,
+            selected_actor_basename_mutation_never_started: true,
+            generation_revalidated,
+        })
     }
 }
 
@@ -1158,9 +1006,10 @@ where
 {
     let generation = Rc::new(PmSelectedEgressActorGeneration::current());
     generation.revalidate()?;
-    // Build the runtime/LocalSet before setup follows the reviewed locator into
-    // the protected directory. A runtime-construction failure is therefore
-    // pre-arm and intentionally leaves all staged secret files for retry.
+    // Build the runtime/LocalSet before setup retains the unopened reviewed
+    // custody aggregate. This actor never follows the locator into a
+    // credential directory, so runtime-construction failure cannot load a
+    // credential or mutate a credential basename.
     let runtime = TokioRuntimeBuilder::new_current_thread()
         .enable_all()
         .build()
@@ -1249,8 +1098,8 @@ async fn shutdown_resources_after_error<R: PmSelectedEgressActorResources>(
     primary: PmDeniedSelectedEgressActorError,
 ) -> Result<PmSelectedActorTaskShutdownProof, PmDeniedSelectedEgressActorError> {
     match resources.shutdown().await {
-        Ok(proof) if !proof.credential_clean_terminal() => {
-            Err(PmDeniedSelectedEgressActorError::CredentialShutdownAbnormal)
+        Ok(proof) if !proof.custody_clean_terminal() => {
+            Err(PmDeniedSelectedEgressActorError::CustodyShutdownAbnormal)
         }
         Ok(proof) if !proof.generation_revalidated => {
             Err(PmDeniedSelectedEgressActorError::ActorThreadChanged)
@@ -1317,10 +1166,9 @@ mod tests {
             Ok(PmSelectedActorTaskShutdownProof {
                 shutdown_requested: true,
                 abort_requested: !clean_shutdown,
-                task_joined: true,
-                task_completed_cleanly: clean_shutdown,
-                credentials_dropped: true,
-                staged_files_removed: true,
+                selected_actor_unopened_custody_holder_dropped: clean_shutdown,
+                selected_actor_credential_loading_never_started: true,
+                selected_actor_basename_mutation_never_started: true,
                 generation_revalidated: true,
             })
         }
@@ -1481,7 +1329,7 @@ mod tests {
     }
 
     #[test]
-    fn actor_cleanup_error_precedes_shutdown_delivery_error() {
+    fn actor_custody_error_precedes_shutdown_delivery_error() {
         let (events, _received) = mpsc::channel();
         let mut supervisor = spawn_selected_egress_actor_thread(move |generation| {
             Ok(TestResources {
@@ -1497,8 +1345,8 @@ mod tests {
         assert_eq!(
             supervisor
                 .shutdown_and_join()
-                .expect_err("abnormal cleanup must outrank failed Shutdown delivery"),
-            PmDeniedSelectedEgressActorError::CredentialShutdownAbnormal,
+                .expect_err("abnormal custody shutdown must outrank failed Shutdown delivery"),
+            PmDeniedSelectedEgressActorError::CustodyShutdownAbnormal,
         );
     }
 
@@ -1511,16 +1359,15 @@ mod tests {
             actor_thread_joined: true,
             shutdown_requested: true,
             abort_requested: false,
-            task_joined: true,
-            task_completed_cleanly: true,
-            credentials_dropped: true,
-            staged_files_removed: true,
+            selected_actor_unopened_custody_holder_dropped: true,
+            selected_actor_credential_loading_never_started: true,
+            selected_actor_basename_mutation_never_started: true,
             generation_revalidated: true,
         };
         assert!(evidence.clean_terminal());
         assert_eq!(
             format!("{evidence:?}"),
-            "PmDeniedSelectedEgressShutdownEvidence(<thread joined; credentials terminal; redacted>)",
+            "PmDeniedSelectedEgressShutdownEvidence(<thread joined; unopened custody dropped; no credential load or basename mutation; denied>)",
         );
     }
 }

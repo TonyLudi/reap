@@ -26,6 +26,7 @@ use result_wire::{RawCancelResult, RawPlaceResult};
 
 pub const MAX_PM_LIVE_BODY_BYTES: usize = 1_048_576;
 pub const MAX_PM_LIVE_PAGE_ITEMS: usize = 128;
+const MAX_PM_LIVE_DECLARED_PAGE_LIMIT: usize = 300;
 pub const MAX_PM_LIVE_CURSOR_BYTES: usize = 256;
 const MAX_PM_LIVE_USER_EVENTS: usize = 64;
 const MAX_PM_LIVE_MAKER_ORDERS: usize = 64;
@@ -58,6 +59,10 @@ pub enum PmLiveWireError {
     InvalidCursor,
     #[error("authenticated Polymarket page limit/count contradicts its bounded data")]
     InvalidPageMetadata,
+    #[error("authenticated Polymarket page declares unsupported limit {observed}")]
+    UnsupportedPageLimit { observed: usize },
+    #[error("authenticated Polymarket page count {declared} does not match returned rows {actual}")]
+    PageCountMismatch { declared: usize, actual: usize },
     #[error("authenticated Polymarket allowance map is absent")]
     MissingAllowanceMap,
     #[error("authenticated Polymarket allowance map contains duplicate canonical spenders")]
@@ -681,6 +686,22 @@ pub fn parse_live_open_order_page(raw: &[u8]) -> Result<PmLiveOpenOrderPage, PmL
 }
 
 pub fn parse_live_trade_page(raw: &[u8]) -> Result<PmLiveTradePage, PmLiveWireError> {
+    parse_live_trade_page_with_fee_evidence(raw, true)
+}
+
+/// Parse the exact-scope trade projection used solely for owned-fill and
+/// position reconciliation. Fee-rate evidence is deliberately omitted: it
+/// does not participate in fill identity, side, quantity, price, ownership,
+/// or settlement, and current CLOB V2 maker legs may use fractional fee text
+/// that the integer fee projection cannot represent.
+pub fn parse_live_owned_fill_trade_page(raw: &[u8]) -> Result<PmLiveTradePage, PmLiveWireError> {
+    parse_live_trade_page_with_fee_evidence(raw, false)
+}
+
+fn parse_live_trade_page_with_fee_evidence(
+    raw: &[u8],
+    retain_fee_evidence: bool,
+) -> Result<PmLiveTradePage, PmLiveWireError> {
     check_body(raw)?;
     let page = serde_json::from_slice::<RawPage<RawRestTrade>>(raw)
         .map_err(|_| PmLiveWireError::MalformedJson)?;
@@ -689,7 +710,7 @@ pub fn parse_live_trade_page(raw: &[u8]) -> Result<PmLiveTradePage, PmLiveWireEr
     let trades = page
         .data
         .into_iter()
-        .map(PmLiveTrade::try_from)
+        .map(|trade| PmLiveTrade::from_rest(trade, retain_fee_evidence))
         .collect::<Result<Vec<_>, _>>()?;
     let (next_cursor, terminal) = parse_cursor(page.next_cursor)?;
     Ok(PmLiveTradePage {
@@ -883,11 +904,19 @@ fn validate_page_metadata(
     limit: usize,
     count: usize,
 ) -> Result<(), PmLiveWireError> {
-    if limit == 0 || limit > MAX_PM_LIVE_PAGE_ITEMS || data_len > limit || count != data_len {
-        Err(PmLiveWireError::InvalidPageMetadata)
-    } else {
-        Ok(())
+    if limit == 0 || data_len > limit {
+        return Err(PmLiveWireError::InvalidPageMetadata);
     }
+    if limit > MAX_PM_LIVE_DECLARED_PAGE_LIMIT {
+        return Err(PmLiveWireError::UnsupportedPageLimit { observed: limit });
+    }
+    if count != data_len {
+        return Err(PmLiveWireError::PageCountMismatch {
+            declared: count,
+            actual: data_len,
+        });
+    }
+    Ok(())
 }
 
 fn bounded(value: String, field: &'static str) -> Result<String, PmLiveWireError> {
@@ -1031,6 +1060,12 @@ impl TryFrom<RawOrder> for PmLiveOrder {
 impl TryFrom<RawMakerOrder> for PmLiveMakerOrder {
     type Error = PmLiveWireError;
     fn try_from(wire: RawMakerOrder) -> Result<Self, Self::Error> {
+        Self::from_raw(wire, true)
+    }
+}
+
+impl PmLiveMakerOrder {
+    fn from_raw(wire: RawMakerOrder, retain_fee_evidence: bool) -> Result<Self, PmLiveWireError> {
         let owner = parse_credential_owner(wire.owner, "maker_orders.owner")?;
         Ok(Self {
             order_id: parse_order_id(&wire.order_id, "maker_orders.order_id")?,
@@ -1040,10 +1075,11 @@ impl TryFrom<RawMakerOrder> for PmLiveMakerOrder {
                 .map_err(|_| PmLiveWireError::InvalidNumeric("maker_orders.price"))?,
             matched_amount: PmQuantity::parse_decimal(&wire.matched_amount)
                 .map_err(|_| PmLiveWireError::InvalidNumeric("maker_orders.matched_amount"))?,
-            fee_rate_bps: parse_optional_fee_rate_bps(
-                wire.fee_rate_bps,
-                "maker_orders.fee_rate_bps",
-            )?,
+            fee_rate_bps: if retain_fee_evidence {
+                parse_optional_fee_rate_bps(wire.fee_rate_bps, "maker_orders.fee_rate_bps")?
+            } else {
+                None
+            },
             owner,
             maker: EvmAddress::parse(&wire.maker_address)
                 .map_err(|_| PmLiveWireError::InvalidIdentity("maker_orders.maker_address"))?,
@@ -1056,12 +1092,13 @@ impl PmLiveTrade {
         wire: RawTradeCore,
         owner: PmCredentialOwner,
         last_update: Option<u64>,
+        retain_fee_evidence: bool,
     ) -> Result<Self, PmLiveWireError> {
         check_items(wire.maker_orders.len(), MAX_PM_LIVE_MAKER_ORDERS)?;
         let maker_orders = wire
             .maker_orders
             .into_iter()
-            .map(PmLiveMakerOrder::try_from)
+            .map(|maker| PmLiveMakerOrder::from_raw(maker, retain_fee_evidence))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             id: PmFillId::new(&wire.id).map_err(|_| PmLiveWireError::InvalidIdentity("id"))?,
@@ -1083,7 +1120,11 @@ impl PmLiveTrade {
                 .transpose()?,
             trader_side: optional_bounded(wire.trader_side, "trader_side")?,
             transaction_hash: optional_empty_bounded(wire.transaction_hash, "transaction_hash")?,
-            fee_rate_bps: parse_optional_fee_rate_bps(wire.fee_rate_bps, "fee_rate_bps")?,
+            fee_rate_bps: if retain_fee_evidence {
+                parse_optional_fee_rate_bps(wire.fee_rate_bps, "fee_rate_bps")?
+            } else {
+                None
+            },
             maker_orders: maker_orders.into_boxed_slice(),
             maker: None,
             owner,
@@ -1099,10 +1140,16 @@ impl TryFrom<RawRestTrade> for PmLiveTrade {
     type Error = PmLiveWireError;
 
     fn try_from(wire: RawRestTrade) -> Result<Self, Self::Error> {
+        Self::from_rest(wire, true)
+    }
+}
+
+impl PmLiveTrade {
+    fn from_rest(wire: RawRestTrade, retain_fee_evidence: bool) -> Result<Self, PmLiveWireError> {
         let owner = parse_credential_owner(wire.owner, "owner")?;
         let match_time = parse_timestamp(&wire.match_time, "match_time")?;
         let last_update = parse_timestamp(&wire.last_update, "last_update")?;
-        let mut trade = Self::from_core(wire.trade, owner, Some(last_update))?;
+        let mut trade = Self::from_core(wire.trade, owner, Some(last_update), retain_fee_evidence)?;
         trade.maker = Some(
             EvmAddress::parse(&wire.maker_address)
                 .map_err(|_| PmLiveWireError::InvalidIdentity("maker_address"))?,
@@ -1230,7 +1277,7 @@ impl TryFrom<RawUserTrade> for PmLiveTrade {
                     .map_err(|_| PmLiveWireError::InvalidIdentity("maker_address"))
             })
             .transpose()?;
-        let mut trade = Self::from_core(wire.trade, owner, last_update)?;
+        let mut trade = Self::from_core(wire.trade, owner, last_update, true)?;
         trade.maker = maker;
         trade.trade_owner = trade_owner;
         trade.timestamp = timestamp;
@@ -1752,6 +1799,33 @@ mod tests {
             parse_live_trade_page(&serde_json::to_vec(&page).unwrap()).expect("REST zero fee rate");
         assert_eq!(page.trades()[0].fee_rate_bps(), Some(U256::ZERO));
 
+        let mut fractional = serde_json::from_str::<serde_json::Value>(&trade_json()).unwrap();
+        fractional["maker_orders"] = serde_json::json!([{
+            "order_id": ORDER_2,
+            "asset_id": "123",
+            "side": "BUY",
+            "price": "0.420000",
+            "matched_amount": "2.500000",
+            "fee_rate_bps": "12.5",
+            "owner": API_OWNER,
+            "maker_address": MAKER,
+        }]);
+        let fractional_page = serde_json::json!({
+            "data": [fractional],
+            "next_cursor": "LTE=",
+            "limit": 300,
+            "count": 1
+        });
+        let fractional_bytes = serde_json::to_vec(&fractional_page).unwrap();
+        assert_eq!(
+            parse_live_trade_page(&fractional_bytes),
+            Err(PmLiveWireError::InvalidNumeric("maker_orders.fee_rate_bps"))
+        );
+        let owned = parse_live_owned_fill_trade_page(&fractional_bytes)
+            .expect("owned-fill projection ignores unrepresentable fee text");
+        assert_eq!(owned.trades()[0].fee_rate_bps(), None);
+        assert_eq!(owned.trades()[0].maker_orders()[0].fee_rate_bps(), None);
+
         assert_eq!(
             parse_user(Some(serde_json::json!(0)), None),
             Err(PmLiveWireError::MalformedJson),
@@ -1980,11 +2054,21 @@ mod tests {
         assert_eq!(delayed.making_amount(), None);
         assert_eq!(delayed.taking_amount(), None);
 
-        let wrong_spelling = format!(
+        let v2_sdk_spelling = format!(
             r#"{{"success":true,"orderID":"{ORDER_1}","status":"live","errorMsg":"","makingAmount":"1","takingAmount":"1","tradeIds":[]}}"#
         );
+        assert!(parse_live_place_result(v2_sdk_spelling.as_bytes()).is_ok());
+
+        let without_optional_execution_ids = format!(
+            r#"{{"success":true,"orderID":"{ORDER_1}","status":"live","errorMsg":"","makingAmount":"1","takingAmount":"1"}}"#
+        );
+        assert!(parse_live_place_result(without_optional_execution_ids.as_bytes()).is_ok());
+
+        let duplicate_aliases = format!(
+            r#"{{"success":true,"orderID":"{ORDER_1}","status":"live","errorMsg":"","makingAmount":"1","takingAmount":"1","tradeIDs":[],"tradeIds":[]}}"#
+        );
         assert_eq!(
-            parse_live_place_result(wrong_spelling.as_bytes()),
+            parse_live_place_result(duplicate_aliases.as_bytes()),
             Err(PmLiveWireError::MalformedJson)
         );
     }
@@ -2046,12 +2130,19 @@ mod tests {
         );
 
         assert_eq!(
-            parse_live_trade_page(br#"{"data":[],"next_cursor":"LTE=","limit":129,"count":0}"#),
-            Err(PmLiveWireError::InvalidPageMetadata)
+            parse_live_trade_page(br#"{"data":[],"next_cursor":"LTE=","limit":301,"count":0}"#),
+            Err(PmLiveWireError::UnsupportedPageLimit { observed: 301 })
+        );
+        assert!(
+            parse_live_trade_page(br#"{"data":[],"next_cursor":"LTE=","limit":300,"count":0}"#)
+                .is_ok()
         );
         assert_eq!(
             parse_live_trade_page(br#"{"data":[],"next_cursor":"LTE=","limit":128,"count":1}"#),
-            Err(PmLiveWireError::InvalidPageMetadata)
+            Err(PmLiveWireError::PageCountMismatch {
+                declared: 1,
+                actual: 0,
+            })
         );
         assert_eq!(
             parse_live_trade_page(br#"{"data":[],"limit":128,"count":0}"#),

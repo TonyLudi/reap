@@ -2,9 +2,10 @@ use std::fmt;
 
 use reap_pm_core::U256;
 use reap_polymarket_auth::{
-    AuthenticatedOwnedCancelRequest, AuthenticatedPlaceRequest, ExpectedOrderId, FixedOrderId,
-    FixedOwnedCancelRequestSink, FixedPlaceRequestSink, OwnedCancelSemanticRequestCommitment,
-    PlaceSemanticRequestCommitment, RuntimeExactBodyCommitment,
+    AuthenticatedGtcFillPlaceRequest, AuthenticatedOwnedCancelRequest, AuthenticatedPlaceRequest,
+    ExpectedOrderId, FixedGtcFillPlaceRequestSink, FixedOrderId, FixedOwnedCancelRequestSink,
+    FixedPlaceRequestSink, OwnedCancelSemanticRequestCommitment, PlaceSemanticRequestCommitment,
+    RuntimeExactBodyCommitment,
 };
 use zeroize::Zeroizing;
 
@@ -172,6 +173,88 @@ impl fmt::Debug for PmRetainedPlaceRequest {
     }
 }
 
+/// Move-only retained GTC/non-post-only fill request. Its distinct type keeps
+/// marketable authority out of the ordinary post-only production role.
+pub struct PmRetainedGtcFillPlaceRequest {
+    pub(super) headers: RetainedL2Headers,
+    pub(super) body: Zeroizing<Vec<u8>>,
+    expected_order_id: ExpectedOrderId,
+    expected_making_amount: U256,
+    expected_taking_amount: U256,
+    runtime_exact_body_commitment: RuntimeExactBodyCommitment,
+    semantic_request_commitment: PlaceSemanticRequestCommitment,
+    l2_timestamp_seconds: u64,
+}
+
+impl PmRetainedGtcFillPlaceRequest {
+    pub fn retain(request: AuthenticatedGtcFillPlaceRequest) -> Result<Self, PmMutationEdgeError> {
+        let mut sink = GtcFillPlaceRetentionSink {
+            expected_order_id: request.expected_order_id(),
+            expected_making_amount: request.expected_making_amount(),
+            expected_taking_amount: request.expected_taking_amount(),
+            runtime_exact_body_commitment: request.runtime_exact_body_commitment(),
+            semantic_request_commitment: request.semantic_request_commitment(),
+        };
+        request.dispatch(&mut sink)
+    }
+
+    #[must_use]
+    pub const fn expected_order_id(&self) -> ExpectedOrderId {
+        self.expected_order_id
+    }
+
+    #[must_use]
+    pub const fn runtime_exact_body_commitment(&self) -> RuntimeExactBodyCommitment {
+        self.runtime_exact_body_commitment
+    }
+
+    #[must_use]
+    pub const fn semantic_request_commitment(&self) -> PlaceSemanticRequestCommitment {
+        self.semantic_request_commitment
+    }
+
+    #[must_use]
+    pub const fn expected_making_amount(&self) -> U256 {
+        self.expected_making_amount
+    }
+
+    #[must_use]
+    pub const fn expected_taking_amount(&self) -> U256 {
+        self.expected_taking_amount
+    }
+
+    #[must_use]
+    pub const fn l2_timestamp_seconds(&self) -> u64 {
+        self.l2_timestamp_seconds
+    }
+
+    pub(super) fn remains_valid(&self) -> bool {
+        self.headers.remains_valid()
+            && !self.body.is_empty()
+            && self.body.len() <= MAX_RETAINED_PLACE_BODY_BYTES
+            && self.headers.timestamp.parse::<u64>().ok() == Some(self.l2_timestamp_seconds)
+    }
+}
+
+impl fmt::Debug for PmRetainedGtcFillPlaceRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PmRetainedGtcFillPlaceRequest")
+            .field("headers", &"[REDACTED]")
+            .field("body", &"[REDACTED]")
+            .field("expected_order_id", &self.expected_order_id)
+            .field("expected_making_amount", &self.expected_making_amount)
+            .field("expected_taking_amount", &self.expected_taking_amount)
+            .field("runtime_exact_body_commitment", &"[REDACTED; NON_DURABLE]")
+            .field(
+                "semantic_request_commitment",
+                &self.semantic_request_commitment,
+            )
+            .field("l2_timestamp_seconds", &self.l2_timestamp_seconds)
+            .finish()
+    }
+}
+
 /// A move-only retained exact-owned cancel request. It retains the
 /// authenticated request byte-for-byte, its runtime-only exact-body
 /// correlation, and the separate secret-free semantic identity.
@@ -252,6 +335,62 @@ struct PlaceRetentionSink {
     expected_taking_amount: U256,
     runtime_exact_body_commitment: RuntimeExactBodyCommitment,
     semantic_request_commitment: PlaceSemanticRequestCommitment,
+}
+
+struct GtcFillPlaceRetentionSink {
+    expected_order_id: ExpectedOrderId,
+    expected_making_amount: U256,
+    expected_taking_amount: U256,
+    runtime_exact_body_commitment: RuntimeExactBodyCommitment,
+    semantic_request_commitment: PlaceSemanticRequestCommitment,
+}
+
+impl FixedGtcFillPlaceRequestSink for GtcFillPlaceRetentionSink {
+    type Output = PmRetainedGtcFillPlaceRequest;
+    type Error = PmMutationEdgeError;
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the retention sink validates the complete fixed-purpose auth and amount boundary"
+    )]
+    fn send_gtc_fill(
+        &mut self,
+        poly_address: &str,
+        poly_signature: &str,
+        poly_timestamp: &str,
+        poly_api_key: &str,
+        poly_passphrase: &str,
+        expected_making_amount: U256,
+        expected_taking_amount: U256,
+        exact_body: &[u8],
+    ) -> Result<Self::Output, Self::Error> {
+        if exact_body.is_empty()
+            || exact_body.len() > MAX_RETAINED_PLACE_BODY_BYTES
+            || expected_making_amount != self.expected_making_amount
+            || expected_taking_amount != self.expected_taking_amount
+        {
+            return Err(PmMutationEdgeError::InvalidAuthenticatedRequest);
+        }
+        let l2_timestamp_seconds = poly_timestamp
+            .parse()
+            .map_err(|_| PmMutationEdgeError::InvalidAuthenticatedRequest)?;
+        Ok(PmRetainedGtcFillPlaceRequest {
+            headers: RetainedL2Headers::copy_validated(
+                poly_address,
+                poly_signature,
+                poly_timestamp,
+                poly_api_key,
+                poly_passphrase,
+            )?,
+            body: Zeroizing::new(exact_body.to_vec()),
+            expected_order_id: self.expected_order_id,
+            expected_making_amount,
+            expected_taking_amount,
+            runtime_exact_body_commitment: self.runtime_exact_body_commitment,
+            semantic_request_commitment: self.semantic_request_commitment,
+            l2_timestamp_seconds,
+        })
+    }
 }
 
 impl FixedPlaceRequestSink for PlaceRetentionSink {

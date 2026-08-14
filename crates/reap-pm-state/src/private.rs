@@ -827,7 +827,7 @@ impl PmPrivateState {
                     PmReservationTotalsError::Overflow => PmPrivateStateError::ArithmeticOverflow,
                 })?;
         let inventory = self
-            .effective_inventory()
+            .effective_position()
             .ok_or(PmPrivateStateError::CanonicalInventoryUnavailable)?;
         let dependencies = PmRiskDependencies::new(
             reference,
@@ -1279,7 +1279,10 @@ impl PmPrivateState {
             .or(self.risk.market_halt())
     }
 
-    fn effective_inventory(&self) -> Option<PmSignedUnits> {
+    /// Last published outcome position plus unique locally observed fills
+    /// that are not yet covered by reconciliation.
+    #[must_use]
+    pub fn effective_position(&self) -> Option<PmSignedUnits> {
         let published = self.account.position().tradable_units()?;
         if self.account.outcome_balance().value()? != published {
             return None;

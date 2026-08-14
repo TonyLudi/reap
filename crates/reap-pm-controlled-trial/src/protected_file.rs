@@ -22,7 +22,12 @@ pub(crate) enum ProtectedFileKind {
     FreshCredentialDeliveryBindingV1,
     ReviewedSignerProxyAccountIdentityV1,
     ReviewedRemoteCredentialProofPolicyV1,
+    ReviewedL1CredentialDerivationProofPolicyV1,
+    ReviewedPolyProxyControlPolicyV1,
     ReviewedStaticOnlineAuthorizationV3,
+    ReviewedPhaseAEligibilityEnvelopeV4,
+    ReviewedPhaseAReviewerTrustPolicyV1,
+    ReviewedLocalOperatorCooperativeCustodyProfileV1,
     OnlineAuthorizationConsumptionV2,
     ConsumptionEvidence,
     PrivateKey,
@@ -51,7 +56,18 @@ impl std::fmt::Display for ProtectedFileKind {
             Self::ReviewedRemoteCredentialProofPolicyV1 => {
                 "reviewed remote credential-proof policy V1"
             }
+            Self::ReviewedL1CredentialDerivationProofPolicyV1 => {
+                "reviewed L1 credential-derivation proof policy V1"
+            }
+            Self::ReviewedPolyProxyControlPolicyV1 => "reviewed Poly proxy control policy V1",
             Self::ReviewedStaticOnlineAuthorizationV3 => "reviewed static online-authorization V3",
+            Self::ReviewedPhaseAEligibilityEnvelopeV4 => "reviewed Phase-A eligibility envelope V4",
+            Self::ReviewedPhaseAReviewerTrustPolicyV1 => {
+                "reviewed Phase-A reviewer trust policy V1"
+            }
+            Self::ReviewedLocalOperatorCooperativeCustodyProfileV1 => {
+                "reviewed local-operator cooperative custody profile V1"
+            }
             Self::OnlineAuthorizationConsumptionV2 => {
                 "online-authorization-consumption V2 evidence"
             }

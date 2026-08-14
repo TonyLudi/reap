@@ -1,6 +1,6 @@
 //! Immutable least-authority projections over monitor-owned private state.
 
-use reap_pm_core::PmSpenderId;
+use reap_pm_core::{PmSignedUnits, PmSpenderId};
 use reap_pm_state::{
     PmAccountCounters, PmAccountSnapshotProjection, PmAllowanceKnowledge, PmFillCounters,
     PmFillProjection, PmOrderCounters, PmOrderProjection, PmPrivateConvergence,
@@ -46,6 +46,16 @@ impl<'a> PmReadOnlyPrivateProjection<'a> {
     #[must_use]
     pub const fn provisional_deltas(&self) -> PmProvisionalDeltas {
         self.state.provisional_deltas()
+    }
+
+    /// Last authoritative outcome position plus unique, locally observed
+    /// fills not yet covered by reconciliation.
+    ///
+    /// `None` means the authoritative account snapshot is not complete or no
+    /// longer supports a safe effective-position projection.
+    #[must_use]
+    pub fn effective_position(&self) -> Option<PmSignedUnits> {
+        self.state.effective_position()
     }
 
     #[must_use]

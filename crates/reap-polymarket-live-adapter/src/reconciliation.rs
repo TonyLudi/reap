@@ -7,7 +7,7 @@ use reap_pm_core::{
 use reap_polymarket_auth::{FixedOrderId, L2Timestamp};
 use reap_polymarket_wire::{
     PmLiveOpenOrderPage, PmLiveOrder, PmLiveTradePage, PmWireScope, parse_live_open_order_page,
-    parse_live_order_detail, parse_live_trade_page,
+    parse_live_order_detail, parse_live_owned_fill_trade_page, parse_live_trade_page,
 };
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
@@ -175,6 +175,7 @@ pub struct PmTradesAssembly {
     next_cursor: String,
     row_count: usize,
     live_source: Option<LiveCutSource>,
+    exact_scope_filter: bool,
 }
 
 impl PmTradesAssembly {
@@ -619,7 +620,17 @@ impl<'a> PmReconciliationHttpRole<'a> {
         &mut self,
         server_time: PmReadServerTime,
     ) -> Result<PmTradesCutProgress, PmLiveAdapterError> {
-        self.begin_trades_source(server_time, None).await
+        self.begin_trades_source(server_time, None, false).await
+    }
+
+    /// Start a complete trade cut narrowed by the configured exact condition
+    /// and token. Authentication remains bound to `/data/trades`; only the
+    /// allowlisted read-only query is narrowed.
+    pub async fn begin_exact_scope_trades(
+        &mut self,
+        server_time: PmReadServerTime,
+    ) -> Result<PmTradesCutProgress, PmLiveAdapterError> {
+        self.begin_trades_source(server_time, None, true).await
     }
 
     /// Start a source-clocked trade cut. A terminal receive edge is sampled
@@ -629,13 +640,15 @@ impl<'a> PmReconciliationHttpRole<'a> {
         server_time: PmReadServerTime,
         clock: &mut PmPrivateReadProductClock,
     ) -> Result<PmTradesCutProgress, PmLiveAdapterError> {
-        self.begin_trades_source(server_time, Some(clock)).await
+        self.begin_trades_source(server_time, Some(clock), false)
+            .await
     }
 
     async fn begin_trades_source(
         &mut self,
         server_time: PmReadServerTime,
         clock: Option<&mut PmPrivateReadProductClock>,
+        exact_scope_filter: bool,
     ) -> Result<PmTradesCutProgress, PmLiveAdapterError> {
         let fetched = self
             .trades_page(
@@ -643,6 +656,7 @@ impl<'a> PmReconciliationHttpRole<'a> {
                     .into_l2_timestamp()
                     .map_err(|_| PmLiveAdapterError::ProductClock)?,
                 first_page_cursor(),
+                exact_scope_filter,
             )
             .await?;
         let terminal_receive_clock = observe_terminal_page(&fetched.parsed, clock)?;
@@ -656,6 +670,7 @@ impl<'a> PmReconciliationHttpRole<'a> {
             vec![first_page_cursor().to_owned()],
             0,
             Some(live_source),
+            exact_scope_filter,
         )
     }
 
@@ -699,6 +714,7 @@ impl<'a> PmReconciliationHttpRole<'a> {
                     .into_l2_timestamp()
                     .map_err(|_| PmLiveAdapterError::ProductClock)?,
                 &cursor,
+                assembly.exact_scope_filter,
             )
             .await?;
         let terminal_receive_clock = observe_terminal_page(&fetched.parsed, clock)?;
@@ -714,6 +730,7 @@ impl<'a> PmReconciliationHttpRole<'a> {
             assembly.requested_cursors,
             assembly.row_count,
             assembly.live_source,
+            assembly.exact_scope_filter,
         )
     }
 
@@ -904,17 +921,26 @@ impl<'a> PmReconciliationHttpRole<'a> {
         &mut self,
         timestamp: L2Timestamp,
         cursor: &str,
+        exact_scope_filter: bool,
     ) -> Result<FetchedTradesPage, PmLiveAdapterError> {
         let headers = self.authority.authenticate_trades(timestamp).await?;
         let body = found(
             self.transport
-                .get(PmPrivateRoute::Trades { cursor }, headers)
+                .get(
+                    PmPrivateRoute::Trades {
+                        cursor,
+                        exact_scope: exact_scope_filter.then_some(self.source_binding().scope),
+                    },
+                    headers,
+                )
                 .await?,
         )?;
-        let parsed = self
-            .authority
-            .bind_trades(parse_live_trade_page(&body)?)
-            .await?;
+        let parsed = if exact_scope_filter {
+            parse_live_owned_fill_trade_page(&body)?
+        } else {
+            parse_live_trade_page(&body)?
+        };
+        let parsed = self.authority.bind_trades(parsed).await?;
         let source = authenticated_page_source(
             TRADES_PAGE_SOURCE_COMMITMENT_DOMAIN,
             b"/data/trades",
@@ -1406,6 +1432,7 @@ fn advance_trades(
     requested_cursors: Vec<String>,
     prior_rows: usize,
     live_source: Option<LiveCutSource>,
+    exact_scope_filter: bool,
 ) -> Result<PmTradesCutProgress, PmLiveAdapterError> {
     ensure_live_source_shape(live_source.as_ref(), pages.len(), &requested_cursors)?;
     let page = pages.last().expect("advance always has a page");
@@ -1430,6 +1457,7 @@ fn advance_trades(
                 next_cursor,
                 row_count,
                 live_source,
+                exact_scope_filter,
             }))
         }
     }
@@ -1593,6 +1621,7 @@ mod tests {
                 vec!["MA==".into(), "cursor-1".into()],
                 0,
                 None,
+                false,
             ),
             Err(PmLiveAdapterError::PaginationCursorCycle)
         ));
@@ -1616,8 +1645,14 @@ mod tests {
         assert_eq!(complete.pages().len(), 1);
         assert_eq!(complete.row_count(), 0);
 
-        let progress = advance_trades(vec![trade_page("next")], vec!["MA==".into()], 0, None)
-            .expect("nonterminal cut");
+        let progress = advance_trades(
+            vec![trade_page("next")],
+            vec!["MA==".into()],
+            0,
+            None,
+            false,
+        )
+        .expect("nonterminal cut");
         let PmTradesCutProgress::Incomplete(incomplete) = progress else {
             panic!("nonterminal cursor must remain incomplete")
         };

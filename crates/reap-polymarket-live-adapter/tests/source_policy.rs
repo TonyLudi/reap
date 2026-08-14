@@ -8,6 +8,7 @@ const GEOBLOCK_HTTP: &str = include_str!("../src/geoblock_http.rs");
 const HTTP_TRANSPORT: &str = include_str!("../src/http_transport.rs");
 const LOOPBACK_MUTATION_CREDENTIALS: &str = include_str!("../src/loopback_mutation_credentials.rs");
 const METADATA_HTTP: &str = include_str!("../src/metadata_http.rs");
+const MUTATION_TRANSPORT: &str = include_str!("../src/mutation/transport.rs");
 const OBSERVATION_CLOCK: &str = include_str!("../src/observation_clock.rs");
 const PRIVATE_HTTP: &str = include_str!("../src/private_http.rs");
 const PRIVATE_CREDENTIALS: &str = include_str!("../src/private_credentials.rs");
@@ -31,6 +32,46 @@ fn production_prefix(source: &str) -> &str {
     source
         .split_once("#[cfg(test)]\nmod tests")
         .map_or(source, |(head, _)| head)
+}
+
+#[test]
+fn production_mutation_transport_is_fixed_selected_single_order_and_never_retries() {
+    for required in [
+        "pub struct PmProductionMutationConfig",
+        "production_on_fixed_tls_peer_and_selected_local_egress",
+        "fixed_tls_peer.dns_name() != PM_CLOB_PRODUCTION_DNS_NAME",
+        "selected_local_egress.require_production()",
+        ".require_same_address_family(&selected_local_egress)",
+        ".resolve(",
+        ".interface(config.selected_local_egress.interface_name())",
+        ".local_address(config.selected_local_egress.local_source_ip())",
+        ".https_only(true)",
+        ".retry(reqwest::retry::never())",
+        "self.expected_peer != response.remote_addr()",
+        "pub struct PmFixedPlaceProductionRole",
+        "pub struct PmExactOwnedCancelProductionRole",
+        ".post(url)",
+        ".delete(url)",
+        "url.set_path(\"/order\")",
+    ] {
+        assert!(
+            MUTATION_TRANSPORT.contains(required),
+            "production mutation edge lost `{required}`"
+        );
+    }
+    for forbidden in [
+        "set_path(\"/cancel-all\")",
+        "set_path(\"/cancel-market-orders\")",
+        "set_path(\"/orders\")",
+        "Client::new()",
+        "Policy::limited",
+        "reqwest::retry::default",
+    ] {
+        assert!(
+            !MUTATION_TRANSPORT.contains(forbidden),
+            "production mutation edge gained `{forbidden}`"
+        );
+    }
 }
 
 fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {

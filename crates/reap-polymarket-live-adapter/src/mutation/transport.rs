@@ -4,7 +4,7 @@
 //! `8222273a9c72033b760e1d2fec813bc77144556d` independently corroborates only
 //! the fixed POST/DELETE `/order` routes and exact owned-cancel body key.
 
-use std::{fmt, time::Duration};
+use std::{fmt, net::SocketAddr, time::Duration};
 
 #[cfg(any(test, feature = "loopback-evidence"))]
 use std::net::IpAddr;
@@ -14,6 +14,7 @@ use reap_polymarket_auth::{
     ExpectedOrderId, FixedOrderId, OwnedCancelSemanticRequestCommitment,
     PlaceSemanticRequestCommitment, RuntimeExactBodyCommitment,
 };
+use reap_polymarket_egress_binding::{PmFixedTlsPeerSelection, PmLocalEgressSelection};
 use reap_polymarket_wire::{parse_live_cancel_result, parse_live_place_result};
 use reqwest::{
     Client, Request, StatusCode, Url,
@@ -23,12 +24,13 @@ use reqwest::{
 use zeroize::Zeroizing;
 
 use super::{
-    PmMutationEdgeError, PmRetainedOwnedCancelRequest, PmRetainedPlaceRequest,
-    retained::RetainedL2Headers,
+    PmMutationEdgeError, PmRetainedGtcFillPlaceRequest, PmRetainedOwnedCancelRequest,
+    PmRetainedPlaceRequest, retained::RetainedL2Headers,
 };
+use crate::PM_CLOB_PRODUCTION_ORIGIN;
 
-#[cfg(any(test, feature = "loopback-evidence"))]
 const MAX_MUTATION_TIMEOUT: Duration = Duration::from_secs(60);
+const PM_CLOB_PRODUCTION_DNS_NAME: &str = "clob.polymarket.com";
 pub(super) const MAX_MUTATION_RESPONSE_BYTES: usize = 32 * 1_024;
 const POLY_ADDRESS: HeaderName = HeaderName::from_static("poly_address");
 const POLY_SIGNATURE: HeaderName = HeaderName::from_static("poly_signature");
@@ -43,6 +45,67 @@ pub struct PmLoopbackMutationConfig {
     origin: Url,
     connect_timeout: Duration,
     request_timeout: Duration,
+}
+
+/// Exact production mutation destination and selected Linux egress.
+///
+/// This cloneable value is configuration, not mutation authority. It has no
+/// origin parameter, credential, request bytes, or send method. Construction
+/// requires the separately reviewed fixed TLS peer and local-egress values.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PmProductionMutationConfig {
+    origin: Url,
+    connect_timeout: Duration,
+    request_timeout: Duration,
+    fixed_tls_peer: PmFixedTlsPeerSelection,
+    selected_local_egress: PmLocalEgressSelection,
+}
+
+impl PmProductionMutationConfig {
+    pub fn production_on_fixed_tls_peer_and_selected_local_egress(
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        fixed_tls_peer: PmFixedTlsPeerSelection,
+        selected_local_egress: PmLocalEgressSelection,
+    ) -> Result<Self, PmMutationEdgeError> {
+        validate_production_timeouts(connect_timeout, request_timeout)?;
+        if fixed_tls_peer.require_production().is_err()
+            || fixed_tls_peer.dns_name() != PM_CLOB_PRODUCTION_DNS_NAME
+            || fixed_tls_peer.peer_addr().port() != 443
+        {
+            return Err(PmMutationEdgeError::InvalidProductionConfiguration(
+                "the fixed TLS peer must be production clob.polymarket.com:443",
+            ));
+        }
+        if selected_local_egress.require_production().is_err() {
+            return Err(PmMutationEdgeError::InvalidProductionConfiguration(
+                "the selected local egress must be a production selection",
+            ));
+        }
+        fixed_tls_peer
+            .require_same_address_family(&selected_local_egress)
+            .map_err(|_| {
+                PmMutationEdgeError::InvalidProductionConfiguration(
+                    "the fixed peer and selected local egress must use one address family",
+                )
+            })?;
+        let origin = validate_production_origin()?;
+        Ok(Self {
+            origin,
+            connect_timeout,
+            request_timeout,
+            fixed_tls_peer,
+            selected_local_egress,
+        })
+    }
+}
+
+impl fmt::Debug for PmProductionMutationConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "PmProductionMutationConfig(<fixed clob TLS peer; selected local egress; no authority>)",
+        )
+    }
 }
 
 impl PmLoopbackMutationConfig {
@@ -92,6 +155,7 @@ pub enum PmMutationDiagnosticKind {
     TransportFailure,
     ResponseBodyTimeout,
     ResponseBodyFailure,
+    ConnectedPeerMismatch,
 }
 
 /// Non-secret bounded evidence about one classified attempt. Raw request or
@@ -307,7 +371,7 @@ pub struct PmFixedPlaceLoopbackRole {
 impl PmFixedPlaceLoopbackRole {
     pub fn new(config: PmLoopbackMutationConfig) -> Result<Self, PmMutationEdgeError> {
         Ok(Self {
-            edge: MutationHttpEdge::new(config)?,
+            edge: MutationHttpEdge::loopback(config)?,
         })
     }
 
@@ -328,6 +392,83 @@ impl PmFixedPlaceLoopbackRole {
     }
 }
 
+/// Fixed production place transport. It can consume only one already
+/// authenticated retained request per call and has no authentication,
+/// credential, generic-route, batch, or retry surface.
+pub struct PmFixedPlaceProductionRole {
+    edge: MutationHttpEdge,
+}
+
+impl PmFixedPlaceProductionRole {
+    pub fn new(config: PmProductionMutationConfig) -> Result<Self, PmMutationEdgeError> {
+        Ok(Self {
+            edge: MutationHttpEdge::production(config)?,
+        })
+    }
+
+    /// Consume one retained request and perform exactly one production
+    /// `POST /order` attempt.
+    pub async fn send(&mut self, request: PmRetainedPlaceRequest) -> PmPlaceMutationOutcome {
+        let evidence = PlaceEvidence {
+            runtime_exact_body_commitment: request.runtime_exact_body_commitment(),
+            semantic_request_commitment: request.semantic_request_commitment(),
+            expected_order_id: request.expected_order_id(),
+            expected_making_amount: request.expected_making_amount(),
+            expected_taking_amount: request.expected_taking_amount(),
+        };
+        let prepared = match self.edge.prepare_place(&request) {
+            Ok(prepared) => prepared,
+            Err(()) => return place_pre_send_failure(evidence),
+        };
+        classify_place_observation(evidence, self.edge.execute(prepared).await)
+    }
+}
+
+impl fmt::Debug for PmFixedPlaceProductionRole {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PmFixedPlaceProductionRole([FIXED PRODUCTION])")
+    }
+}
+
+/// Fixed production role for one already-authenticated GTC/non-post-only fill
+/// request. Its input type cannot be constructed from a post-only request.
+pub struct PmFixedGtcFillPlaceProductionRole {
+    edge: MutationHttpEdge,
+}
+
+impl PmFixedGtcFillPlaceProductionRole {
+    pub fn new(config: PmProductionMutationConfig) -> Result<Self, PmMutationEdgeError> {
+        Ok(Self {
+            edge: MutationHttpEdge::production(config)?,
+        })
+    }
+
+    /// Consume one retained request and perform exactly one production
+    /// `POST /order` attempt. The response may be either immediately matched
+    /// or live (if the book moved), after which the caller reconciles and
+    /// cancels the exact deterministic order ID.
+    pub async fn send(&mut self, request: PmRetainedGtcFillPlaceRequest) -> PmPlaceMutationOutcome {
+        let evidence = PlaceEvidence {
+            runtime_exact_body_commitment: request.runtime_exact_body_commitment(),
+            semantic_request_commitment: request.semantic_request_commitment(),
+            expected_order_id: request.expected_order_id(),
+            expected_making_amount: request.expected_making_amount(),
+            expected_taking_amount: request.expected_taking_amount(),
+        };
+        let prepared = match self.edge.prepare_gtc_fill_place(&request) {
+            Ok(prepared) => prepared,
+            Err(()) => return place_pre_send_failure(evidence),
+        };
+        classify_gtc_fill_place_observation(evidence, self.edge.execute(prepared).await)
+    }
+}
+
+impl fmt::Debug for PmFixedGtcFillPlaceProductionRole {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PmFixedGtcFillPlaceProductionRole([FIXED PRODUCTION])")
+    }
+}
+
 impl fmt::Debug for PmFixedPlaceLoopbackRole {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("PmFixedPlaceLoopbackRole([LOOPBACK])")
@@ -343,7 +484,7 @@ pub struct PmExactOwnedCancelLoopbackRole {
 impl PmExactOwnedCancelLoopbackRole {
     pub fn new(config: PmLoopbackMutationConfig) -> Result<Self, PmMutationEdgeError> {
         Ok(Self {
-            edge: MutationHttpEdge::new(config)?,
+            edge: MutationHttpEdge::loopback(config)?,
         })
     }
 
@@ -368,13 +509,49 @@ impl fmt::Debug for PmExactOwnedCancelLoopbackRole {
     }
 }
 
+/// Exact-owned production cancel transport. It exposes no cancel-all,
+/// cancel-market, batch, arbitrary order ID, authentication, or retry method.
+pub struct PmExactOwnedCancelProductionRole {
+    edge: MutationHttpEdge,
+}
+
+impl PmExactOwnedCancelProductionRole {
+    pub fn new(config: PmProductionMutationConfig) -> Result<Self, PmMutationEdgeError> {
+        Ok(Self {
+            edge: MutationHttpEdge::production(config)?,
+        })
+    }
+
+    /// Consume one retained request and perform exactly one production
+    /// `DELETE /order` attempt.
+    pub async fn send(&mut self, request: PmRetainedOwnedCancelRequest) -> PmCancelMutationOutcome {
+        let evidence = CancelEvidence {
+            runtime_exact_body_commitment: request.runtime_exact_body_commitment(),
+            semantic_request_commitment: request.semantic_request_commitment(),
+            order_id: request.order_id(),
+        };
+        let prepared = match self.edge.prepare_cancel(&request) {
+            Ok(prepared) => prepared,
+            Err(()) => return cancel_pre_send_failure(evidence),
+        };
+        classify_cancel_observation(evidence, self.edge.execute(prepared).await)
+    }
+}
+
+impl fmt::Debug for PmExactOwnedCancelProductionRole {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PmExactOwnedCancelProductionRole([FIXED PRODUCTION])")
+    }
+}
+
 struct MutationHttpEdge {
     client: Client,
     origin: Url,
+    expected_peer: Option<SocketAddr>,
 }
 
 impl MutationHttpEdge {
-    fn new(config: PmLoopbackMutationConfig) -> Result<Self, PmMutationEdgeError> {
+    fn loopback(config: PmLoopbackMutationConfig) -> Result<Self, PmMutationEdgeError> {
         let client = Client::builder()
             .connect_timeout(config.connect_timeout)
             .timeout(config.request_timeout)
@@ -392,10 +569,64 @@ impl MutationHttpEdge {
         Ok(Self {
             client,
             origin: config.origin,
+            expected_peer: None,
+        })
+    }
+
+    fn production(config: PmProductionMutationConfig) -> Result<Self, PmMutationEdgeError> {
+        let mut builder = Client::builder()
+            .connect_timeout(config.connect_timeout)
+            .timeout(config.request_timeout)
+            .retry(reqwest::retry::never())
+            .redirect(Policy::none())
+            .no_proxy()
+            .https_only(true)
+            .pool_max_idle_per_host(0)
+            .resolve(
+                config.fixed_tls_peer.dns_name(),
+                config.fixed_tls_peer.peer_addr(),
+            );
+        #[cfg(target_os = "linux")]
+        {
+            builder = builder
+                .interface(config.selected_local_egress.interface_name())
+                .local_address(config.selected_local_egress.local_source_ip());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = builder;
+            return Err(PmMutationEdgeError::InvalidProductionConfiguration(
+                "selected production mutation egress requires Linux",
+            ));
+        }
+        let client = builder
+            .build()
+            .map_err(|_| PmMutationEdgeError::TransportBuild)?;
+        Ok(Self {
+            client,
+            origin: config.origin,
+            expected_peer: Some(config.fixed_tls_peer.peer_addr()),
         })
     }
 
     fn prepare_place(&self, request: &PmRetainedPlaceRequest) -> Result<Request, ()> {
+        if !request.remains_valid() {
+            return Err(());
+        }
+        let mut url = self.origin.clone();
+        url.set_path("/order");
+        self.client
+            .post(url)
+            .headers(fixed_headers(&request.headers)?)
+            .body(request.body.as_slice().to_vec())
+            .build()
+            .map_err(|_| ())
+    }
+
+    fn prepare_gtc_fill_place(
+        &self,
+        request: &PmRetainedGtcFillPlaceRequest,
+    ) -> Result<Request, ()> {
         if !request.remains_valid() {
             return Err(());
         }
@@ -435,6 +666,13 @@ impl MutationHttpEdge {
             }
         };
         let status = response.status();
+        if self.expected_peer.is_some() && self.expected_peer != response.remote_addr() {
+            return MutationHttpObservation::Fault(PmMutationDiagnostic::response(
+                PmMutationDiagnosticKind::ConnectedPeerMismatch,
+                status,
+                0,
+            ));
+        }
         if status.is_redirection() {
             return MutationHttpObservation::Redirect(status);
         }
@@ -541,6 +779,168 @@ fn classify_place_observation(
             classify_complete_place(evidence, status, body.as_slice())
         }
     }
+}
+
+fn classify_gtc_fill_place_observation(
+    evidence: PlaceEvidence,
+    observation: MutationHttpObservation,
+) -> PmPlaceMutationOutcome {
+    match observation {
+        MutationHttpObservation::Fault(diagnostic) => place_outcome(
+            evidence,
+            PmMutationClassification::AcknowledgementUnknown,
+            None,
+            diagnostic,
+            None,
+        ),
+        MutationHttpObservation::Redirect(status) => place_outcome(
+            evidence,
+            PmMutationClassification::OutOfProfile,
+            None,
+            PmMutationDiagnostic::response(PmMutationDiagnosticKind::Redirect, status, 0),
+            None,
+        ),
+        MutationHttpObservation::Complete { status, body } => {
+            classify_complete_gtc_fill_place(evidence, status, body.as_slice())
+        }
+    }
+}
+
+fn classify_complete_gtc_fill_place(
+    evidence: PlaceEvidence,
+    status: StatusCode,
+    body: &[u8],
+) -> PmPlaceMutationOutcome {
+    let response_bytes = body.len();
+    let parsed = match parse_live_place_result(body) {
+        Ok(parsed) => parsed,
+        Err(_) => return place_status_fallback(evidence, status, response_bytes),
+    };
+    let observed = parsed.order_id();
+
+    if status_requires_reconciliation(status) {
+        return place_outcome(
+            evidence,
+            PmMutationClassification::OutOfProfile,
+            observed,
+            PmMutationDiagnostic::response(status_diagnostic(status), status, response_bytes),
+            parsed.error_message(),
+        );
+    }
+    if status == StatusCode::REQUEST_TIMEOUT || status.is_server_error() {
+        return place_outcome(
+            evidence,
+            PmMutationClassification::AcknowledgementUnknown,
+            observed,
+            PmMutationDiagnostic::response(
+                PmMutationDiagnosticKind::UnexpectedHttpStatus,
+                status,
+                response_bytes,
+            ),
+            parsed.error_message(),
+        );
+    }
+    if !parsed.success() {
+        if status == StatusCode::OK
+            || status == StatusCode::BAD_REQUEST
+            || status == StatusCode::UNPROCESSABLE_ENTITY
+        {
+            return place_outcome(
+                evidence,
+                PmMutationClassification::Rejected,
+                None,
+                PmMutationDiagnostic::response(
+                    PmMutationDiagnosticKind::VenueRejected,
+                    status,
+                    response_bytes,
+                ),
+                parsed.error_message(),
+            );
+        }
+        return place_status_fallback(evidence, status, response_bytes);
+    }
+    if status != StatusCode::OK {
+        return place_outcome(
+            evidence,
+            PmMutationClassification::OutOfProfile,
+            observed,
+            PmMutationDiagnostic::response(
+                PmMutationDiagnosticKind::UnexpectedHttpStatus,
+                status,
+                response_bytes,
+            ),
+            None,
+        );
+    }
+
+    let exact_identity = observed.is_some_and(|id| {
+        let expected = evidence.expected_order_id.to_string();
+        id.as_str() == expected
+    });
+    let accepted_status = matches!(parsed.status(), "live" | "matched");
+    if !exact_identity {
+        return place_outcome(
+            evidence,
+            PmMutationClassification::OutOfProfile,
+            observed,
+            PmMutationDiagnostic::response(
+                PmMutationDiagnosticKind::ResponseIdentityMismatch,
+                status,
+                response_bytes,
+            ),
+            None,
+        );
+    }
+    if !accepted_status
+        || parsed.making_amount() != Some(evidence.expected_making_amount)
+        || parsed.taking_amount() != Some(evidence.expected_taking_amount)
+    {
+        return place_outcome(
+            evidence,
+            PmMutationClassification::OutOfProfile,
+            observed,
+            PmMutationDiagnostic::response(
+                PmMutationDiagnosticKind::ResponseProfileMismatch,
+                status,
+                response_bytes,
+            ),
+            None,
+        );
+    }
+    place_outcome(
+        evidence,
+        PmMutationClassification::Accepted,
+        observed,
+        PmMutationDiagnostic::response(
+            PmMutationDiagnosticKind::AcceptedProfile,
+            status,
+            response_bytes,
+        ),
+        None,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn classify_complete_gtc_fill_place_for_test(
+    expected_order_id: ExpectedOrderId,
+    runtime_exact_body_commitment: RuntimeExactBodyCommitment,
+    semantic_request_commitment: PlaceSemanticRequestCommitment,
+    expected_making_amount: U256,
+    expected_taking_amount: U256,
+    status: StatusCode,
+    body: &[u8],
+) -> PmPlaceMutationOutcome {
+    classify_complete_gtc_fill_place(
+        PlaceEvidence {
+            runtime_exact_body_commitment,
+            semantic_request_commitment,
+            expected_order_id,
+            expected_making_amount,
+            expected_taking_amount,
+        },
+        status,
+        body,
+    )
 }
 
 fn classify_complete_place(
@@ -939,6 +1339,45 @@ fn validate_timeouts(
         ));
     }
     Ok(())
+}
+
+fn validate_production_timeouts(
+    connect_timeout: Duration,
+    request_timeout: Duration,
+) -> Result<(), PmMutationEdgeError> {
+    if connect_timeout.is_zero() || request_timeout.is_zero() {
+        return Err(PmMutationEdgeError::InvalidProductionConfiguration(
+            "connect and request timeouts must be positive",
+        ));
+    }
+    if connect_timeout > MAX_MUTATION_TIMEOUT || request_timeout > MAX_MUTATION_TIMEOUT {
+        return Err(PmMutationEdgeError::InvalidProductionConfiguration(
+            "connect and request timeouts must not exceed 60 seconds",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_production_origin() -> Result<Url, PmMutationEdgeError> {
+    let origin = Url::parse(PM_CLOB_PRODUCTION_ORIGIN).map_err(|_| {
+        PmMutationEdgeError::InvalidProductionConfiguration(
+            "the fixed production origin is malformed",
+        )
+    })?;
+    if origin.scheme() != "https"
+        || origin.host_str() != Some(PM_CLOB_PRODUCTION_DNS_NAME)
+        || origin.port_or_known_default() != Some(443)
+        || !origin.username().is_empty()
+        || origin.password().is_some()
+        || origin.path() != "/"
+        || origin.query().is_some()
+        || origin.fragment().is_some()
+    {
+        return Err(PmMutationEdgeError::InvalidProductionConfiguration(
+            "the fixed production origin is not exact",
+        ));
+    }
+    Ok(origin)
 }
 
 #[cfg(any(test, feature = "loopback-evidence"))]

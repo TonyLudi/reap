@@ -2357,6 +2357,11 @@ fn published_balance_position_disagreement_and_resolved_inventory_are_distinct()
             position: U256::from_u64(4_000_000),
         })
     );
+    assert_eq!(
+        mismatch.effective_position(),
+        None,
+        "a disagreeing published balance and position must not escape through the live projection"
+    );
     assert!(
         mismatch
             .pending_refresh_keys()
@@ -2390,6 +2395,11 @@ fn published_balance_position_disagreement_and_resolved_inventory_are_distinct()
         PmPrivateReadiness::Blocked(PmPrivateReadinessReason::PositionResolvedUnredeemed(
             U256::from_u64(5_000_000)
         ))
+    );
+    assert_eq!(
+        resolved.effective_position(),
+        None,
+        "resolved-but-unredeemed inventory is not a tradable effective position"
     );
     assert!(
         resolved
@@ -2462,6 +2472,7 @@ fn exact_allowances_and_live_reservations_constrain_resources_independently() {
 #[test]
 fn risk_requires_canonical_inventory_and_counts_both_candidate_resources() {
     let mut unavailable = new_state();
+    assert_eq!(unavailable.effective_position(), None);
     assert!(matches!(
         unavailable.evaluate_risk_candidate(
             quote(120),
@@ -2490,6 +2501,10 @@ fn risk_requires_canonical_inventory_and_counts_both_candidate_resources() {
     let mut state = PmPrivateState::new(config(), token_tight_limits).unwrap();
     state.observe_reconnect(ConnectionEpoch::new(1), 1).unwrap();
     make_ready(&mut state);
+    assert_eq!(
+        state.effective_position(),
+        Some(PmSignedUnits::from_parts(PmSign::Positive, U256::from_u64(5_000_000)).unwrap())
+    );
     let candidate = PmPrivateQuoteRequest::new(
         120,
         PmOrderSide::Buy,

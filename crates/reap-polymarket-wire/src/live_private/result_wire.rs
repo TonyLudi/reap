@@ -18,7 +18,7 @@ pub(super) struct RawPlaceResult {
     pub(super) making_amount: String,
     #[serde(rename = "takingAmount")]
     pub(super) taking_amount: String,
-    #[serde(rename = "tradeIDs")]
+    #[serde(default, rename = "tradeIDs", alias = "tradeIds")]
     pub(super) trade_ids: Vec<String>,
     #[serde(default, rename = "transactionsHashes")]
     pub(super) transaction_hashes: Vec<String>,

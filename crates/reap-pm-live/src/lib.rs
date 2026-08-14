@@ -10,6 +10,8 @@ mod fake_effect;
 mod journal;
 mod lanes;
 mod private_monitor;
+mod private_user_ws;
+mod production_private_user_ws;
 mod public_routes;
 mod replay;
 mod schedule;
@@ -84,6 +86,10 @@ pub use private_monitor::{
     PmOrderDetailFixtureInput, PmPrivateBatchApply, PmPrivateMonitorError,
     PmPrivateMonitorInputError, PmReadOnlyMonitor, PmReadOnlyPrivateProjection,
     PmReconciliationFixtureInput,
+};
+pub use production_private_user_ws::{
+    PmProductionPrivateStateChange, PmProductionPrivateUserWsError,
+    PmProductionPrivateUserWsHandler,
 };
 pub use public_routes::{
     OkxPublicReferenceDelivery, OkxPublicUnavailable, OkxPublicUnavailableDelivery,

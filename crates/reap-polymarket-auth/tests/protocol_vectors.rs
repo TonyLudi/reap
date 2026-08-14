@@ -31,6 +31,12 @@ fn signer() -> FixedEoaSigner {
     FixedEoaSigner::bind(EoaPrivateKeyInput::new(TEST_KEY.into()), ADDRESS).unwrap()
 }
 
+#[test]
+fn signer_identity_can_be_derived_without_a_duplicate_address_secret_source() {
+    let signer = FixedEoaSigner::derive(EoaPrivateKeyInput::new(TEST_KEY.into())).unwrap();
+    assert_eq!(signer.address().to_string(), ADDRESS);
+}
+
 fn credentials() -> L2Credentials {
     credentials_for(ADDRESS, API_KEY, API_SECRET, PASSPHRASE)
 }

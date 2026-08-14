@@ -43,6 +43,18 @@ impl L2CredentialInput {
             passphrase: Zeroizing::new(passphrase),
         }
     }
+
+    pub(crate) fn from_zeroizing(
+        api_key: Zeroizing<String>,
+        secret: Zeroizing<String>,
+        passphrase: Zeroizing<String>,
+    ) -> Self {
+        Self {
+            api_key,
+            secret,
+            passphrase,
+        }
+    }
 }
 
 impl fmt::Debug for L2CredentialInput {
@@ -58,30 +70,27 @@ pub struct FixedEoaSigner {
 }
 
 impl FixedEoaSigner {
+    /// Consume one private key, validate its exact encoding, and derive the
+    /// only EOA identity controlled by it.
+    ///
+    /// This constructor is intended for credential sources whose signer
+    /// address is not stored separately. It returns no key bytes or generic
+    /// signing surface; the resulting authority remains limited to the fixed
+    /// Polymarket operations implemented by this crate.
+    pub fn derive(private_key: EoaPrivateKeyInput) -> Result<Self, PmAuthError> {
+        let key = decode_private_key(private_key)?;
+        let signing_key = SigningKey::from_slice(key.as_ref())
+            .map_err(|_| PmAuthError::InvalidPrivateKeyScalar)?;
+        let address = derive_address(&signing_key);
+        Ok(Self { key, address })
+    }
+
     pub fn bind(
         private_key: EoaPrivateKeyInput,
         configured_address: &str,
     ) -> Result<Self, PmAuthError> {
         let address = EoaAddress::parse(configured_address)?;
-        let input = private_key.0.as_bytes();
-        if input.len() != 66
-            || !input.starts_with(b"0x")
-            || input[2..]
-                .iter()
-                .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
-        {
-            return Err(PmAuthError::InvalidPrivateKeyEncoding);
-        }
-
-        let mut key = Zeroizing::new([0_u8; 32]);
-        for (index, output) in key.iter_mut().enumerate() {
-            let high = lower_hex_nibble(input[index * 2 + 2])
-                .ok_or(PmAuthError::InvalidPrivateKeyEncoding)?;
-            let low = lower_hex_nibble(input[index * 2 + 3])
-                .ok_or(PmAuthError::InvalidPrivateKeyEncoding)?;
-            *output = (high << 4) | low;
-        }
-
+        let key = decode_private_key(private_key)?;
         let signing_key = SigningKey::from_slice(key.as_ref())
             .map_err(|_| PmAuthError::InvalidPrivateKeyScalar)?;
         let derived = derive_address(&signing_key);
@@ -102,6 +111,28 @@ impl FixedEoaSigner {
     }
 }
 
+fn decode_private_key(private_key: EoaPrivateKeyInput) -> Result<Zeroizing<[u8; 32]>, PmAuthError> {
+    let input = private_key.0.as_bytes();
+    if input.len() != 66
+        || !input.starts_with(b"0x")
+        || input[2..]
+            .iter()
+            .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+    {
+        return Err(PmAuthError::InvalidPrivateKeyEncoding);
+    }
+
+    let mut key = Zeroizing::new([0_u8; 32]);
+    for (index, output) in key.iter_mut().enumerate() {
+        let high =
+            lower_hex_nibble(input[index * 2 + 2]).ok_or(PmAuthError::InvalidPrivateKeyEncoding)?;
+        let low =
+            lower_hex_nibble(input[index * 2 + 3]).ok_or(PmAuthError::InvalidPrivateKeyEncoding)?;
+        *output = (high << 4) | low;
+    }
+    Ok(key)
+}
+
 impl fmt::Debug for FixedEoaSigner {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("FixedEoaSigner([REDACTED])")
@@ -119,6 +150,13 @@ pub struct L2Credentials {
 impl L2Credentials {
     pub fn bind(configured_address: &str, input: L2CredentialInput) -> Result<Self, PmAuthError> {
         let address = EoaAddress::parse(configured_address)?;
+        Self::bind_to_address(address, input)
+    }
+
+    pub(crate) fn bind_to_address(
+        address: EoaAddress,
+        input: L2CredentialInput,
+    ) -> Result<Self, PmAuthError> {
         if !valid_api_key(input.api_key.as_bytes()) {
             return Err(PmAuthError::InvalidApiKey);
         }
@@ -132,10 +170,11 @@ impl L2Credentials {
             return Err(PmAuthError::L2SecretTooLong);
         }
 
-        let decoded = URL_SAFE
-            .decode(input.secret.as_bytes())
-            .map_err(|_| PmAuthError::InvalidL2Secret)?;
-        let secret = Zeroizing::new(decoded);
+        let secret = Zeroizing::new(
+            URL_SAFE
+                .decode(input.secret.as_bytes())
+                .map_err(|_| PmAuthError::InvalidL2Secret)?,
+        );
         if secret.is_empty() || secret.len() > MAX_L2_SECRET_DECODED_BYTES {
             return Err(if secret.len() > MAX_L2_SECRET_DECODED_BYTES {
                 PmAuthError::L2SecretTooLong
@@ -143,7 +182,8 @@ impl L2Credentials {
                 PmAuthError::InvalidL2Secret
             });
         }
-        if URL_SAFE.encode(secret.as_slice()).as_bytes() != input.secret.as_bytes() {
+        let canonical_secret = Zeroizing::new(URL_SAFE.encode(secret.as_slice()));
+        if canonical_secret.as_bytes() != input.secret.as_bytes() {
             return Err(PmAuthError::InvalidL2Secret);
         }
 
@@ -179,6 +219,31 @@ impl L2Credentials {
 
     pub(crate) fn passphrase(&self) -> &str {
         self.passphrase.as_str()
+    }
+
+    /// Compare every credential component across a fixed local bound without
+    /// exposing a component, its length, or a secret-derived projection.
+    ///
+    /// This is deliberately only constant-time-ish: every component always
+    /// executes its full fixed-bound loop, but ordinary Rust indexing and the
+    /// optimizer are not a formally verified constant-time implementation.
+    pub(crate) fn matches_exact_l2_bundle(&self, candidate: &Self) -> bool {
+        let api_key_matches = fixed_bound_eq(
+            self.api_key.as_str().as_bytes(),
+            candidate.api_key.as_str().as_bytes(),
+            36,
+        );
+        let secret_matches = fixed_bound_eq(
+            self.secret.as_slice(),
+            candidate.secret.as_slice(),
+            MAX_L2_SECRET_DECODED_BYTES,
+        );
+        let passphrase_matches = fixed_bound_eq(
+            self.passphrase.as_str().as_bytes(),
+            candidate.passphrase.as_str().as_bytes(),
+            128,
+        );
+        api_key_matches & secret_matches & passphrase_matches
     }
 }
 
@@ -233,6 +298,16 @@ fn valid_api_key(value: &[u8]) -> bool {
 
 fn valid_passphrase(value: &[u8]) -> bool {
     !value.is_empty() && value.len() <= 128 && value.iter().all(|byte| (0x21..=0x7e).contains(byte))
+}
+
+fn fixed_bound_eq(left: &[u8], right: &[u8], bound: usize) -> bool {
+    let mut difference = left.len() ^ right.len();
+    for index in 0..bound {
+        let left_byte = left.get(index).copied().unwrap_or(0);
+        let right_byte = right.get(index).copied().unwrap_or(0);
+        difference |= usize::from(left_byte ^ right_byte);
+    }
+    difference == 0
 }
 
 fn lower_hex_nibble(byte: u8) -> Option<u8> {

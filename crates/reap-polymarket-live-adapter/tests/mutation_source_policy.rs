@@ -6,7 +6,7 @@ const TRANSPORT: &str = include_str!("../src/mutation/transport.rs");
 const LOOPBACK_CREDENTIALS: &str = include_str!("../src/loopback_mutation_credentials.rs");
 
 #[test]
-fn production_surface_has_no_constructible_mutation_transport() {
+fn production_surface_is_fixed_peer_selected_and_still_carries_no_order_authority() {
     assert!(MANIFEST.contains("default = []"));
     assert!(
         MANIFEST
@@ -34,7 +34,21 @@ fn production_surface_has_no_constructible_mutation_transport() {
     assert!(!TRANSPORT.contains("pub fn new_origin("));
     assert!(LIB.contains("PRODUCTION_ORDER_ENTRY_AUTHORIZED: bool = false"));
     assert!(!LIB.contains("PRODUCTION_ORDER_ENTRY_AUTHORIZED: bool = true"));
-    for source in [MUTATION, RETAINED, TRANSPORT, LOOPBACK_CREDENTIALS] {
+    for required in [
+        "PmFixedTlsPeerSelection",
+        "production_on_fixed_tls_peer_and_selected_local_egress",
+        "fixed_tls_peer.require_production()",
+        "selected_local_egress.require_production()",
+        "pub struct PmFixedPlaceProductionRole",
+        "pub struct PmFixedGtcFillPlaceProductionRole",
+        "pub struct PmExactOwnedCancelProductionRole",
+    ] {
+        assert!(
+            TRANSPORT.contains(required),
+            "fixed production mutation transport lost `{required}`"
+        );
+    }
+    for source in [MUTATION, RETAINED, LOOPBACK_CREDENTIALS] {
         for forbidden in [
             "PmFixedTlsPeerSelection",
             "fixed_tls_peer",
@@ -45,7 +59,7 @@ fn production_surface_has_no_constructible_mutation_transport() {
         ] {
             assert!(
                 !source.contains(forbidden),
-                "fixed read-peer capability escaped into mutation source: {forbidden}"
+                "fixed transport configuration escaped its sole transport module: {forbidden}"
             );
         }
     }
@@ -53,8 +67,8 @@ fn production_surface_has_no_constructible_mutation_transport() {
 
 #[test]
 fn mutation_routes_methods_and_retry_policy_are_closed() {
-    assert_eq!(TRANSPORT.matches("url.set_path(\"/order\")").count(), 2);
-    assert_eq!(TRANSPORT.matches(".post(url)").count(), 1);
+    assert_eq!(TRANSPORT.matches("url.set_path(\"/order\")").count(), 3);
+    assert_eq!(TRANSPORT.matches(".post(url)").count(), 2);
     assert_eq!(TRANSPORT.matches(".delete(url)").count(), 1);
     assert!(TRANSPORT.contains(".redirect(Policy::none())"));
     assert!(TRANSPORT.contains(".retry(reqwest::retry::never())"));

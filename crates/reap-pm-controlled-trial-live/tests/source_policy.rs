@@ -8,6 +8,10 @@ fn source(name: &str) -> String {
     fs::read_to_string(crate_root().join("src").join(name)).expect("source file")
 }
 
+fn compact_whitespace(source: &str) -> String {
+    source.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[test]
 fn crate_has_no_transport_auth_secret_or_mutation_dependency() {
     let manifest = fs::read_to_string(crate_root().join("Cargo.toml")).expect("manifest");
@@ -31,6 +35,7 @@ fn crate_has_no_transport_auth_secret_or_mutation_dependency() {
         source("journal.rs"),
         source("live_dispatch.rs"),
         source("online_preflight_v2.rs"),
+        source("phase_a_attempt_lineage_v4.rs"),
         source("recovery.rs"),
         source("recovery_continuation.rs"),
         source("schema.rs"),
@@ -51,6 +56,372 @@ fn crate_has_no_transport_auth_secret_or_mutation_dependency() {
             !all_source.contains(forbidden),
             "forbidden source surface: {forbidden}"
         );
+    }
+}
+
+#[test]
+fn phase_a_attempt_lineage_v4_is_denied_burn_evidence_with_no_production_writer() {
+    let lineage = source("phase_a_attempt_lineage_v4.rs");
+    let online = source("online_preflight_v2.rs");
+    let journal = source("journal.rs");
+    let production = lineage
+        .split_once("\n#[cfg(test)]\nmod tests")
+        .map_or(lineage.as_str(), |(production, _)| production);
+
+    for required in [
+        "PM_PHASE_A_ATTEMPT_LINEAGE_LEDGER_FILE_V4",
+        "PM_PHASE_A_ATTEMPT_BURN_CLAIM_FILE_V4",
+        "reap.pm-t2.phase-a.attempt-lineage.prepared.v4\\0",
+        "reap.pm-t2.phase-a.attempt-lineage.burn-claim.v4\\0",
+        "reap.pm-t2.phase-a.attempt-lineage.consumed.v4\\0",
+        "reap.pm-t2.phase-a.attempt-lineage.final-conjunct.v4\\0",
+        "PmPhaseAAttemptLineageInspectionV4",
+        "PreparedUnclaimed",
+        "ClaimOnlyBurned",
+        "BurnedAwaitingFinalConjunct",
+        "Complete",
+        "AmbiguousBeforeClaim",
+        "AmbiguousBurned",
+        "placement_resumption_allowed(&self) -> bool",
+        "OfflineAuthorizationState::DENIED",
+        "PmPreparedPhaseAAttemptLineageV4",
+        "PmBurnedPhaseAAttemptLineageEvidenceV4",
+        "create_phase_a_attempt_lineage_prepared_v4",
+        "burn_and_record_a3_with_refresh",
+        "PmOnlinePreflightV2BoundCreateRefresh",
+        "future,",
+        "separately versioned positive successor",
+        "Hash commitments attest no proof validity",
+        "ProtectedArtifactLease::acquire",
+        "lease.validate()",
+        "same-EUID process bypassing the",
+        "coordinated rollback",
+        "TPM-backed monotonic anchor",
+        "WORM",
+        "authenticated remote registry",
+        "([_, _, ..], None) => PmPhaseAAttemptLineageInspectionV4::AmbiguousBurned",
+    ] {
+        assert!(
+            production.contains(required),
+            "V4 lineage lost `{required}`"
+        );
+    }
+    for forbidden in [
+        "pub struct PmPreparedPhaseAAttemptLineageV4",
+        "pub struct PmBurnedPhaseAAttemptLineageEvidenceV4",
+        "pub fn create_phase_a_attempt_lineage_prepared_v4",
+        "pub fn burn_and_complete",
+        "pub fn into_parts",
+        "pub fn into_network",
+        "pub fn into_dispatch",
+        "pub fn permit",
+        "AuthenticatedPlaceRequest",
+        "L2Credentials",
+        "Hmac",
+        "reqwest",
+        "TcpStream",
+        "SerializedPlaceRequest",
+        "production_order_entry_authorized: true",
+        "real_order_submission_authorized: true",
+        "place_dispatch_allowance: 1",
+        "synthetic_for_tests",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "V4 lineage gained forbidden production surface `{forbidden}`"
+        );
+    }
+    for owner in [
+        "PmPreparedPhaseAAttemptLineageV4",
+        "PmBurnedPhaseAAttemptLineageEvidenceV4",
+    ] {
+        let declaration = format!("pub(crate) struct {owner} {{");
+        let before = production
+            .split_once(&declaration)
+            .map(|(before, _)| before)
+            .unwrap_or_else(|| panic!("missing V4 owner `{owner}`"));
+        let declaration_attributes = before
+            .rsplit_once("\n}\n\n")
+            .map_or(before, |(_, attributes)| attributes);
+        assert!(
+            !declaration_attributes.contains("#[derive"),
+            "V4 owner `{owner}` gained a derived capability"
+        );
+        for trait_name in ["Clone", "Copy", "Serialize", "Deserialize"] {
+            assert!(
+                !production.contains(&format!("impl {trait_name} for {owner}")),
+                "V4 owner `{owner}` gained `{trait_name}`"
+            );
+        }
+    }
+
+    let burn = production
+        .split_once("pub(crate) fn burn_and_complete(")
+        .expect("V4 burn writer")
+        .1
+        .split_once("struct PhaseAAttemptHeldParentRefreshV4")
+        .expect("bounded V4 burn writer")
+        .0;
+    let burn = compact_whitespace(burn);
+    let claim_create = burn
+        .find("let mut claim_file = ProtectedJournal::create_new(")
+        .expect("create-new V4 burn claim");
+    let consumed_append = burn
+        .find("ledger.append_durable(&expected_ledger_bytes, &consumed_bytes)")
+        .expect("V4 Consumed append");
+    let existing_lineage = burn
+        .find("basis.burn_and_record_a3_with_refresh(")
+        .expect("unchanged V2/V1/A3 lineage");
+    let final_append = burn
+        .find("ledger.append_durable(&expected_ledger_bytes, &final_bytes)")
+        .expect("V4 final-conjunct append");
+    let final_revalidation = burn
+        .find("owner.revalidate_held_evidence(journals)")
+        .expect("full final revalidation");
+    assert!(
+        claim_create < consumed_append
+            && consumed_append < existing_lineage
+            && existing_lineage < final_append
+            && final_append < final_revalidation
+    );
+
+    let settled_existing = online
+        .split_once("pub(crate) fn burn_and_record_a3_with_refresh(")
+        .expect("sealed existing-lineage writer")
+        .1
+        .split_once("impl fmt::Debug for PmPendingPhaseAOnlinePreflightBasisV2")
+        .expect("bounded existing-lineage writer")
+        .0;
+    let settled_existing = compact_whitespace(settled_existing);
+    let v2_burn = settled_existing
+        .find("v2_consumption .consume")
+        .expect("V2 burn");
+    let v1_burn = settled_existing
+        .find("v1_consumption .consume")
+        .expect("V1 burn");
+    let v1_a3 = settled_existing
+        .find("record_phase_a_place_live_dispatch_authorized")
+        .expect("V1 DispatchAuthorized+A3");
+    let v2_conjunct = settled_existing
+        .find("append_durable(&expected_sidecar_bytes, &encoded)")
+        .expect("V2 final conjunct");
+    assert!(v2_burn < v1_burn && v1_burn < v1_a3 && v1_a3 < v2_conjunct);
+    assert_eq!(
+        settled_existing
+            .matches(".refresh_after_bound_create(&mut sidecar, &expected_sidecar_bytes)")
+            .count(),
+        3,
+        "V4 parents and exact sidecar bytes must refresh/revalidate after V2 claim, V1 claim, and A3 barrier"
+    );
+    assert!(
+        settled_existing.contains("record_phase_a_place_live_dispatch_authorized_with_refresh")
+    );
+    assert!(
+        journal.contains(
+            "additional_refresh: &mut impl FnMut() -> Result<(), PmTrialLiveJournalError>"
+        )
+    );
+
+    let assert_aggregated_before = |block: &str, first_check: &str, attempts: &[&str]| {
+        let first_check = block
+            .find(first_check)
+            .unwrap_or_else(|| panic!("missing first aggregate check `{first_check}`"));
+        for attempt in attempts {
+            let attempt_index = block
+                .find(attempt)
+                .unwrap_or_else(|| panic!("missing aggregate attempt `{attempt}`"));
+            assert!(
+                attempt_index < first_check,
+                "aggregate attempt `{attempt}` moved after the first error check"
+            );
+        }
+    };
+
+    let prepared_writer = production
+        .split_once("pub(crate) fn create_phase_a_attempt_lineage_prepared_v4(")
+        .expect("V4 Prepared writer")
+        .1
+        .split_once("impl PmPreparedPhaseAAttemptLineageV4")
+        .expect("bounded V4 Prepared writer")
+        .0;
+    let prepared_writer = compact_whitespace(prepared_writer);
+    assert_aggregated_before(
+        &prepared_writer,
+        "if let Err(error) = basis_refresh",
+        &[
+            "let basis_refresh =",
+            "let ledger_refresh =",
+            "let ledger_validation =",
+        ],
+    );
+
+    let v4_claim_refresh = burn
+        .split_once("claim_file.append_durable(&[], &claim_bytes)?;")
+        .expect("V4 claim durable append")
+        .1
+        .split_once("let consumed =")
+        .expect("bounded post-claim refresh")
+        .0;
+    assert_aggregated_before(
+        v4_claim_refresh,
+        "ledger_refresh?;",
+        &[
+            "let ledger_refresh =",
+            "let claim_refresh =",
+            "let basis_refresh =",
+            "let ledger_validation =",
+            "let claim_validation =",
+        ],
+    );
+
+    let v2_claim_refresh = settled_existing
+        .split_once("let mut v2_consumption =")
+        .expect("V2 consumption")
+        .1
+        .split_once("let v1_consumption = v1_consumption")
+        .expect("bounded post-V2-claim refresh")
+        .0;
+    assert_aggregated_before(
+        v2_claim_refresh,
+        "if let Err(error) = sidecar_refresh",
+        &[
+            "let sidecar_refresh =",
+            "let v1_refresh =",
+            "let journal_refresh =",
+            "let additional_refresh_result =",
+        ],
+    );
+
+    let v1_claim_refresh = settled_existing
+        .split_once("let v1_consumption = v1_consumption")
+        .expect("V1 consumption")
+        .1
+        .split_once("let verification =")
+        .expect("bounded post-V1-claim refresh")
+        .0;
+    assert_aggregated_before(
+        v1_claim_refresh,
+        "if let Err(error) = sidecar_refresh",
+        &[
+            "let sidecar_refresh =",
+            "let v2_refresh =",
+            "let journal_refresh =",
+            "let additional_refresh_result =",
+        ],
+    );
+
+    let a3_outer_refresh = settled_existing
+        .split_once("let mut refresh_after_a3_create = || {")
+        .expect("A3 outer refresh callback")
+        .1
+        .split_once("}; journals.record_phase_a_place_live_dispatch_authorized_with_refresh(")
+        .expect("bounded A3 outer refresh callback")
+        .0;
+    assert_aggregated_before(
+        a3_outer_refresh,
+        "sidecar_refresh?;",
+        &[
+            "let sidecar_refresh =",
+            "let v2_refresh =",
+            "let additional_refresh_result =",
+        ],
+    );
+
+    let a3_journal_refresh = journal
+        .split_once("pub(crate) fn record_phase_a_place_live_dispatch_authorized_with_refresh(")
+        .expect("A3 journal refresh seam")
+        .1
+        .split_once("fn record_place_dispatch_authorized_inner(")
+        .expect("bounded A3 journal refresh seam")
+        .0;
+    let a3_journal_refresh = compact_whitespace(a3_journal_refresh);
+    assert_aggregated_before(
+        &a3_journal_refresh,
+        "artifact_refresh?;",
+        &[
+            "let artifact_refresh =",
+            "let intent_refresh =",
+            "let dispatch_refresh =",
+            "let authorization_refresh =",
+            "let additional_refresh_result =",
+            "let artifact_validation =",
+        ],
+    );
+
+    let callback = production
+        .split_once("struct PhaseAAttemptHeldParentRefreshV4")
+        .expect("V4 held-parent callback")
+        .1
+        .split_once("fn make_prepared(")
+        .expect("bounded V4 held-parent callback")
+        .0;
+    for required in [
+        "expected_ledger_bytes: &'a [u8]",
+        "expected_claim_bytes: &'a [u8]",
+        "sidecar.validate_exact_bytes(expected_sidecar_bytes)",
+        "validate_exact_bytes(self.expected_ledger_bytes)",
+        "validate_exact_bytes(self.expected_claim_bytes)",
+    ] {
+        assert!(
+            callback.contains(required),
+            "V4 refresh callback lost exact-byte obligation `{required}`"
+        );
+    }
+    let callback = compact_whitespace(callback);
+    assert_aggregated_before(
+        &callback,
+        "sidecar_validation?;",
+        &[
+            "let sidecar_validation =",
+            "let ledger =",
+            "let claim =",
+            "let ledger_validation =",
+            "let claim_validation =",
+        ],
+    );
+
+    let evidence_revalidation = online
+        .split_once("pub(crate) fn revalidate_phase_a_online_preflight_v2_evidence_only(")
+        .expect("sealed V2 evidence-only revalidation")
+        .1
+        .split_once("/// Consume the complete V2 composite")
+        .expect("bounded sealed V2 evidence-only revalidation")
+        .0;
+    assert_eq!(
+        evidence_revalidation
+            .matches("owner.validate_held_complete_set()")
+            .count(),
+        2,
+        "V2 exact set must bracket the fresh V1 evidence check"
+    );
+    assert!(
+        evidence_revalidation
+            .contains("self.revalidate_phase_a_place_evidence_only(&mut owner.v1)")
+    );
+    assert!(!evidence_revalidation.contains("PmPhaseAOnlinePreflightNetworkDispatchOwnerV2"));
+    assert!(!evidence_revalidation.contains("revalidate_phase_a_place_for_network_dispatch"));
+
+    let v1_evidence_revalidation = journal
+        .split_once("pub(crate) fn revalidate_phase_a_place_evidence_only(")
+        .expect("sealed V1 evidence-only revalidation")
+        .1
+        .split_once("/// Consume the sole combined DND token")
+        .expect("bounded sealed V1 evidence-only revalidation")
+        .0;
+    for required in [
+        "require_phase_a_live_epoch",
+        "require_phase_a_live_dispatch_tail",
+        "validate_phase_a_live_durable_set",
+        "grant_matches_v1_dispatch",
+    ] {
+        assert!(v1_evidence_revalidation.contains(required));
+    }
+    for forbidden in [
+        "PmPhaseAPlaceNetworkDispatchOwnerV1",
+        "PmPhaseAPlaceLiveDispatchProfileV1",
+        "into_may_have_been_dispatched",
+    ] {
+        assert!(!v1_evidence_revalidation.contains(forbidden));
     }
 }
 

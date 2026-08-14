@@ -72,6 +72,19 @@ const FIXED_PROXY_PLACE_SEMANTIC_PROFILE: FixedPlaceSemanticProfile = FixedPlace
     ..FIXED_PLACE_SEMANTIC_PROFILE
 };
 
+const FIXED_GTC_FILL_PLACE_SEMANTIC_PROFILE: FixedPlaceSemanticProfile =
+    FixedPlaceSemanticProfile {
+        post_only: false,
+        ..FIXED_PLACE_SEMANTIC_PROFILE
+    };
+
+const FIXED_PROXY_GTC_FILL_PLACE_SEMANTIC_PROFILE: FixedPlaceSemanticProfile =
+    FixedPlaceSemanticProfile {
+        signature_type: PM_CLOB_V2_PROXY_SIGNATURE_TYPE,
+        maker_equals_signer: false,
+        ..FIXED_GTC_FILL_PLACE_SEMANTIC_PROFILE
+    };
+
 #[derive(Clone, Copy)]
 struct PlaceSemanticCommitmentBasis {
     profile: FixedPlaceSemanticProfile,
@@ -151,13 +164,33 @@ pub fn derive_place_public_request_identity(
     domain: PmClobDomain,
     order: PmUnsignedClobV2Order,
 ) -> PlacePublicRequestIdentity {
+    derive_place_public_request_identity_with_profile(domain, order, false)
+}
+
+/// Derive the public identity for the fixed marketable GTC/non-post-only
+/// profile used by the bounded production fill probe.
+#[must_use]
+pub fn derive_gtc_fill_place_public_request_identity(
+    domain: PmClobDomain,
+    order: PmUnsignedClobV2Order,
+) -> PlacePublicRequestIdentity {
+    derive_place_public_request_identity_with_profile(domain, order, true)
+}
+
+fn derive_place_public_request_identity_with_profile(
+    domain: PmClobDomain,
+    order: PmUnsignedClobV2Order,
+    gtc_fill: bool,
+) -> PlacePublicRequestIdentity {
     let expected_order_id = ExpectedOrderId::from_bytes(order_digest(
         domain_separator(domain),
         order_struct_hash(order),
     ));
-    let profile = match order.signature_profile() {
-        PmClobV2SignatureType::Eoa => FIXED_PLACE_SEMANTIC_PROFILE,
-        PmClobV2SignatureType::Proxy => FIXED_PROXY_PLACE_SEMANTIC_PROFILE,
+    let profile = match (order.signature_profile(), gtc_fill) {
+        (PmClobV2SignatureType::Eoa, false) => FIXED_PLACE_SEMANTIC_PROFILE,
+        (PmClobV2SignatureType::Proxy, false) => FIXED_PROXY_PLACE_SEMANTIC_PROFILE,
+        (PmClobV2SignatureType::Eoa, true) => FIXED_GTC_FILL_PLACE_SEMANTIC_PROFILE,
+        (PmClobV2SignatureType::Proxy, true) => FIXED_PROXY_GTC_FILL_PLACE_SEMANTIC_PROFILE,
     };
     let semantic_request_commitment = hash_place_semantic_basis(PlaceSemanticCommitmentBasis {
         profile,
@@ -204,6 +237,16 @@ pub struct SignedClobV2Order {
     semantic_request_commitment: PlaceSemanticRequestCommitment,
 }
 
+/// One signed order bound to the fixed GTC/non-post-only fill profile.
+/// It cannot be serialized as a post-only request.
+pub struct SignedGtcFillClobV2Order(SignedClobV2Order);
+
+impl fmt::Debug for SignedGtcFillClobV2Order {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SignedGtcFillClobV2Order([REDACTED])")
+    }
+}
+
 impl SignedClobV2Order {
     #[must_use]
     pub const fn expected_order_id(&self) -> ExpectedOrderId {
@@ -227,6 +270,43 @@ pub struct SerializedPlaceRequest {
     expected_taking_amount: U256,
     runtime_exact_body_commitment: RuntimeExactBodyCommitment,
     semantic_request_commitment: PlaceSemanticRequestCommitment,
+}
+
+/// Final fixed GTC/non-post-only fill body. This is purpose-distinct from the
+/// ordinary post-only body all the way through authentication and transport.
+pub struct SerializedGtcFillPlaceRequest(pub(crate) SerializedPlaceRequest);
+
+impl SerializedGtcFillPlaceRequest {
+    #[must_use]
+    pub const fn expected_order_id(&self) -> ExpectedOrderId {
+        self.0.expected_order_id()
+    }
+
+    #[must_use]
+    pub const fn expected_making_amount(&self) -> U256 {
+        self.0.expected_making_amount()
+    }
+
+    #[must_use]
+    pub const fn expected_taking_amount(&self) -> U256 {
+        self.0.expected_taking_amount()
+    }
+
+    #[must_use]
+    pub const fn runtime_exact_body_commitment(&self) -> RuntimeExactBodyCommitment {
+        self.0.runtime_exact_body_commitment()
+    }
+
+    #[must_use]
+    pub const fn semantic_request_commitment(&self) -> PlaceSemanticRequestCommitment {
+        self.0.semantic_request_commitment()
+    }
+}
+
+impl fmt::Debug for SerializedGtcFillPlaceRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SerializedGtcFillPlaceRequest([REDACTED])")
+    }
 }
 
 impl SerializedPlaceRequest {
@@ -305,6 +385,25 @@ impl FixedEoaSigner {
         domain: PmClobDomain,
         order: PmUnsignedClobV2Order,
     ) -> Result<SignedClobV2Order, PmAuthError> {
+        self.sign_clob_v2_order_with_profile(domain, order, false)
+    }
+
+    /// Sign one checked order for the bounded GTC/non-post-only fill profile.
+    pub fn sign_gtc_fill_clob_v2_order(
+        &self,
+        domain: PmClobDomain,
+        order: PmUnsignedClobV2Order,
+    ) -> Result<SignedGtcFillClobV2Order, PmAuthError> {
+        self.sign_clob_v2_order_with_profile(domain, order, true)
+            .map(SignedGtcFillClobV2Order)
+    }
+
+    fn sign_clob_v2_order_with_profile(
+        &self,
+        domain: PmClobDomain,
+        order: PmUnsignedClobV2Order,
+        gtc_fill: bool,
+    ) -> Result<SignedClobV2Order, PmAuthError> {
         let account = self.address().as_core();
         let identity_matches = match order.signature_profile() {
             PmClobV2SignatureType::Eoa => order.maker() == account && order.signer() == account,
@@ -314,7 +413,11 @@ impl FixedEoaSigner {
             return Err(PmAuthError::OrderIdentityMismatch);
         }
 
-        let public_identity = derive_place_public_request_identity(domain, order);
+        let public_identity = if gtc_fill {
+            derive_gtc_fill_place_public_request_identity(domain, order)
+        } else {
+            derive_place_public_request_identity(domain, order)
+        };
         let digest = public_identity.expected_order_id().bytes();
         let signing_key = self.signing_key()?;
         let (signature, recovery_id) = signing_key
@@ -353,6 +456,24 @@ impl L2Credentials {
         &self,
         order: SignedClobV2Order,
     ) -> Result<SerializedPlaceRequest, PmAuthError> {
+        self.serialize_fixed_gtc(order, true)
+    }
+
+    /// Consume a fill-profile signed order into a fixed GTC/non-post-only
+    /// body. No arbitrary order type or post-only flag is caller supplied.
+    pub fn serialize_gtc_fill(
+        &self,
+        order: SignedGtcFillClobV2Order,
+    ) -> Result<SerializedGtcFillPlaceRequest, PmAuthError> {
+        self.serialize_fixed_gtc(order.0, false)
+            .map(SerializedGtcFillPlaceRequest)
+    }
+
+    fn serialize_fixed_gtc(
+        &self,
+        order: SignedClobV2Order,
+        post_only: bool,
+    ) -> Result<SerializedPlaceRequest, PmAuthError> {
         if order.signer != self.address() {
             return Err(PmAuthError::CredentialIdentityMismatch);
         }
@@ -385,7 +506,7 @@ impl L2Credentials {
             },
             order_type: "GTC",
             owner: self.api_key(),
-            post_only: true,
+            post_only,
         };
         let body = Zeroizing::new(
             serde_json::to_vec(&body).map_err(|_| PmAuthError::SerializationFailure)?,
@@ -610,11 +731,14 @@ mod tests {
     use super::{
         CancelSemanticCommitmentBasis, FIXED_CANCEL_SEMANTIC_PROFILE, FIXED_PLACE_SEMANTIC_PROFILE,
         FIXED_PROXY_PLACE_SEMANTIC_PROFILE, FixedCancelSemanticProfile, FixedPlaceSemanticProfile,
-        ORDER_TYPE, PlaceSemanticCommitmentBasis, derive_owned_cancel_semantic_request_commitment,
-        derive_place_public_request_identity, domain_separator, hash_cancel_semantic_basis,
-        hash_place_semantic_basis, order_struct_hash,
+        ORDER_TYPE, PlaceSemanticCommitmentBasis, derive_gtc_fill_place_public_request_identity,
+        derive_owned_cancel_semantic_request_commitment, derive_place_public_request_identity,
+        domain_separator, hash_cancel_semantic_basis, hash_place_semantic_basis, order_struct_hash,
     };
-    use crate::{EoaAddress, ExpectedOrderId, FixedOrderId, PmClobDomain};
+    use crate::{
+        EoaAddress, EoaPrivateKeyInput, ExpectedOrderId, FixedEoaSigner, FixedOrderId,
+        L2CredentialInput, L2Credentials, PmClobDomain,
+    };
     use reap_pm_core::{
         EvmAddress, PmOrderSalt, PmOrderSide, PmPrice, PmQuantity, PmTick, PmTokenId, U256,
     };
@@ -690,6 +814,47 @@ mod tests {
             negative_risk.semantic_request_commitment()
         );
         assert!(format!("{standard:?}").contains("mutation_authority: false"));
+    }
+
+    #[test]
+    fn gtc_fill_profile_is_distinct_and_serializes_only_non_post_only_gtc() {
+        let order = vector_order(PmOrderSide::Buy);
+        let post_only = derive_place_public_request_identity(PmClobDomain::Standard, order);
+        let fill = derive_gtc_fill_place_public_request_identity(PmClobDomain::Standard, order);
+        assert_eq!(post_only.expected_order_id(), fill.expected_order_id());
+        assert_ne!(
+            post_only.semantic_request_commitment(),
+            fill.semantic_request_commitment()
+        );
+
+        let signer = FixedEoaSigner::bind(
+            EoaPrivateKeyInput::new(
+                "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".into(),
+            ),
+            "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+        )
+        .unwrap();
+        let credentials = L2Credentials::bind(
+            "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+            L2CredentialInput::new(
+                "00000000-0000-4000-8000-000000000001".into(),
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+                "synthetic-passphrase".into(),
+            ),
+        )
+        .unwrap();
+        let signed = signer
+            .sign_gtc_fill_clob_v2_order(PmClobDomain::Standard, order)
+            .unwrap();
+        let serialized = credentials.serialize_gtc_fill(signed).unwrap();
+        assert_eq!(
+            serialized.semantic_request_commitment(),
+            fill.semantic_request_commitment()
+        );
+        let body: serde_json::Value = serde_json::from_slice(serialized.0.body.as_slice()).unwrap();
+        assert_eq!(body["orderType"], "GTC");
+        assert_eq!(body["postOnly"], false);
+        assert_eq!(body["deferExec"], false);
     }
 
     fn place_semantic_basis() -> PlaceSemanticCommitmentBasis {

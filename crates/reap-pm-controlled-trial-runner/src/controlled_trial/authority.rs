@@ -1,4 +1,22 @@
 mod credential_custody;
+#[cfg(target_os = "linux")]
+mod local_operator_cooperative_custody_v1;
+#[cfg(target_os = "linux")]
+mod production_order_v1;
+
+#[cfg(target_os = "linux")]
+pub(super) use self::local_operator_cooperative_custody_v1::{
+    GenerationBoundUnopenedLocalOperatorFreshCredentialCustodyV1,
+    PreparedUnopenedLocalOperatorFreshCredentialCustodyV1,
+    prepare_unopened_local_operator_fresh_credential_custody_v1,
+};
+#[cfg(target_os = "linux")]
+pub(crate) use self::production_order_v1::{
+    PredarbExactOrderReconciliationRequestV1, PredarbOwnedFillPositionReconciliationRequestV1,
+    PredarbProductionOrderRequestV1, reconcile_predarb_exact_order_v1,
+    reconcile_predarb_owned_fill_position_v1, run_authorized_predarb_minimum_fill_v1,
+    run_authorized_predarb_place_then_cancel_v1,
+};
 
 use std::{
     fmt,

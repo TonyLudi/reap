@@ -10,6 +10,14 @@ use std::fmt;
 
 use reap_polymarket_auth::{AuthenticatedL2Headers, FixedOrderId, L2Timestamp};
 
+#[cfg(target_os = "linux")]
+pub(super) use authority::{
+    PredarbExactOrderReconciliationRequestV1, PredarbOwnedFillPositionReconciliationRequestV1,
+    PredarbProductionOrderRequestV1, reconcile_predarb_exact_order_v1,
+    reconcile_predarb_owned_fill_position_v1, run_authorized_predarb_minimum_fill_v1,
+    run_authorized_predarb_place_then_cancel_v1,
+};
+
 /// An L2 timestamp admitted by the future in-process freshness/session join.
 ///
 /// This wrapper has no public constructor. The current authority tests mint

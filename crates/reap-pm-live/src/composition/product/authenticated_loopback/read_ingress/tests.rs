@@ -161,7 +161,13 @@ fn actor_rotation_and_transport_ordering_are_source_pinned() {
     assert!(actor.contains("PmPublicServiceOutcome::ResyncRequired"));
     assert!(actor.contains("request_rest_book(PmRestBookPurpose::Resync)"));
 
-    let user = std::fs::read_to_string(root.join("user.rs")).unwrap();
+    let user = std::fs::read_to_string(
+        root.ancestors()
+            .nth(4)
+            .expect("read-ingress has a crate src ancestor")
+            .join("private_user_ws.rs"),
+    )
+    .unwrap();
     let opened = user.find("PmUserWsEvent::ConnectionOpened").unwrap();
     let subscribed = user.find("PmUserWsEvent::SubscriptionSent").unwrap();
     let canonical = user.find("start_user_connection(observation)").unwrap();

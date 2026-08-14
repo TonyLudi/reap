@@ -18,15 +18,14 @@ use crate::lanes::{
 };
 use crate::private_monitor::{
     PmAccountFixtureInput, PmLiveAccountInput, PmLiveConnectionInput, PmLiveIngressReport,
-    PmLiveOpenOrdersInput, PmLiveOrderDetailInput, PmLivePrivateInput, PmLiveReconciliationInput,
-    PmLiveRetirementInput, PmOpenOrdersFixtureInput, PmOrderDetailFixtureInput,
-    PmReconciliationFixtureInput,
+    PmLiveInternalControlOccurrence, PmLiveOpenOrdersInput, PmLiveOrderDetailInput,
+    PmLivePrivateInput, PmLiveReconciliationInput, PmLiveRetirementInput, PmOpenOrdersFixtureInput,
+    PmOrderDetailFixtureInput, PmReconciliationFixtureInput,
 };
 #[cfg(any(test, feature = "loopback-evidence"))]
 use crate::private_monitor::{
-    PmLiveAccountFailureInput, PmLiveHttpDependencyFailure, PmLiveInternalControlOccurrence,
-    PmLiveMutationCompletionOccurrence, PmLiveOpenOrdersFailureInput,
-    PmLiveOrderDetailFailureInput, PmLivePersistencePollOccurrence,
+    PmLiveAccountFailureInput, PmLiveHttpDependencyFailure, PmLiveMutationCompletionOccurrence,
+    PmLiveOpenOrdersFailureInput, PmLiveOrderDetailFailureInput, PmLivePersistencePollOccurrence,
     PmLiveReconciliationFailureInput,
 };
 use crate::public_routes::{OkxPublicUnavailable, PmPublicUnavailable};
@@ -745,12 +744,20 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         self.mutation.private().fill_watermark()
     }
 
-    /// Test-only immutable canonical view for runtime-versus-restart parity.
+    /// Immutable canonical view. It carries no reducer, journal, transport,
+    /// or mutation authority.
+    pub(crate) fn private_projection(
+        &self,
+    ) -> crate::private_monitor::PmReadOnlyPrivateProjection<'_> {
+        self.mutation.private().private_projection()
+    }
+
+    /// Test alias retained for runtime-versus-restart parity.
     #[cfg(test)]
     pub(crate) fn private_projection_for_test(
         &self,
     ) -> crate::private_monitor::PmReadOnlyPrivateProjection<'_> {
-        self.mutation.private().private_projection_for_test()
+        self.private_projection()
     }
 
     pub(crate) const fn pending_effect_outputs(&self) -> usize {

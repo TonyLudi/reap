@@ -1,0 +1,40 @@
+[package]
+name = "reap-pm-credential-proof-runner"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+loopback-evidence = [
+    "dep:libc",
+    "dep:reap-polymarket-egress-binding",
+    "dep:reqwest",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:sha2",
+    "dep:tokio",
+    "dep:zeroize",
+    "reap-polymarket-egress-binding/loopback-evidence",
+]
+
+[dependencies]
+libc = { workspace = true, optional = true }
+reap-polymarket-auth.workspace = true
+reap-polymarket-egress-binding = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
+
+[dev-dependencies]
+libc.workspace = true
+reap-polymarket-egress-binding = { workspace = true, features = ["loopback-evidence"] }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile = "3"
+tokio.workspace = true
+zeroize.workspace = true

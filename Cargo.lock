@@ -1505,6 +1505,7 @@ dependencies = [
 name = "reap-pm-controlled-trial"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chrono",
  "clap",
  "libc",
@@ -1514,6 +1515,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sha3",
  "tempfile",
  "thiserror",
  "zeroize",
@@ -1539,6 +1541,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "clap",
  "libc",
  "nix",
  "reap-pm-controlled-trial",
@@ -1554,6 +1557,8 @@ dependencies = [
  "reap-polymarket-wire",
  "reap-transport",
  "rustix",
+ "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "thiserror",
@@ -1571,6 +1576,22 @@ dependencies = [
  "sha2",
  "thiserror",
  "trybuild",
+]
+
+[[package]]
+name = "reap-pm-credential-proof-runner"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "reap-polymarket-auth",
+ "reap-polymarket-egress-binding",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]

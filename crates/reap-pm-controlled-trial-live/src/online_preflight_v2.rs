@@ -340,6 +340,30 @@ pub struct PmPendingPhaseAOnlinePreflightBasisV2 {
     basis: OnlinePreflightSidecarLineV2,
 }
 
+/// Crate-private refresh callback for additive durable conjuncts which predate
+/// the existing V2/V1/A3 create-new transitions. External crates cannot name
+/// or implement this trait, and the public V2 path always uses the sealed
+/// no-op implementation below.
+pub(crate) trait PmOnlinePreflightV2BoundCreateRefresh {
+    fn refresh_after_bound_create(
+        &mut self,
+        sidecar: &mut ProtectedJournal,
+        expected_sidecar_bytes: &[u8],
+    ) -> Result<(), PmTrialLiveJournalError>;
+}
+
+struct NoAdditionalBoundCreateRefresh;
+
+impl PmOnlinePreflightV2BoundCreateRefresh for NoAdditionalBoundCreateRefresh {
+    fn refresh_after_bound_create(
+        &mut self,
+        _sidecar: &mut ProtectedJournal,
+        _expected_sidecar_bytes: &[u8],
+    ) -> Result<(), PmTrialLiveJournalError> {
+        Ok(())
+    }
+}
+
 impl PmPendingPhaseAOnlinePreflightBasisV2 {
     /// Borrow only the public PlacePrepared evidence needed to construct and
     /// sign the exact body. No acknowledgement or consumption owner escapes.
@@ -369,9 +393,49 @@ impl PmPendingPhaseAOnlinePreflightBasisV2 {
         &self.basis.record_fingerprint
     }
 
+    /// Exact durable PlacePrepared evidence fingerprint for an additive,
+    /// crate-private lineage record. This does not expose the acknowledgement.
+    pub(crate) fn place_prepared_record_fingerprint(&self) -> &str {
+        self.prepared.record_fingerprint()
+    }
+
     #[must_use]
     pub const fn authorization(&self) -> OfflineAuthorizationState {
         OfflineAuthorizationState::DENIED
+    }
+
+    /// Refresh every descriptor-backed parent already held by Basis after a
+    /// later, crate-private conjunct creates a new artifact-directory entry.
+    /// This exposes neither a component nor a transition capability.
+    pub(crate) fn refresh_after_additive_bound_create(
+        &mut self,
+        journals: &mut PmControlledTrialLiveJournals,
+    ) -> Result<(), PmPhaseAOnlinePreflightV2Error> {
+        // A create-new additive artifact changes every held parent-directory
+        // snapshot. Attempt every refresh and the sidecar byte check before
+        // reporting any failure, so no surviving holder is left deliberately
+        // stale merely because an earlier refresh failed.
+        let sidecar_refresh = self.sidecar.refresh_parent_after_bound_create();
+        let v1_refresh = self.v1_consumption.refresh_after_bound_artifact_create();
+        let v2_refresh = self.v2_consumption.refresh_after_bound_artifact_create();
+        let journal_refresh = journals.refresh_after_online_preflight_v2_artifact_create();
+        let sidecar_validation = self
+            .sidecar
+            .validate_exact_bytes(&self.expected_sidecar_bytes);
+        if let Err(error) = sidecar_refresh {
+            return Err(error.into());
+        }
+        if v1_refresh.is_err() {
+            return Err(PmPhaseAOnlinePreflightV2Error::V1Consumption);
+        }
+        if v2_refresh.is_err() {
+            return Err(PmPhaseAOnlinePreflightV2Error::V2Consumption);
+        }
+        if let Err(error) = journal_refresh {
+            return Err(error.into());
+        }
+        sidecar_validation?;
+        Ok(())
     }
 
     /// Burn V2 first, then V1, create the unchanged V1 A3 barrier, and append
@@ -383,6 +447,30 @@ impl PmPendingPhaseAOnlinePreflightBasisV2 {
         v1_authorization: &CanonicalAuthorization,
         v1_runtime: &AuthorizationRuntimeBinding,
         v2_runtime: &OnlineAuthorizationRuntimeBindingV2,
+    ) -> Result<PmPhaseAOnlinePreflightDispatchOwnerV2, PmPhaseAOnlinePreflightV2Error> {
+        let mut no_additional_refresh = NoAdditionalBoundCreateRefresh;
+        self.burn_and_record_a3_with_refresh(
+            journals,
+            config,
+            v1_authorization,
+            v1_runtime,
+            v2_runtime,
+            &mut no_additional_refresh,
+        )
+    }
+
+    /// Identical V2 -> V1 -> V1 A3 -> V2-conjunct transition with one sealed
+    /// callback which refreshes an older additive holder after each new claim
+    /// or barrier directory entry. The callback cannot alter the settled burn
+    /// order and is unavailable outside this crate.
+    pub(crate) fn burn_and_record_a3_with_refresh(
+        self,
+        journals: &mut PmControlledTrialLiveJournals,
+        config: &CanonicalTrialConfig,
+        v1_authorization: &CanonicalAuthorization,
+        v1_runtime: &AuthorizationRuntimeBinding,
+        v2_runtime: &OnlineAuthorizationRuntimeBindingV2,
+        additional_refresh: &mut impl PmOnlinePreflightV2BoundCreateRefresh,
     ) -> Result<PmPhaseAOnlinePreflightDispatchOwnerV2, PmPhaseAOnlinePreflightV2Error> {
         let Self {
             prepared,
@@ -403,11 +491,21 @@ impl PmPendingPhaseAOnlinePreflightBasisV2 {
 
         // The V2 claim is a new directory entry. Refresh every older held
         // view before the V1 burn can create its claim.
-        sidecar.refresh_parent_after_bound_create()?;
-        v1_consumption
-            .refresh_after_bound_artifact_create()
-            .map_err(|_| PmPhaseAOnlinePreflightV2Error::V1Consumption)?;
-        journals.refresh_after_online_preflight_v2_artifact_create()?;
+        let sidecar_refresh = sidecar.refresh_parent_after_bound_create();
+        let v1_refresh = v1_consumption.refresh_after_bound_artifact_create();
+        let journal_refresh = journals.refresh_after_online_preflight_v2_artifact_create();
+        let additional_refresh_result =
+            additional_refresh.refresh_after_bound_create(&mut sidecar, &expected_sidecar_bytes);
+        if let Err(error) = sidecar_refresh {
+            return Err(error.into());
+        }
+        if v1_refresh.is_err() {
+            return Err(PmPhaseAOnlinePreflightV2Error::V1Consumption);
+        }
+        if let Err(error) = journal_refresh {
+            return Err(error.into());
+        }
+        additional_refresh_result?;
 
         let v1_consumption = v1_consumption
             .consume(config, v1_authorization, v1_runtime)
@@ -415,26 +513,48 @@ impl PmPendingPhaseAOnlinePreflightBasisV2 {
 
         // The V1 claim is another new directory entry. Refresh V2 and the
         // sidecar before either can be used in the final conjunct.
-        sidecar.refresh_parent_after_bound_create()?;
-        v2_consumption
-            .refresh_after_bound_artifact_create()
-            .map_err(|_| PmPhaseAOnlinePreflightV2Error::V2Consumption)?;
-        journals.refresh_after_online_preflight_v2_artifact_create()?;
+        let sidecar_refresh = sidecar.refresh_parent_after_bound_create();
+        let v2_refresh = v2_consumption.refresh_after_bound_artifact_create();
+        let journal_refresh = journals.refresh_after_online_preflight_v2_artifact_create();
+        let additional_refresh_result =
+            additional_refresh.refresh_after_bound_create(&mut sidecar, &expected_sidecar_bytes);
+        if let Err(error) = sidecar_refresh {
+            return Err(error.into());
+        }
+        if v2_refresh.is_err() {
+            return Err(PmPhaseAOnlinePreflightV2Error::V2Consumption);
+        }
+        if let Err(error) = journal_refresh {
+            return Err(error.into());
+        }
+        additional_refresh_result?;
 
         let verification = verify_authorization_consumption(config, v1_authorization)
             .map_err(|_| PmPhaseAOnlinePreflightV2Error::V1Consumption)?;
         let proof =
             journals.bind_consumed_authorization(prepared, v1_consumption, &verification)?;
-        let v1 = journals.record_phase_a_place_live_dispatch_authorized(proof)?;
+        let (v1, additional_refresh_result) = {
+            let mut refresh_after_a3_create = || {
+                let sidecar_refresh = sidecar.refresh_parent_after_bound_create();
+                let v2_refresh = v2_consumption.refresh_after_bound_artifact_create();
+                let additional_refresh_result = additional_refresh
+                    .refresh_after_bound_create(&mut sidecar, &expected_sidecar_bytes);
+                sidecar_refresh?;
+                if v2_refresh.is_err() {
+                    return Err(PmTrialLiveJournalError::Protection);
+                }
+                additional_refresh_result
+            };
+            journals.record_phase_a_place_live_dispatch_authorized_with_refresh(
+                proof,
+                &mut refresh_after_a3_create,
+            )?
+        };
         let v1 = v1.revalidate_for_runner()?;
 
         // From here onward a V1 A3 exists. Any V2-side failure returns only a
         // DND-capable sealed owner; it never returns positive V1 authority.
-        if sidecar.refresh_parent_after_bound_create().is_err()
-            || v2_consumption
-                .refresh_after_bound_artifact_create()
-                .is_err()
-        {
+        if additional_refresh_result.is_err() {
             return Err(post_a3_failure(
                 PmPhaseAOnlinePreflightPostA3FailureReasonV2::ParentRefresh,
                 v1,
@@ -717,6 +837,22 @@ impl fmt::Debug for PmPhaseAOnlinePreflightNetworkDispatchOwnerV2<'_> {
 }
 
 impl PmControlledTrialLiveJournals {
+    /// Borrow and revalidate the complete V2 exact set plus the fresh V1
+    /// journal, dispatch-tail, barrier, consumption, and outstanding epoch.
+    /// This crate-private evidence seam constructs no network-boundary owner,
+    /// exposes no profile or component, and returns no authority-bearing value.
+    pub(crate) fn revalidate_phase_a_online_preflight_v2_evidence_only(
+        &mut self,
+        owner: &mut PmPhaseAOnlinePreflightDispatchOwnerV2,
+    ) -> Result<(), PmPhaseAOnlinePreflightV2Error> {
+        owner.validate_held_complete_set()?;
+        self.revalidate_phase_a_place_evidence_only(&mut owner.v1)?;
+        // Close the interval occupied by the V1 journal-backed check with a
+        // second exact V2 validation while all evidence custody remains held.
+        owner.validate_held_complete_set()?;
+        Ok(())
+    }
+
     /// Consume the complete V2 composite at the final durable boundary. V2 is
     /// revalidated first; the unchanged V1 method then performs the fresh
     /// journal, barrier, consumption, tail, and outstanding-epoch recheck.

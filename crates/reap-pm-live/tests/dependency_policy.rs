@@ -846,6 +846,55 @@ fn live_occurrence_issuer_is_sealed_and_http_purposes_cannot_be_relabelled() {
 }
 
 #[test]
+fn production_private_user_stream_reuses_canonical_state_without_order_entry_authority() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let production = std::fs::read_to_string(root.join("production_private_user_ws.rs")).unwrap();
+    let shared = std::fs::read_to_string(root.join("private_user_ws.rs")).unwrap();
+    let loopback = std::fs::read_to_string(
+        root.join("composition/product/authenticated_loopback/read_ingress/user.rs"),
+    )
+    .unwrap();
+    let run = std::fs::read_to_string(root.join("composition/product/run.rs")).unwrap();
+
+    for required in [
+        "role: PmProductionSelectedUserWsRole",
+        "debug_assert!(!role.production_order_entry_authorized())",
+        "PmUserWsEventSink for PmProductionPrivateUserWsSink",
+        "self.run.connect_private_live(input)?",
+        "self.run.ingest_private_live(input)?",
+        "self.run.mark_private_live_unavailable(input)?",
+        "self.run.request_live_shutdown(input)?",
+        "self.run.service_turn(edge.monotonic_receive_ns)?",
+        "self.run.private_projection()",
+        "while let Some(effect) = self.run.pop_effect()",
+        "A duplicate fill cannot move the",
+    ] {
+        assert!(
+            production.contains(required),
+            "missing production private-state invariant: {required}"
+        );
+    }
+    for forbidden in [
+        "prepare_place_once",
+        "authenticate_exact_owned_cancel",
+        "PmFixedPlace",
+        "PmExactOwnedCancel",
+        "OpaqueAuthenticated",
+        "PRODUCTION_ORDER_ENTRY_AUTHORIZED: bool = true",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "production private-state path gained mutation authority: {forbidden}"
+        );
+    }
+    assert!(shared.contains("pub(crate) struct PmUserIngressState"));
+    assert!(shared.contains("pub(crate) fn admit("));
+    assert!(loopback.contains("crate::private_user_ws::PmUserIngressState"));
+    assert!(loopback.contains(".admit(event, actor.issuer)"));
+    assert!(run.contains("pub fn private_projection(&self)"));
+}
+
+#[test]
 fn authenticated_stage_validates_the_owner_configuration_before_opening_a_journal() {
     let source = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src/coordinator/authenticated_execution.rs"),

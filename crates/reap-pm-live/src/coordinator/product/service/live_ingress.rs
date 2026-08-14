@@ -149,7 +149,6 @@ impl<M: PmQuoteModel> PmCoordinator<M> {
         )
     }
 
-    #[cfg(any(test, feature = "loopback-evidence"))]
     pub(crate) fn request_live_shutdown(
         &mut self,
         occurrence: PmLiveInternalControlOccurrence,

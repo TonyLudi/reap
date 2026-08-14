@@ -511,11 +511,16 @@ impl PmPrivateMonitorRuntime {
         self.state.cardinalities()
     }
 
-    /// Test-only immutable view used to compare live state with its exact
-    /// restart projection. It carries no reducer or cursor authority.
+    /// Immutable view over the canonical private state. It carries no reducer
+    /// or cursor authority.
+    pub(crate) const fn private_projection(&self) -> PmReadOnlyPrivateProjection<'_> {
+        PmReadOnlyPrivateProjection::new(&self.state)
+    }
+
+    /// Test alias retained for runtime-versus-restart parity checks.
     #[cfg(test)]
     pub(crate) const fn private_projection_for_test(&self) -> PmReadOnlyPrivateProjection<'_> {
-        PmReadOnlyPrivateProjection::new(&self.state)
+        self.private_projection()
     }
 
     pub(crate) fn reserved_capacity_bytes(&self) -> usize {
