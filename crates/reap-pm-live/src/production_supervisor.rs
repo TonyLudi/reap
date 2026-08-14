@@ -1118,7 +1118,7 @@ struct PositionState {
 
 struct SupervisorState {
     orders: BTreeMap<String, OrderState>,
-    fills: BTreeSet<String>,
+    fills: BTreeSet<(String, String)>,
     positions: BTreeMap<String, PositionState>,
     durable_exact_cancel_intents: usize,
     ready: bool,
@@ -1254,7 +1254,8 @@ impl SupervisorState {
         {
             return Err(PmProductionSupervisorError::RoleFailed);
         }
-        if self.fills.contains(&fill.fill_id) {
+        let fill_key = (fill.fill_id.clone(), fill.venue_order_id.clone());
+        if self.fills.contains(&fill_key) {
             return Ok(false);
         }
         if self.fills.len() >= config.maximum_fills {
@@ -1301,7 +1302,7 @@ impl SupervisorState {
                     .map_err(|_| PmProductionSupervisorError::RoleFailed)?;
             }
         }
-        self.fills.insert(fill.fill_id);
+        self.fills.insert(fill_key);
         Ok(true)
     }
 
@@ -2005,7 +2006,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn polled_fill_drives_position_and_authoritative_mismatch_keeps_gate_closed() {
+    async fn polled_fill_uses_order_leg_identity_and_mismatch_keeps_gate_closed() {
         let config = PmProductionSupervisorConfig::new(
             PmSupervisorScope::new("condition", ["up".to_owned()]).unwrap(),
             Duration::from_secs(1),
@@ -2021,17 +2022,37 @@ mod tests {
             U256::from_u64(1_000_000),
         )
         .unwrap();
+        let second_facts = PmSupervisorOrderFacts::new(
+            "client-2",
+            "venue-2",
+            "up",
+            PmOrderSide::Buy,
+            U256::from_u64(1_000_000),
+        )
+        .unwrap();
         let mut state = SupervisorState {
-            orders: BTreeMap::from([(
-                "venue-1".to_owned(),
-                OrderState {
-                    facts,
-                    status: PmSupervisorOrderStatus::Live,
-                    cumulative_filled: U256::ZERO,
-                    known_filled: U256::ZERO,
-                    cancel_requested: false,
-                },
-            )]),
+            orders: BTreeMap::from([
+                (
+                    "venue-1".to_owned(),
+                    OrderState {
+                        facts,
+                        status: PmSupervisorOrderStatus::Live,
+                        cumulative_filled: U256::ZERO,
+                        known_filled: U256::ZERO,
+                        cancel_requested: false,
+                    },
+                ),
+                (
+                    "venue-2".to_owned(),
+                    OrderState {
+                        facts: second_facts,
+                        status: PmSupervisorOrderStatus::Live,
+                        cumulative_filled: U256::ZERO,
+                        known_filled: U256::ZERO,
+                        cancel_requested: false,
+                    },
+                ),
+            ]),
             fills: BTreeSet::new(),
             positions: BTreeMap::from([(
                 "up".to_owned(),
@@ -2055,8 +2076,17 @@ mod tests {
         };
         assert!(state.apply_fill(&config, fill.clone(), true).unwrap());
         assert!(!state.apply_fill(&config, fill, true).unwrap());
+        let second_leg = PmSupervisorFill {
+            fill_id: "fill-1".to_owned(),
+            venue_order_id: "venue-2".to_owned(),
+            token_id: "up".to_owned(),
+            side: PmOrderSide::Buy,
+            quantity: U256::from_u64(1_000_000),
+        };
+        assert!(state.apply_fill(&config, second_leg.clone(), true).unwrap());
+        assert!(!state.apply_fill(&config, second_leg, true).unwrap());
         let report = state.position_report().unwrap();
-        assert_eq!(report[0].fill_based, U256::from_u64(1_000_000));
+        assert_eq!(report[0].fill_based, U256::from_u64(2_000_000));
         assert!(!report[0].converged);
     }
 
