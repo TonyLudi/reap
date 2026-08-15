@@ -11,6 +11,7 @@ mod journal;
 mod lanes;
 mod private_monitor;
 mod private_user_ws;
+mod production_execution_runtime;
 mod production_private_user_ws;
 mod production_read_infrastructure;
 mod production_supervisor;
@@ -91,6 +92,10 @@ pub use private_monitor::{
     PmOrderDetailFixtureInput, PmPrivateBatchApply, PmPrivateMonitorError,
     PmPrivateMonitorInputError, PmReadOnlyMonitor, PmReadOnlyPrivateProjection,
     PmReconciliationFixtureInput,
+};
+pub use production_execution_runtime::{
+    PmProductionExecutionRuntime, PmProductionExecutionRuntimeStartError,
+    PmProductionExecutionShutdownError, PmProductionExecutionShutdownReport,
 };
 pub use production_private_user_ws::{
     PmProductionPrivateStateChange, PmProductionPrivateUserWsError,
