@@ -7,7 +7,7 @@ use std::{fmt, future::Future, pin::Pin};
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
-use reap_pm_core::{ConnectionEpoch, PmConditionId, ReceivedEventClock};
+use reap_pm_core::{ConnectionEpoch, EvmAddress, PmConditionId, ReceivedEventClock};
 use reap_polymarket_auth::{
     AuthenticatedUserSubscriptionSink, CredentialOwnedUserFrame, PmAuthError,
 };
@@ -446,6 +446,8 @@ pub fn pm_user_ws_shutdown_channel() -> (PmUserWsShutdownHandle, PmUserWsShutdow
 /// freshly minted by the sole credential authority on every connection.
 pub struct PmAuthenticatedUserWsRole {
     config: PmUserWsConfig,
+    l2_signer: EvmAddress,
+    expected_maker: EvmAddress,
     credentials: Box<dyn PmUserWsReadAuthorityProvider>,
     clock: Box<dyn PmUserWsClockSource>,
     activity: PmUserWsActivityView,
@@ -454,17 +456,23 @@ pub struct PmAuthenticatedUserWsRole {
 impl PmAuthenticatedUserWsRole {
     pub(crate) fn from_authority(
         config: PmUserWsConfig,
+        l2_signer: EvmAddress,
+        expected_maker: EvmAddress,
         credentials: crate::private_credentials::PmUserWsCredentialRole,
     ) -> Self {
-        Self::from_external_authority(config, Box::new(credentials))
+        Self::from_external_authority(config, l2_signer, expected_maker, Box::new(credentials))
     }
 
     pub(crate) fn from_external_authority(
         config: PmUserWsConfig,
+        l2_signer: EvmAddress,
+        expected_maker: EvmAddress,
         credentials: Box<dyn PmUserWsReadAuthorityProvider>,
     ) -> Self {
         Self {
             config,
+            l2_signer,
+            expected_maker,
             credentials,
             clock: Box::new(SystemUserWsClock),
             activity: PmUserWsActivityView::new(),
@@ -488,11 +496,21 @@ impl PmAuthenticatedUserWsRole {
     }
 
     #[must_use]
+    pub const fn configured_l2_signer(&self) -> EvmAddress {
+        self.l2_signer
+    }
+
+    #[must_use]
+    pub const fn configured_expected_maker(&self) -> EvmAddress {
+        self.expected_maker
+    }
+
+    #[must_use]
     pub fn activity_view(&self) -> PmUserWsActivityView {
         self.activity.clone()
     }
 
-    pub(crate) const fn is_production(&self) -> bool {
+    pub const fn is_production(&self) -> bool {
         self.config.is_production()
     }
 
@@ -565,6 +583,8 @@ impl PmProductionSelectedUserWsRole {
         let Self { role, binding } = self;
         let PmAuthenticatedUserWsRole {
             config,
+            l2_signer: _,
+            expected_maker: _,
             credentials,
             clock,
             activity,

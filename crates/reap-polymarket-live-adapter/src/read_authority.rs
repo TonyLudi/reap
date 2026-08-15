@@ -234,6 +234,8 @@ impl PmExternalProxyReadConnectivityOwner {
         );
         let user_ws = PmAuthenticatedUserWsRole::from_external_authority(
             user_ws_config,
+            l2_signer_address.as_core(),
+            proxy_funder,
             Box::new(user_ws_authority),
         );
         Ok(Self { http, user_ws })

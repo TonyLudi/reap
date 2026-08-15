@@ -2841,7 +2841,7 @@ fn loopback_mutation_custody_is_scope_bound_feature_gated_and_separate_from_read
 }
 
 #[test]
-fn authenticated_routes_are_fixed_reads_without_filter_or_mutation_escape() {
+fn authenticated_routes_are_fixed_reads_with_only_typed_condition_narrowing() {
     for required in [
         "url.set_path(\"/data/orders\")",
         "url.set_path(\"/data/trades\")",
@@ -2851,17 +2851,39 @@ fn authenticated_routes_are_fixed_reads_without_filter_or_mutation_escape() {
         ".append_pair(\"asset_type\", \"COLLATERAL\")",
         ".append_pair(\"asset_type\", \"CONDITIONAL\")",
         ".append_pair(\"signature_type\", signature_type.query_value())",
+        "ConditionOpenOrders {",
+        "ConditionTrades {",
+        "condition: PmConditionId",
+        ".append_pair(\"market\", &condition.to_string())",
     ] {
         assert!(
             PRIVATE_HTTP.contains(required),
             "missing fixed route: {required}"
         );
     }
+    assert_eq!(
+        PRIVATE_HTTP
+            .matches(".append_pair(\"market\", &condition.to_string())")
+            .count(),
+        2,
+        "only fixed order/trade condition cuts may narrow by market"
+    );
+    for required in [
+        "pub async fn begin_condition_open_orders(",
+        "pub async fn begin_condition_trades(",
+        "condition: self.exact_order_scope.condition()",
+    ] {
+        assert!(
+            RECONCILIATION.contains(required),
+            "missing typed condition-cut ownership: {required}"
+        );
+    }
     for forbidden_filter in [
-        "append_pair(\"market\"",
         "append_pair(\"asset_id\"",
         "append_pair(\"after\"",
         "append_pair(\"maker_address\"",
+        "market: &'a str",
+        "condition: &'a str",
     ] {
         assert!(
             !PRIVATE_HTTP.contains(forbidden_filter),

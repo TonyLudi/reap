@@ -1625,6 +1625,7 @@ dependencies = [
  "reap-polymarket-adapter",
  "reap-polymarket-auth",
  "reap-polymarket-live-adapter",
+ "reap-polymarket-public-source",
  "reap-polymarket-wire",
  "reap-transport",
  "serde",

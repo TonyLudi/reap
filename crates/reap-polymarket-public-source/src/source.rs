@@ -246,6 +246,16 @@ pub struct PmDataApiCurrentPositionSource {
 }
 
 impl PmDataApiCurrentPositionSource {
+    #[must_use]
+    pub const fn configured_scope(&self) -> PmDataApiPositionScope {
+        self.transport.scope
+    }
+
+    #[must_use]
+    pub const fn is_production(&self) -> bool {
+        matches!(self.transport.mode, OriginMode::Production)
+    }
+
     pub fn production(
         scope: PmDataApiPositionScope,
         connect_timeout: Duration,

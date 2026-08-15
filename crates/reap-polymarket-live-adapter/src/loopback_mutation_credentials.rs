@@ -364,6 +364,8 @@ impl PmLoopbackMutationConnectivityOwner {
         );
         let user_ws = PmAuthenticatedUserWsRole::from_authority(
             self.user_ws_config,
+            address.as_core(),
+            self.binding.account.funder().address(),
             PmUserWsCredentialRole::from_sender(senders.read),
         );
         Ok(PmLoopbackMutationConnectivityRoles {

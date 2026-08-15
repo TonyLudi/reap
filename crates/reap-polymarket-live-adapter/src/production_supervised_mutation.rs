@@ -227,6 +227,16 @@ impl PmProductionSupervisedMutationRole {
     pub const fn configured_scope(&self) -> PmWireScope {
         self.scope
     }
+
+    #[must_use]
+    pub fn configured_l2_signer(&self) -> EvmAddress {
+        self.credentials.address().as_core()
+    }
+
+    #[must_use]
+    pub const fn configured_expected_maker(&self) -> EvmAddress {
+        self.expected_proxy_maker
+    }
 }
 
 impl fmt::Debug for PmProductionSupervisedMutationRole {

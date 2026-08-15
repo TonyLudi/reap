@@ -347,6 +347,11 @@ pub struct PmReadServerTimeHttpRole {
 }
 
 impl PmReadServerTimeHttpRole {
+    #[must_use]
+    pub const fn is_production(&self) -> bool {
+        matches!(self.mode, OriginMode::Production)
+    }
+
     /// Build a standalone read-only `/time` capability.
     ///
     /// This constructor creates only a read-time clock domain. Callers do not

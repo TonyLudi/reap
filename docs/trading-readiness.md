@@ -78,14 +78,23 @@ supervises independent heartbeat/private-WS/poll roles, durably records place
 and exact-cancel intents before mutation, deduplicates WS and REST fills into a
 fill-derived position, gates entry on reconciliation with authoritative polled
 positions, and requires exact-owned cancellation plus a complete terminal
-zero-open-order cut during shutdown. The concrete heartbeat and mutation
-adapters use fixed CLOB peers/selected egress and purpose-specific server time;
-the mutation role validates the public order facts before signing.
+zero-open-order cut during shutdown. The concrete private-WebSocket adapter
+maps scoped order updates and maker/taker trade legs, admits only confirmed
+trades as irreversible fills, and closes readiness across disconnects or
+unrepresentable lifecycle changes. The concrete poll role finishes every
+condition-scoped open-order and trade cursor plus one complete authoritative
+position walk for each outcome token before publishing a cut. The fixed
+heartbeat and dual-token mutation adapters use fixed CLOB peers/selected
+egress and purpose-specific server time; exact cancellation is routed from
+durable order facts and placement validates those facts before signing. The
+strict composition also requires one non-secret signer/funder binding across
+HTTP reads, the user stream, heartbeat, positions, and both mutation roles.
 
 This is infrastructure, not a production strategy executable. A deployment
-still has to supply the exact BTC-five-minute public/private WS mapping, full
-open-order/trade/position poll role, rollover orchestration, risk/model command
-producer, host configuration, and soak evidence. Therefore
+still has to bind these roles to each active BTC-five-minute market, retain and
+join the credential-authority owner, compose the public book/reference inputs,
+run rollover orchestration, supply the risk/model command producer, and pass
+target-host fault and soak acceptance. Therefore
 `PRODUCTION_SUPERVISOR_INFRA_AVAILABLE = true` coexists with product-level
 `PRODUCTION_ORDER_ENTRY_AUTHORIZED = false` and the separate
 `ONE_SHOT_PRODUCTION_ORDER_ENTRY_AVAILABLE = true`. No one-shot ledger or

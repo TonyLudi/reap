@@ -1,6 +1,6 @@
 use std::{fmt, net::SocketAddr};
 
-use reap_pm_core::{EvmAddress, PmTokenId};
+use reap_pm_core::{EvmAddress, PmConditionId, PmTokenId};
 use reap_polymarket_auth::{AuthenticatedL2Headers, EoaAddress, FixedOrderId, L2HeaderSink};
 use reap_polymarket_egress_binding::{PmFixedTlsPeerSelection, PmLocalEgressSelection};
 use reap_polymarket_wire::{
@@ -104,8 +104,16 @@ pub(crate) enum PmPrivateRoute<'a> {
     OpenOrders {
         cursor: &'a str,
     },
+    ConditionOpenOrders {
+        cursor: &'a str,
+        condition: PmConditionId,
+    },
     Trades {
         cursor: &'a str,
+    },
+    ConditionTrades {
+        cursor: &'a str,
+        condition: PmConditionId,
     },
     ExactScopeTrades {
         cursor: &'a str,
@@ -129,7 +137,9 @@ impl PmPrivateRoute<'_> {
         match self {
             Self::ClosedOnly => MAX_PM_CLOSED_ONLY_BODY_BYTES,
             Self::OpenOrders { .. }
+            | Self::ConditionOpenOrders { .. }
             | Self::Trades { .. }
+            | Self::ConditionTrades { .. }
             | Self::ExactScopeTrades { .. }
             | Self::ExactOrder(_)
             | Self::CollateralBalanceAllowance(_)
@@ -310,9 +320,21 @@ impl PmPrivateHttpTransport {
                 url.set_path("/data/orders");
                 url.query_pairs_mut().append_pair("next_cursor", cursor);
             }
+            PmPrivateRoute::ConditionOpenOrders { cursor, condition } => {
+                url.set_path("/data/orders");
+                url.query_pairs_mut()
+                    .append_pair("market", &condition.to_string())
+                    .append_pair("next_cursor", cursor);
+            }
             PmPrivateRoute::Trades { cursor } => {
                 url.set_path("/data/trades");
                 url.query_pairs_mut().append_pair("next_cursor", cursor);
+            }
+            PmPrivateRoute::ConditionTrades { cursor, condition } => {
+                url.set_path("/data/trades");
+                url.query_pairs_mut()
+                    .append_pair("market", &condition.to_string())
+                    .append_pair("next_cursor", cursor);
             }
             PmPrivateRoute::ExactScopeTrades { cursor, scope } => {
                 return scoped_trades_route::url(&self.origin, cursor, scope);
@@ -469,6 +491,26 @@ impl PmAuthenticatedHttpOwner {
             self.expected_order_maker,
             self.balance_signature_type,
         )
+    }
+
+    #[must_use]
+    pub const fn configured_scope(&self) -> PmWireScope {
+        self.exact_order_scope
+    }
+
+    #[must_use]
+    pub fn configured_l2_signer(&self) -> EvmAddress {
+        self.l2_signer_address.as_core()
+    }
+
+    #[must_use]
+    pub const fn configured_expected_maker(&self) -> EvmAddress {
+        self.expected_order_maker
+    }
+
+    #[must_use]
+    pub const fn is_production(&self) -> bool {
+        matches!(self.transport.mode(), OriginMode::Production)
     }
 
     pub fn account(&mut self) -> PmAccountHttpRole<'_> {
@@ -1154,6 +1196,83 @@ mod tests {
             )
         );
         assert!(!request.lines().next().unwrap().contains("question="));
+
+        task.await.unwrap();
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn condition_cuts_bound_both_outcome_tokens_without_account_wide_history() {
+        let responses = vec![
+            MockResponse::ok(empty_page("cursor-next")),
+            MockResponse::ok(empty_page("LTE=")),
+            MockResponse::ok(empty_page("cursor-next")),
+            MockResponse::ok(empty_page("LTE=")),
+        ];
+        let (origin, mut requests, task) = mock_server(responses).await;
+        let (mut owner, supervisor) = local_owner(&origin, Duration::from_secs(1));
+
+        let open = owner
+            .reconciliation()
+            .begin_condition_open_orders(timestamp())
+            .await
+            .unwrap();
+        let crate::PmOpenOrdersCutProgress::Incomplete(open) = open else {
+            panic!("condition open-order cut must retain pagination")
+        };
+        assert!(matches!(
+            owner
+                .reconciliation()
+                .continue_open_orders(timestamp(), open)
+                .await
+                .unwrap(),
+            crate::PmOpenOrdersCutProgress::Complete(_)
+        ));
+        let trades = owner
+            .reconciliation()
+            .begin_condition_trades(timestamp())
+            .await
+            .unwrap();
+        let crate::PmTradesCutProgress::Incomplete(trades) = trades else {
+            panic!("condition trade cut must retain pagination")
+        };
+        assert!(matches!(
+            owner
+                .reconciliation()
+                .continue_trades(timestamp(), trades)
+                .await
+                .unwrap(),
+            crate::PmTradesCutProgress::Complete(_)
+        ));
+
+        let open_request = requests.recv().await.unwrap();
+        let open_continue = requests.recv().await.unwrap();
+        let trade_request = requests.recv().await.unwrap();
+        let trade_continue = requests.recv().await.unwrap();
+        assert_eq!(
+            open_request.lines().next().unwrap(),
+            format!("GET /data/orders?market={CONDITION}&next_cursor=MA%3D%3D HTTP/1.1")
+        );
+        assert_eq!(
+            trade_request.lines().next().unwrap(),
+            format!("GET /data/trades?market={CONDITION}&next_cursor=MA%3D%3D HTTP/1.1")
+        );
+        assert_eq!(
+            open_continue.lines().next().unwrap(),
+            format!("GET /data/orders?market={CONDITION}&next_cursor=cursor-next HTTP/1.1")
+        );
+        assert_eq!(
+            trade_continue.lines().next().unwrap(),
+            format!("GET /data/trades?market={CONDITION}&next_cursor=cursor-next HTTP/1.1")
+        );
+        for request in [
+            &open_request,
+            &open_continue,
+            &trade_request,
+            &trade_continue,
+        ] {
+            assert!(!request.contains("asset_id="));
+        }
 
         task.await.unwrap();
         supervisor.shutdown().await.unwrap();

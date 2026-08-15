@@ -32,9 +32,10 @@ fn pm_contracts_do_not_import_existing_okx_authority_or_raw_clients() {
     assert!(live_dependencies.contains("reap-polymarket-adapter"));
     assert!(live_dependencies.contains("reap-polymarket-auth"));
     assert!(live_dependencies.contains("reap-polymarket-live-adapter"));
+    assert!(live_dependencies.contains("reap-polymarket-public-source"));
+    assert!(live_dependencies.contains("reap-polymarket-wire"));
     assert!(live_dependencies.contains("base64"));
     assert!(!live_dependencies.contains("reap-core"));
-    assert!(!live_dependencies.contains("reap-polymarket-wire"));
     for forbidden in [
         "reap-okx-live-adapter",
         "reap-okx-evidence-adapter",

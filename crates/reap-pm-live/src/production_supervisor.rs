@@ -12,25 +12,26 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::Duration,
 };
 
 use async_trait::async_trait;
-use reap_durable_writer::DurableLease;
 use reap_pm_core::{PmOrderSide, U256};
-use reap_polymarket_auth::L2Credentials;
-use reap_polymarket_live_adapter::{
-    PmMutationClassification, PmOrderHeartbeatProductionRole, PmOrderHeartbeatReply,
-    PmProductionPostOnlyPlaceRequest, PmProductionSupervisedMutationRole, PmReadServerTimeHttpRole,
-};
-use reap_polymarket_wire::PmOrderHeartbeatId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
-    io::AsyncWriteExt as _,
     sync::{mpsc, oneshot, watch},
     task::{JoinError, JoinHandle},
+};
+
+pub use crate::production_supervisor_journal::{
+    PmSupervisorJournal, PmSupervisorJournalError, PmSupervisorJournalFill,
+    PmSupervisorJournalRecord, PmSupervisorJournalRecovery,
+};
+pub use crate::production_supervisor_roles::{
+    PmSupervisorFixedHeartbeatRole, PmSupervisorFixedMutationRole,
+    PmSupervisorProductionMutationRole,
 };
 
 pub const MAX_PM_SUPERVISOR_ORDERS: usize = 4_096;
@@ -40,8 +41,6 @@ pub const MAX_PM_SUPERVISOR_TOKENS: usize = 32;
 /// mutation adapters are available. This does not authorize a strategy or a
 /// continuously composed product executable by itself.
 pub const PRODUCTION_SUPERVISOR_INFRA_AVAILABLE: bool = true;
-const MAX_PM_SUPERVISOR_JOURNAL_BYTES: u64 = 128 * 1024 * 1024;
-const MAX_PM_SUPERVISOR_JOURNAL_LINE_BYTES: usize = 64 * 1024;
 const MAX_PM_SUPERVISOR_INGRESS: usize = 1_024;
 const MAX_PM_SUPERVISOR_COMMANDS: usize = 128;
 
@@ -170,7 +169,7 @@ pub struct PmSupervisorOrderFacts {
     client_order_id: String,
     expected_venue_order_id: String,
     token_id: String,
-    #[serde(with = "order_side_serde")]
+    #[serde(with = "crate::production_supervisor_serde")]
     side: PmOrderSide,
     quantity: U256,
 }
@@ -295,6 +294,14 @@ pub struct PmSupervisorPollCut {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PmSupervisorWsEvent {
+    /// The authenticated subscription was written on a live connection. A
+    /// later complete poll is still required before order entry can reopen.
+    Connected,
+    /// The private stream retired, exhausted retries, or began shutdown.
+    Disconnected,
+    /// A private lifecycle transition cannot be represented as an
+    /// irreversible fill and requires a fresh authoritative poll.
+    ReconciliationRequired,
     Order(PmSupervisorOpenOrder),
     Fill(PmSupervisorFill),
 }
@@ -318,267 +325,6 @@ pub struct PmSupervisorOrderProjection {
     pub known_filled: U256,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "event", rename_all = "snake_case")]
-pub enum PmSupervisorJournalRecord {
-    Header {
-        schema_version: u8,
-        scope: PmSupervisorScope,
-    },
-    PositionBaseline {
-        token_id: String,
-        quantity: U256,
-    },
-    PlaceIntent {
-        facts: PmSupervisorOrderFacts,
-    },
-    PlaceResult {
-        expected_venue_order_id: String,
-        classification: PmSupervisorMutationClassification,
-    },
-    CancelIntent {
-        venue_order_id: String,
-    },
-    CancelResult {
-        venue_order_id: String,
-        classification: PmSupervisorMutationClassification,
-    },
-    FillApplied {
-        fill: PmSupervisorJournalFill,
-    },
-    PollReconciled {
-        sequence: u64,
-    },
-    CleanShutdown {
-        terminal_poll_sequence: u64,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PmSupervisorJournalFill {
-    fill_id: String,
-    venue_order_id: String,
-    token_id: String,
-    #[serde(with = "order_side_serde")]
-    side: PmOrderSide,
-    quantity: U256,
-}
-
-impl From<&PmSupervisorFill> for PmSupervisorJournalFill {
-    fn from(fill: &PmSupervisorFill) -> Self {
-        Self {
-            fill_id: fill.fill_id.clone(),
-            venue_order_id: fill.venue_order_id.clone(),
-            token_id: fill.token_id.clone(),
-            side: fill.side,
-            quantity: fill.quantity,
-        }
-    }
-}
-
-impl From<PmSupervisorJournalFill> for PmSupervisorFill {
-    fn from(fill: PmSupervisorJournalFill) -> Self {
-        Self {
-            fill_id: fill.fill_id,
-            venue_order_id: fill.venue_order_id,
-            token_id: fill.token_id,
-            side: fill.side,
-            quantity: fill.quantity,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct PmSupervisorJournalRecovery {
-    records: Box<[PmSupervisorJournalRecord]>,
-}
-
-impl PmSupervisorJournalRecovery {
-    #[must_use]
-    pub fn records(&self) -> &[PmSupervisorJournalRecord] {
-        &self.records
-    }
-}
-
-#[derive(Debug, Error)]
-pub enum PmSupervisorJournalError {
-    #[error("supervisor journal path or existing contents are invalid")]
-    Invalid,
-    #[error("supervisor journal I/O failed")]
-    Io,
-    #[error("supervisor journal serialization failed")]
-    Serialization,
-}
-
-pub struct PmSupervisorJournal {
-    path: PathBuf,
-    file: tokio::fs::File,
-    _lease: DurableLease,
-}
-
-impl fmt::Debug for PmSupervisorJournal {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PmSupervisorJournal")
-            .field("path", &self.path)
-            .finish_non_exhaustive()
-    }
-}
-
-impl PmSupervisorJournal {
-    pub async fn open(
-        path: PathBuf,
-        scope: &PmSupervisorScope,
-    ) -> Result<(Self, PmSupervisorJournalRecovery), PmSupervisorJournalError> {
-        let lease = DurableLease::acquire(&path).map_err(|_| PmSupervisorJournalError::Invalid)?;
-        let path = lease.journal_path().to_path_buf();
-        let records = read_journal(&path, scope)?;
-        let exists = path.exists();
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let file = options
-            .open(&path)
-            .map_err(|_| PmSupervisorJournalError::Io)?;
-        #[cfg(unix)]
-        std::fs::set_permissions(&path, private_permissions())
-            .map_err(|_| PmSupervisorJournalError::Io)?;
-        let mut journal = Self {
-            path,
-            file: tokio::fs::File::from_std(file),
-            _lease: lease,
-        };
-        if !exists {
-            journal
-                .append_durable(&PmSupervisorJournalRecord::Header {
-                    schema_version: 1,
-                    scope: scope.clone(),
-                })
-                .await?;
-            sync_parent_directory(&journal.path)?;
-        }
-        Ok((
-            journal,
-            PmSupervisorJournalRecovery {
-                records: records.into_boxed_slice(),
-            },
-        ))
-    }
-
-    async fn append_durable(
-        &mut self,
-        record: &PmSupervisorJournalRecord,
-    ) -> Result<(), PmSupervisorJournalError> {
-        let mut bytes =
-            serde_json::to_vec(record).map_err(|_| PmSupervisorJournalError::Serialization)?;
-        if bytes.len() > MAX_PM_SUPERVISOR_JOURNAL_LINE_BYTES {
-            return Err(PmSupervisorJournalError::Serialization);
-        }
-        bytes.push(b'\n');
-        self.file
-            .write_all(&bytes)
-            .await
-            .map_err(|_| PmSupervisorJournalError::Io)?;
-        self.file
-            .flush()
-            .await
-            .map_err(|_| PmSupervisorJournalError::Io)?;
-        self.file
-            .sync_data()
-            .await
-            .map_err(|_| PmSupervisorJournalError::Io)
-    }
-}
-
-fn sync_parent_directory(path: &Path) -> Result<(), PmSupervisorJournalError> {
-    let parent = path.parent().ok_or(PmSupervisorJournalError::Invalid)?;
-    std::fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|_| PmSupervisorJournalError::Io)
-}
-
-#[cfg(unix)]
-fn private_permissions() -> std::fs::Permissions {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::Permissions::from_mode(0o600)
-}
-
-mod order_side_serde {
-    use reap_pm_core::PmOrderSide;
-    use serde::{Deserialize as _, Deserializer, Serializer};
-
-    pub fn serialize<S>(side: &PmOrderSide, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(match side {
-            PmOrderSide::Buy => "buy",
-            PmOrderSide::Sell => "sell",
-        })
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<PmOrderSide, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        match <&str>::deserialize(deserializer)? {
-            "buy" => Ok(PmOrderSide::Buy),
-            "sell" => Ok(PmOrderSide::Sell),
-            _ => Err(serde::de::Error::custom("invalid Polymarket order side")),
-        }
-    }
-}
-
-fn read_journal(
-    path: &Path,
-    scope: &PmSupervisorScope,
-) -> Result<Vec<PmSupervisorJournalRecord>, PmSupervisorJournalError> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let metadata = std::fs::metadata(path).map_err(|_| PmSupervisorJournalError::Io)?;
-    if !metadata.is_file() || metadata.len() > MAX_PM_SUPERVISOR_JOURNAL_BYTES {
-        return Err(PmSupervisorJournalError::Invalid);
-    }
-    let bytes = std::fs::read(path).map_err(|_| PmSupervisorJournalError::Io)?;
-    if bytes.is_empty() || bytes.last() != Some(&b'\n') {
-        return Err(PmSupervisorJournalError::Invalid);
-    }
-    let mut records = Vec::new();
-    for line in bytes
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-    {
-        if line.len() > MAX_PM_SUPERVISOR_JOURNAL_LINE_BYTES {
-            return Err(PmSupervisorJournalError::Invalid);
-        }
-        let record = serde_json::from_slice::<PmSupervisorJournalRecord>(line)
-            .map_err(|_| PmSupervisorJournalError::Invalid)?;
-        records.push(record);
-        if records.len() > MAX_PM_SUPERVISOR_FILLS + MAX_PM_SUPERVISOR_ORDERS * 4 + 4_096 {
-            return Err(PmSupervisorJournalError::Invalid);
-        }
-    }
-    if records
-        .iter()
-        .skip(1)
-        .any(|record| matches!(record, PmSupervisorJournalRecord::Header { .. }))
-    {
-        return Err(PmSupervisorJournalError::Invalid);
-    }
-    match records.first() {
-        Some(PmSupervisorJournalRecord::Header {
-            schema_version: 1,
-            scope: observed,
-        }) if observed == scope => Ok(records),
-        _ => Err(PmSupervisorJournalError::Invalid),
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum PmSupervisorEdgeError {
     #[error("production edge is unavailable")]
@@ -592,82 +338,6 @@ pub trait PmSupervisorHeartbeatRole: Send + 'static {
     async fn heartbeat(&mut self) -> Result<(), PmSupervisorEdgeError>;
 }
 
-/// Concrete one-tick heartbeat role. Scheduling and fatal supervision remain
-/// with [`PmProductionSupervisor`]; this value retains the credential-wide
-/// identifier and exact fixed `/time` + `/v1/heartbeats` capabilities.
-pub struct PmSupervisorFixedHeartbeatRole {
-    credentials: L2Credentials,
-    server_time: PmReadServerTimeHttpRole,
-    transport: PmOrderHeartbeatProductionRole,
-    previous: Option<PmOrderHeartbeatId>,
-}
-
-impl PmSupervisorFixedHeartbeatRole {
-    #[must_use]
-    pub const fn new(
-        credentials: L2Credentials,
-        server_time: PmReadServerTimeHttpRole,
-        transport: PmOrderHeartbeatProductionRole,
-    ) -> Self {
-        Self {
-            credentials,
-            server_time,
-            transport,
-            previous: None,
-        }
-    }
-
-    async fn authenticate_and_send(
-        &mut self,
-        previous: Option<PmOrderHeartbeatId>,
-    ) -> Result<PmOrderHeartbeatReply, PmSupervisorEdgeError> {
-        let timestamp = self
-            .server_time
-            .fresh_read_server_time_observation()
-            .await
-            .map_err(|_| PmSupervisorEdgeError::Unavailable)?
-            .parsed_l2_timestamp();
-        let request = match previous.as_ref() {
-            Some(previous) => self
-                .credentials
-                .authenticate_order_heartbeat(timestamp, previous),
-            None => self
-                .credentials
-                .authenticate_initial_order_heartbeat(timestamp),
-        }
-        .map_err(|_| PmSupervisorEdgeError::Unavailable)?;
-        self.transport
-            .send(request)
-            .await
-            .map_err(|_| PmSupervisorEdgeError::Unavailable)
-    }
-}
-
-impl fmt::Debug for PmSupervisorFixedHeartbeatRole {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("PmSupervisorFixedHeartbeatRole([REDACTED; FIXED PRODUCTION])")
-    }
-}
-
-#[async_trait]
-impl PmSupervisorHeartbeatRole for PmSupervisorFixedHeartbeatRole {
-    async fn heartbeat(&mut self) -> Result<(), PmSupervisorEdgeError> {
-        let previous = self.previous.take();
-        match self.authenticate_and_send(previous).await? {
-            PmOrderHeartbeatReply::Accepted(next) => self.previous = Some(next),
-            PmOrderHeartbeatReply::StaleIdentifier(current) => {
-                match self.authenticate_and_send(Some(current)).await? {
-                    PmOrderHeartbeatReply::Accepted(next) => self.previous = Some(next),
-                    PmOrderHeartbeatReply::StaleIdentifier(_) => {
-                        return Err(PmSupervisorEdgeError::InvalidObservation);
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
 #[async_trait]
 pub trait PmSupervisorPollRole: Send + 'static {
     async fn complete_poll(&mut self) -> Result<PmSupervisorPollCut, PmSupervisorEdgeError>;
@@ -676,6 +346,10 @@ pub trait PmSupervisorPollRole: Send + 'static {
 #[async_trait]
 pub trait PmSupervisorWsRole: Send + 'static {
     async fn next_event(&mut self) -> Result<PmSupervisorWsEvent, PmSupervisorEdgeError>;
+
+    async fn shutdown(&mut self) -> Result<(), PmSupervisorEdgeError> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -694,90 +368,8 @@ pub trait PmSupervisorMutationRole: Send + 'static {
     async fn cancel_exact(
         &mut self,
         venue_order_id: &str,
+        token_id: &str,
     ) -> Result<PmSupervisorCancelResult, PmSupervisorEdgeError>;
-}
-
-/// Concrete adapter from the reviewed fixed-scope signer/L2/time/transport
-/// owner to the generic supervisor actor.
-pub struct PmSupervisorFixedMutationRole {
-    inner: PmProductionSupervisedMutationRole,
-}
-
-impl PmSupervisorFixedMutationRole {
-    #[must_use]
-    pub const fn new(inner: PmProductionSupervisedMutationRole) -> Self {
-        Self { inner }
-    }
-}
-
-impl fmt::Debug for PmSupervisorFixedMutationRole {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("PmSupervisorFixedMutationRole(<opaque production authority>)")
-    }
-}
-
-#[async_trait]
-impl PmSupervisorMutationRole for PmSupervisorFixedMutationRole {
-    type PlaceRequest = PmProductionPostOnlyPlaceRequest;
-
-    fn validate_place(&self, facts: &PmSupervisorOrderFacts, request: &Self::PlaceRequest) -> bool {
-        let order = request.order();
-        self.inner.validate_place(request)
-            && self
-                .inner
-                .expected_order_id(request)
-                .is_some_and(|order_id| order_id.to_string() == facts.expected_venue_order_id)
-            && order.token_id().units().to_string() == facts.token_id
-            && order.side() == facts.side
-            && request.quantity().protocol_units() == facts.quantity
-    }
-
-    async fn place(
-        &mut self,
-        request: Self::PlaceRequest,
-    ) -> Result<PmSupervisorPlaceResult, PmSupervisorEdgeError> {
-        let outcome = self
-            .inner
-            .place(request)
-            .await
-            .map_err(|_| PmSupervisorEdgeError::Unavailable)?;
-        Ok(PmSupervisorPlaceResult {
-            classification: map_mutation_classification(outcome.classification()),
-            observed_venue_order_id: outcome
-                .observed_order_id()
-                .map(|order_id| order_id.as_str().to_owned()),
-        })
-    }
-
-    async fn cancel_exact(
-        &mut self,
-        venue_order_id: &str,
-    ) -> Result<PmSupervisorCancelResult, PmSupervisorEdgeError> {
-        let outcome = self
-            .inner
-            .cancel_exact(venue_order_id)
-            .await
-            .map_err(|_| PmSupervisorEdgeError::Unavailable)?;
-        Ok(PmSupervisorCancelResult {
-            classification: map_mutation_classification(outcome.classification()),
-        })
-    }
-}
-
-const fn map_mutation_classification(
-    classification: PmMutationClassification,
-) -> PmSupervisorMutationClassification {
-    match classification {
-        PmMutationClassification::DefinitelyNotDispatched => {
-            PmSupervisorMutationClassification::DefinitelyNotDispatched
-        }
-        PmMutationClassification::Accepted => PmSupervisorMutationClassification::Accepted,
-        PmMutationClassification::Rejected => PmSupervisorMutationClassification::Rejected,
-        PmMutationClassification::OutOfProfile
-        | PmMutationClassification::AcknowledgementUnknown => {
-            PmSupervisorMutationClassification::AcknowledgementUnknown
-        }
-    }
 }
 
 pub struct PmProductionSupervisorRoles<H, P, W, M> {
@@ -1098,6 +690,10 @@ fn spawn_ws<W: PmSupervisorWsRole>(
                 }
             }
         }
+        assert!(
+            role.shutdown().await.is_ok(),
+            "supervised private WebSocket shutdown failed"
+        );
     }))
 }
 
@@ -1122,6 +718,7 @@ struct SupervisorState {
     positions: BTreeMap<String, PositionState>,
     durable_exact_cancel_intents: usize,
     ready: bool,
+    private_ws_connected: bool,
     last_poll_sequence: Option<u64>,
 }
 
@@ -1136,6 +733,7 @@ impl SupervisorState {
             positions: BTreeMap::new(),
             durable_exact_cancel_intents: 0,
             ready: false,
+            private_ws_connected: false,
             last_poll_sequence: None,
         };
         for record in recovery.records.into_vec() {
@@ -1381,7 +979,7 @@ async fn run_actor<M: PmSupervisorMutationRole>(
                 Some(Ingress::Poll(cut)) => {
                     if let Err(error) = apply_poll(&config, &mut state, &mut journal, cut).await {
                         state.ready = false;
-                        let _ = cancel_all_owned(&mut state, &mut journal, &mut mutation).await;
+                        let _ = cancel_each_owned(&mut state, &mut journal, &mut mutation).await;
                         break Err(error);
                     }
                     if shutdown_response.is_some() {
@@ -1395,7 +993,7 @@ async fn run_actor<M: PmSupervisorMutationRole>(
                 Some(Ingress::Ws(event)) => {
                     if let Err(error) = apply_ws(&config, &mut state, &mut journal, event).await {
                         state.ready = false;
-                        let _ = cancel_all_owned(&mut state, &mut journal, &mut mutation).await;
+                        let _ = cancel_each_owned(&mut state, &mut journal, &mut mutation).await;
                         break Err(error);
                     }
                 }
@@ -1404,7 +1002,7 @@ async fn run_actor<M: PmSupervisorMutationRole>(
                     // A liveness/read-edge failure closes entry immediately.
                     // Exact cancellation is best-effort because the failed
                     // role may prevent terminal convergence proof.
-                    let _ = cancel_all_owned(&mut state, &mut journal, &mut mutation).await;
+                    let _ = cancel_each_owned(&mut state, &mut journal, &mut mutation).await;
                     break Err(PmProductionSupervisorError::RoleFailed);
                 }
             },
@@ -1412,21 +1010,21 @@ async fn run_actor<M: PmSupervisorMutationRole>(
                 Some(Command::Place(command, response)) => {
                     let result = apply_place(&config, &mut state, &mut journal, &mut mutation, command).await;
                     if result.is_err() && !state.ready {
-                        let _ = cancel_all_owned(&mut state, &mut journal, &mut mutation).await;
+                        let _ = cancel_each_owned(&mut state, &mut journal, &mut mutation).await;
                     }
                     let _ = response.send(result);
                 }
                 Some(Command::Cancel(order_id, response)) => {
                     let result = apply_cancel(&mut state, &mut journal, &mut mutation, &order_id).await;
                     if result.is_err() && !state.ready {
-                        let _ = cancel_all_owned(&mut state, &mut journal, &mut mutation).await;
+                        let _ = cancel_each_owned(&mut state, &mut journal, &mut mutation).await;
                     }
                     let _ = response.send(result);
                 }
                 Some(Command::Shutdown(response)) => {
                     state.ready = false;
                     shutdown_response = Some(response);
-                    if let Err(error) = cancel_all_owned(&mut state, &mut journal, &mut mutation).await {
+                    if let Err(error) = cancel_each_owned(&mut state, &mut journal, &mut mutation).await {
                         break Err(error);
                     }
                 }
@@ -1597,7 +1195,8 @@ async fn apply_cancel<M: PmSupervisorMutationRole>(
         .durable_exact_cancel_intents
         .checked_add(1)
         .ok_or(PmSupervisorCommandError::Capacity)?;
-    let result = match mutation.cancel_exact(order_id).await {
+    let token_id = order.facts.token_id.clone();
+    let result = match mutation.cancel_exact(order_id, &token_id).await {
         Ok(result) => result,
         Err(_) => {
             state.ready = false;
@@ -1631,7 +1230,7 @@ async fn apply_cancel<M: PmSupervisorMutationRole>(
         .ok_or(PmSupervisorCommandError::Contradiction)
 }
 
-async fn cancel_all_owned<M: PmSupervisorMutationRole>(
+async fn cancel_each_owned<M: PmSupervisorMutationRole>(
     state: &mut SupervisorState,
     journal: &mut PmSupervisorJournal,
     mutation: &mut M,
@@ -1654,7 +1253,8 @@ async fn cancel_all_owned<M: PmSupervisorMutationRole>(
             .durable_exact_cancel_intents
             .checked_add(1)
             .ok_or(PmProductionSupervisorError::RoleFailed)?;
-        let classification = match mutation.cancel_exact(&order_id).await {
+        let token_id = order.facts.token_id.clone();
+        let classification = match mutation.cancel_exact(&order_id, &token_id).await {
             Ok(result) => result.classification,
             Err(_) => {
                 order.status = PmSupervisorOrderStatus::ReconciliationRequired;
@@ -1683,7 +1283,20 @@ async fn apply_ws(
     journal: &mut PmSupervisorJournal,
     event: PmSupervisorWsEvent,
 ) -> Result<(), PmProductionSupervisorError> {
+    // A private edge always invalidates the last composite REST cut. The next
+    // complete poll is responsible for reopening readiness after reconciling
+    // order progress, confirmed fills, and venue positions.
+    state.ready = false;
     match event {
+        PmSupervisorWsEvent::Connected => {
+            state.private_ws_connected = true;
+            Ok(())
+        }
+        PmSupervisorWsEvent::Disconnected => {
+            state.private_ws_connected = false;
+            Ok(())
+        }
+        PmSupervisorWsEvent::ReconciliationRequired => Ok(()),
         PmSupervisorWsEvent::Order(observation) => apply_order_observation(state, observation),
         PmSupervisorWsEvent::Fill(fill) => {
             if state.apply_fill(config, fill.clone(), true)? {
@@ -1708,7 +1321,26 @@ fn apply_order_observation(
         .ok_or(PmProductionSupervisorError::RoleFailed)?;
     if order.facts.token_id != observation.token_id
         || observation.cumulative_filled > order.facts.quantity
-        || observation.cumulative_filled < order.cumulative_filled
+    {
+        return Err(PmProductionSupervisorError::RoleFailed);
+    }
+    // WS and HTTP are independent venue edges. A complete HTTP walk can have
+    // begun before a newer private event was reduced, so an otherwise valid
+    // lower cumulative value is stale rather than contradictory.
+    if observation.cumulative_filled < order.cumulative_filled
+        || (observation.cumulative_filled == order.cumulative_filled
+            && matches!(
+                order.status,
+                PmSupervisorOrderStatus::Filled | PmSupervisorOrderStatus::Cancelled
+            )
+            && !observation.status.terminal())
+    {
+        return Ok(());
+    }
+    if matches!(
+        order.status,
+        PmSupervisorOrderStatus::Rejected | PmSupervisorOrderStatus::Expired
+    ) && observation.status != order.status
     {
         return Err(PmProductionSupervisorError::RoleFailed);
     }
@@ -1763,15 +1395,6 @@ async fn apply_poll(
     if position_ids.len() != config.scope.token_ids.len() {
         return Err(PmProductionSupervisorError::RoleFailed);
     }
-    for fill in cut.fills {
-        if state.apply_fill(config, fill.clone(), false)? {
-            journal
-                .append_durable(&PmSupervisorJournalRecord::FillApplied {
-                    fill: (&fill).into(),
-                })
-                .await?;
-        }
-    }
     let open_ids = cut
         .open_orders
         .iter()
@@ -1782,6 +1405,19 @@ async fn apply_poll(
     }
     for observation in cut.open_orders {
         apply_order_observation(state, observation)?;
+    }
+    // The concrete poll walks trades before orders. Apply the later order
+    // snapshot first, then let confirmed fills advance it. A fill that lands
+    // between those two HTTP walks therefore cannot make a valid cut look
+    // internally regressive.
+    for fill in cut.fills {
+        if state.apply_fill(config, fill.clone(), false)? {
+            journal
+                .append_durable(&PmSupervisorJournalRecord::FillApplied {
+                    fill: (&fill).into(),
+                })
+                .await?;
+        }
     }
     for (order_id, order) in &mut state.orders {
         if !order.status.terminal()
@@ -1799,10 +1435,11 @@ async fn apply_poll(
         }
     }
     state.last_poll_sequence = Some(cut.sequence);
-    state.ready = state
-        .position_report()?
-        .iter()
-        .all(|position| position.converged)
+    state.ready = state.private_ws_connected
+        && state
+            .position_report()?
+            .iter()
+            .all(|position| position.converged)
         && state.orders.values().all(|order| {
             order.cumulative_filled == order.known_filled
                 && !matches!(
@@ -1840,7 +1477,7 @@ fn terminal_shutdown_report(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, sync::Arc};
+    use std::{collections::VecDeque, path::Path, sync::Arc};
 
     use tokio::sync::{Mutex, Notify};
 
@@ -1871,12 +1508,19 @@ mod tests {
         }
     }
 
-    struct Ws(Arc<Notify>);
+    struct Ws {
+        notify: Arc<Notify>,
+        connected: bool,
+    }
 
     #[async_trait]
     impl PmSupervisorWsRole for Ws {
         async fn next_event(&mut self) -> Result<PmSupervisorWsEvent, PmSupervisorEdgeError> {
-            self.0.notified().await;
+            if !self.connected {
+                self.connected = true;
+                return Ok(PmSupervisorWsEvent::Connected);
+            }
+            self.notify.notified().await;
             Err(PmSupervisorEdgeError::Unavailable)
         }
     }
@@ -1908,6 +1552,7 @@ mod tests {
         async fn cancel_exact(
             &mut self,
             _venue_order_id: &str,
+            _token_id: &str,
         ) -> Result<PmSupervisorCancelResult, PmSupervisorEdgeError> {
             Ok(PmSupervisorCancelResult {
                 classification: PmSupervisorMutationClassification::Accepted,
@@ -1971,7 +1616,10 @@ mod tests {
                 poll: Poll {
                     cuts: Arc::clone(&cuts),
                 },
-                user_ws: Ws(Arc::new(Notify::new())),
+                user_ws: Ws {
+                    notify: Arc::new(Notify::new()),
+                    connected: false,
+                },
                 mutation: Mutation,
             },
         )
@@ -2065,6 +1713,7 @@ mod tests {
             )]),
             durable_exact_cancel_intents: 0,
             ready: true,
+            private_ws_connected: true,
             last_poll_sequence: None,
         };
         let fill = PmSupervisorFill {
@@ -2088,6 +1737,172 @@ mod tests {
         let report = state.position_report().unwrap();
         assert_eq!(report[0].fill_based, U256::from_u64(2_000_000));
         assert!(!report[0].converged);
+    }
+
+    #[tokio::test]
+    async fn private_fill_closes_readiness_until_a_later_complete_poll() {
+        let path = test_path("pm-production-supervisor-private-fill-gate");
+        remove_test_journal(&path);
+        let config = PmProductionSupervisorConfig::new(
+            PmSupervisorScope::new("condition", ["up".to_owned()]).unwrap(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let facts = PmSupervisorOrderFacts::new(
+            "client-1",
+            "venue-1",
+            "up",
+            PmOrderSide::Buy,
+            U256::from_u64(1_000_000),
+        )
+        .unwrap();
+        let mut state = SupervisorState {
+            orders: BTreeMap::from([(
+                "venue-1".to_owned(),
+                OrderState {
+                    facts,
+                    status: PmSupervisorOrderStatus::Live,
+                    cumulative_filled: U256::ZERO,
+                    known_filled: U256::ZERO,
+                    cancel_requested: false,
+                },
+            )]),
+            fills: BTreeSet::new(),
+            positions: BTreeMap::from([(
+                "up".to_owned(),
+                PositionState {
+                    baseline: U256::ZERO,
+                    bought: U256::ZERO,
+                    sold: U256::ZERO,
+                    authoritative: Some(U256::ZERO),
+                },
+            )]),
+            durable_exact_cancel_intents: 0,
+            ready: true,
+            private_ws_connected: true,
+            last_poll_sequence: Some(1),
+        };
+        let (mut journal, _) = PmSupervisorJournal::open(path.clone(), config.scope())
+            .await
+            .unwrap();
+        apply_ws(
+            &config,
+            &mut state,
+            &mut journal,
+            PmSupervisorWsEvent::Fill(PmSupervisorFill {
+                fill_id: "fill-1".to_owned(),
+                venue_order_id: "venue-1".to_owned(),
+                token_id: "up".to_owned(),
+                side: PmOrderSide::Buy,
+                quantity: U256::from_u64(1_000_000),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!state.ready);
+        drop(journal);
+        remove_test_journal(&path);
+    }
+
+    #[tokio::test]
+    async fn later_private_fill_dominates_an_older_open_order_snapshot() {
+        let path = test_path("pm-production-supervisor-interleaved-poll-fill");
+        remove_test_journal(&path);
+        let config = PmProductionSupervisorConfig::new(
+            PmSupervisorScope::new("condition", ["up".to_owned()]).unwrap(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let facts = PmSupervisorOrderFacts::new(
+            "client-1",
+            "venue-1",
+            "up",
+            PmOrderSide::Buy,
+            U256::from_u64(1_000_000),
+        )
+        .unwrap();
+        let mut state = SupervisorState {
+            orders: BTreeMap::from([(
+                "venue-1".to_owned(),
+                OrderState {
+                    facts,
+                    status: PmSupervisorOrderStatus::Live,
+                    cumulative_filled: U256::ZERO,
+                    known_filled: U256::ZERO,
+                    cancel_requested: false,
+                },
+            )]),
+            fills: BTreeSet::new(),
+            positions: BTreeMap::from([(
+                "up".to_owned(),
+                PositionState {
+                    baseline: U256::ZERO,
+                    bought: U256::ZERO,
+                    sold: U256::ZERO,
+                    authoritative: Some(U256::ZERO),
+                },
+            )]),
+            durable_exact_cancel_intents: 0,
+            ready: false,
+            private_ws_connected: true,
+            last_poll_sequence: None,
+        };
+        let (mut journal, _) = PmSupervisorJournal::open(path.clone(), config.scope())
+            .await
+            .unwrap();
+        let fill = PmSupervisorFill {
+            fill_id: "fill-1".to_owned(),
+            venue_order_id: "venue-1".to_owned(),
+            token_id: "up".to_owned(),
+            side: PmOrderSide::Buy,
+            quantity: U256::from_u64(1_000_000),
+        };
+        apply_ws(
+            &config,
+            &mut state,
+            &mut journal,
+            PmSupervisorWsEvent::Fill(fill.clone()),
+        )
+        .await
+        .unwrap();
+        apply_poll(
+            &config,
+            &mut state,
+            &mut journal,
+            PmSupervisorPollCut {
+                sequence: 1,
+                open_orders: vec![PmSupervisorOpenOrder {
+                    venue_order_id: "venue-1".to_owned(),
+                    token_id: "up".to_owned(),
+                    status: PmSupervisorOrderStatus::Live,
+                    cumulative_filled: U256::ZERO,
+                }]
+                .into_boxed_slice(),
+                fills: vec![fill].into_boxed_slice(),
+                positions: vec![PmSupervisorPosition {
+                    token_id: "up".to_owned(),
+                    quantity: U256::from_u64(1_000_000),
+                }]
+                .into_boxed_slice(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(state.ready);
+        assert_eq!(
+            state.orders["venue-1"].status,
+            PmSupervisorOrderStatus::Filled
+        );
+        assert_eq!(
+            state.orders["venue-1"].known_filled,
+            U256::from_u64(1_000_000)
+        );
+        drop(journal);
+        remove_test_journal(&path);
     }
 
     #[tokio::test]
@@ -2124,6 +1939,7 @@ mod tests {
             positions: BTreeMap::new(),
             durable_exact_cancel_intents: 0,
             ready: false,
+            private_ws_connected: true,
             last_poll_sequence: None,
         };
         let (mut journal, _) = PmSupervisorJournal::open(path.clone(), config.scope())
@@ -2247,7 +2063,10 @@ mod tests {
                 poll: Poll {
                     cuts: Arc::clone(&cuts),
                 },
-                user_ws: Ws(Arc::new(Notify::new())),
+                user_ws: Ws {
+                    notify: Arc::new(Notify::new()),
+                    connected: false,
+                },
                 mutation: Mutation,
             },
         )

@@ -272,7 +272,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     use async_trait::async_trait;
     #[cfg(target_os = "linux")]
-    use reap_pm_core::{ConnectionEpoch, PmConditionId, PmMarketId, PmTokenId, U256};
+    use reap_pm_core::{ConnectionEpoch, EvmAddress, PmConditionId, PmMarketId, PmTokenId, U256};
     #[cfg(target_os = "linux")]
     use reap_polymarket_auth::{AuthenticatedUserSubscription, CredentialOwnedUserFrame};
     #[cfg(target_os = "linux")]
@@ -350,6 +350,8 @@ mod tests {
         .unwrap();
         PmAuthenticatedUserWsRole::from_external_authority(
             PmUserWsConfig::production(condition, bounds).unwrap(),
+            EvmAddress::from_bytes([1; 20]).unwrap(),
+            EvmAddress::from_bytes([2; 20]).unwrap(),
             Box::new(UnusedUserAuthority),
         )
     }

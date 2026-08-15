@@ -197,6 +197,8 @@ impl PmPrivateConnectivityOwner {
         );
         let user_ws = PmAuthenticatedUserWsRole::from_authority(
             self.user_ws_config,
+            l2_signer_address.as_core(),
+            self.expected_order_maker,
             PmUserWsCredentialRole { sender },
         );
         Ok(PmPrivateConnectivityRoles {

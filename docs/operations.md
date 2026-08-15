@@ -109,20 +109,26 @@ minimal-capital place/cancel trial requires a second explicit authorization.
 ## Polymarket Continuous Production Infrastructure
 
 The production supervisor in `reap-pm-live` is a strategy-neutral library, not
-an operator-runnable strategy service. It composes fixed heartbeat and mutation
-roles with application-supplied complete private-WebSocket and poll roles. It
+an operator-runnable strategy service. Its concrete production composition
+includes fixed heartbeat, authenticated private-WebSocket order/trade mapping,
+complete condition-scoped open-order/trade pagination, authoritative per-token
+position walks, and a dual-token place/exact-cancel mutation router. It does
+enforce one non-secret signer/funder binding across those concrete roles. It
 does not authorize continuous order entry: the integrating BTC five-minute
-service must still bind the exact active market, implement complete scoped
-open-order/trade/position polling, supply the strategy, and pass a production
-soak before enabling placement.
+service must still bind each exact active market, retain and join the
+credential owner, compose public book/reference data and rollover, supply the
+strategy/risk policy, and pass a target-host production soak before enabling
+placement.
 
 Startup replays the leased `0600`-mode journal and remains closed until a later
 complete poll reconciles every owned order and both scoped token positions.
 Unique fills update the supervisor's fill-derived position. Venue-reported
 cumulative fills close readiness until the matching fill ledger catches up,
-and authoritative position disagreement also closes readiness. A heartbeat,
-poll, WebSocket, durability, or ambiguous mutation failure closes entry and
-attempts exact cancellation of supervisor-owned nonterminal orders.
+and authoritative position disagreement also closes readiness. Private stream
+edges close readiness until a later complete poll, and only confirmed trade
+legs become irreversible fills. A heartbeat, poll, WebSocket, durability, or
+ambiguous mutation failure closes entry and attempts exact cancellation of
+supervisor-owned nonterminal orders.
 
 The BTC five-minute lifecycle quiesces placement 30 seconds before the active
 window ends. It rolls only after the prior market has ended and a complete poll

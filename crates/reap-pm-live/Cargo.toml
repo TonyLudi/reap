@@ -21,6 +21,7 @@ reap-pm-strategy.workspace = true
 reap-polymarket-adapter.workspace = true
 reap-polymarket-auth.workspace = true
 reap-polymarket-live-adapter.workspace = true
+reap-polymarket-public-source.workspace = true
 reap-polymarket-wire.workspace = true
 reap-transport.workspace = true
 serde.workspace = true

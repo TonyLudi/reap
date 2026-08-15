@@ -92,6 +92,7 @@ pub struct PmOpenOrdersAssembly {
     next_cursor: String,
     row_count: usize,
     live_source: Option<LiveCutSource>,
+    condition_filter: bool,
 }
 
 impl PmOpenOrdersAssembly {
@@ -145,6 +146,11 @@ impl PmCompleteOpenOrdersCut {
         self.row_count
     }
 
+    #[must_use]
+    pub fn into_pages(self) -> Box<[PmLiveOpenOrderPage]> {
+        self.pages
+    }
+
     /// Construct complete typed evidence for downstream contract tests.
     /// Production transport authority never enables this feature.
     #[cfg(feature = "test-support")]
@@ -176,6 +182,7 @@ pub struct PmTradesAssembly {
     row_count: usize,
     live_source: Option<LiveCutSource>,
     exact_scope_filter: bool,
+    condition_filter: bool,
 }
 
 impl PmTradesAssembly {
@@ -227,6 +234,11 @@ impl PmCompleteTradesCut {
     #[must_use]
     pub const fn row_count(&self) -> usize {
         self.row_count
+    }
+
+    #[must_use]
+    pub fn into_pages(self) -> Box<[PmLiveTradePage]> {
+        self.pages
     }
 
     /// Construct complete typed evidence for downstream contract tests.
@@ -516,7 +528,18 @@ impl<'a> PmReconciliationHttpRole<'a> {
         &mut self,
         server_time: PmReadServerTime,
     ) -> Result<PmOpenOrdersCutProgress, PmLiveAdapterError> {
-        self.begin_open_orders_source(server_time, None).await
+        self.begin_open_orders_source(server_time, None, false)
+            .await
+    }
+
+    /// Start a complete open-order cut narrowed to the configured condition.
+    /// This retains both outcome tokens while bounding one short-lived market
+    /// away from unrelated account activity.
+    pub async fn begin_condition_open_orders(
+        &mut self,
+        server_time: PmReadServerTime,
+    ) -> Result<PmOpenOrdersCutProgress, PmLiveAdapterError> {
+        self.begin_open_orders_source(server_time, None, true).await
     }
 
     /// Start a source-clocked open-order cut. If this page is terminal, its
@@ -526,7 +549,7 @@ impl<'a> PmReconciliationHttpRole<'a> {
         server_time: PmReadServerTime,
         clock: &mut PmPrivateReadProductClock,
     ) -> Result<PmOpenOrdersCutProgress, PmLiveAdapterError> {
-        self.begin_open_orders_source(server_time, Some(clock))
+        self.begin_open_orders_source(server_time, Some(clock), false)
             .await
     }
 
@@ -534,6 +557,7 @@ impl<'a> PmReconciliationHttpRole<'a> {
         &mut self,
         server_time: PmReadServerTime,
         clock: Option<&mut PmPrivateReadProductClock>,
+        condition_filter: bool,
     ) -> Result<PmOpenOrdersCutProgress, PmLiveAdapterError> {
         let fetched = self
             .open_orders_page(
@@ -541,6 +565,7 @@ impl<'a> PmReconciliationHttpRole<'a> {
                     .into_l2_timestamp()
                     .map_err(|_| PmLiveAdapterError::ProductClock)?,
                 first_page_cursor(),
+                condition_filter,
             )
             .await?;
         let terminal_receive_clock = observe_terminal_page(&fetched.parsed, clock)?;
@@ -549,11 +574,12 @@ impl<'a> PmReconciliationHttpRole<'a> {
             pages: vec![fetched.source],
             terminal_receive_clock,
         };
-        advance_open_orders(
+        advance_open_orders_filtered(
             vec![fetched.parsed],
             vec![first_page_cursor().to_owned()],
             0,
             Some(live_source),
+            condition_filter,
         )
     }
 
@@ -597,6 +623,7 @@ impl<'a> PmReconciliationHttpRole<'a> {
                     .into_l2_timestamp()
                     .map_err(|_| PmLiveAdapterError::ProductClock)?,
                 &cursor,
+                assembly.condition_filter,
             )
             .await?;
         let terminal_receive_clock = observe_terminal_page(&fetched.parsed, clock)?;
@@ -607,11 +634,12 @@ impl<'a> PmReconciliationHttpRole<'a> {
             .expect("validated live source");
         live_source.pages.push(fetched.source);
         live_source.terminal_receive_clock = terminal_receive_clock;
-        advance_open_orders(
+        advance_open_orders_filtered(
             assembly.pages,
             assembly.requested_cursors,
             assembly.row_count,
             assembly.live_source,
+            assembly.condition_filter,
         )
     }
 
@@ -620,7 +648,18 @@ impl<'a> PmReconciliationHttpRole<'a> {
         &mut self,
         server_time: PmReadServerTime,
     ) -> Result<PmTradesCutProgress, PmLiveAdapterError> {
-        self.begin_trades_source(server_time, None, false).await
+        self.begin_trades_source(server_time, None, false, false)
+            .await
+    }
+
+    /// Start a full trade cut narrowed to the configured condition while
+    /// retaining maker/taker legs for both outcome tokens.
+    pub async fn begin_condition_trades(
+        &mut self,
+        server_time: PmReadServerTime,
+    ) -> Result<PmTradesCutProgress, PmLiveAdapterError> {
+        self.begin_trades_source(server_time, None, false, true)
+            .await
     }
 
     /// Start a complete trade cut narrowed by the configured exact condition
@@ -630,7 +669,8 @@ impl<'a> PmReconciliationHttpRole<'a> {
         &mut self,
         server_time: PmReadServerTime,
     ) -> Result<PmTradesCutProgress, PmLiveAdapterError> {
-        self.begin_trades_source(server_time, None, true).await
+        self.begin_trades_source(server_time, None, true, false)
+            .await
     }
 
     /// Start a source-clocked trade cut. A terminal receive edge is sampled
@@ -640,7 +680,7 @@ impl<'a> PmReconciliationHttpRole<'a> {
         server_time: PmReadServerTime,
         clock: &mut PmPrivateReadProductClock,
     ) -> Result<PmTradesCutProgress, PmLiveAdapterError> {
-        self.begin_trades_source(server_time, Some(clock), false)
+        self.begin_trades_source(server_time, Some(clock), false, false)
             .await
     }
 
@@ -649,6 +689,7 @@ impl<'a> PmReconciliationHttpRole<'a> {
         server_time: PmReadServerTime,
         clock: Option<&mut PmPrivateReadProductClock>,
         exact_scope_filter: bool,
+        condition_filter: bool,
     ) -> Result<PmTradesCutProgress, PmLiveAdapterError> {
         let fetched = self
             .trades_page(
@@ -657,6 +698,7 @@ impl<'a> PmReconciliationHttpRole<'a> {
                     .map_err(|_| PmLiveAdapterError::ProductClock)?,
                 first_page_cursor(),
                 exact_scope_filter,
+                condition_filter,
             )
             .await?;
         let terminal_receive_clock = observe_terminal_page(&fetched.parsed, clock)?;
@@ -665,12 +707,13 @@ impl<'a> PmReconciliationHttpRole<'a> {
             pages: vec![fetched.source],
             terminal_receive_clock,
         };
-        advance_trades(
+        advance_trades_filtered(
             vec![fetched.parsed],
             vec![first_page_cursor().to_owned()],
             0,
             Some(live_source),
             exact_scope_filter,
+            condition_filter,
         )
     }
 
@@ -715,6 +758,7 @@ impl<'a> PmReconciliationHttpRole<'a> {
                     .map_err(|_| PmLiveAdapterError::ProductClock)?,
                 &cursor,
                 assembly.exact_scope_filter,
+                assembly.condition_filter,
             )
             .await?;
         let terminal_receive_clock = observe_terminal_page(&fetched.parsed, clock)?;
@@ -725,12 +769,13 @@ impl<'a> PmReconciliationHttpRole<'a> {
             .expect("validated live source");
         live_source.pages.push(fetched.source);
         live_source.terminal_receive_clock = terminal_receive_clock;
-        advance_trades(
+        advance_trades_filtered(
             assembly.pages,
             assembly.requested_cursors,
             assembly.row_count,
             assembly.live_source,
             assembly.exact_scope_filter,
+            assembly.condition_filter,
         )
     }
 
@@ -896,13 +941,18 @@ impl<'a> PmReconciliationHttpRole<'a> {
         &mut self,
         timestamp: L2Timestamp,
         cursor: &str,
+        condition_filter: bool,
     ) -> Result<FetchedOpenOrdersPage, PmLiveAdapterError> {
         let headers = self.authority.authenticate_open_orders(timestamp).await?;
-        let body = found(
-            self.transport
-                .get(PmPrivateRoute::OpenOrders { cursor }, headers)
-                .await?,
-        )?;
+        let route = if condition_filter {
+            PmPrivateRoute::ConditionOpenOrders {
+                cursor,
+                condition: self.exact_order_scope.condition(),
+            }
+        } else {
+            PmPrivateRoute::OpenOrders { cursor }
+        };
+        let body = found(self.transport.get(route, headers).await?)?;
         let parsed = self
             .authority
             .bind_open_orders(parse_live_open_order_page(&body)?)
@@ -922,6 +972,7 @@ impl<'a> PmReconciliationHttpRole<'a> {
         timestamp: L2Timestamp,
         cursor: &str,
         exact_scope_filter: bool,
+        condition_filter: bool,
     ) -> Result<FetchedTradesPage, PmLiveAdapterError> {
         let headers = self.authority.authenticate_trades(timestamp).await?;
         let route = if exact_scope_filter {
@@ -929,11 +980,16 @@ impl<'a> PmReconciliationHttpRole<'a> {
                 cursor,
                 scope: self.source_binding().scope,
             }
+        } else if condition_filter {
+            PmPrivateRoute::ConditionTrades {
+                cursor,
+                condition: self.exact_order_scope.condition(),
+            }
         } else {
             PmPrivateRoute::Trades { cursor }
         };
         let body = found(self.transport.get(route, headers).await?)?;
-        let parsed = if exact_scope_filter {
+        let parsed = if exact_scope_filter || condition_filter {
             parse_live_owned_fill_trade_page(&body)?
         } else {
             parse_live_trade_page(&body)?
@@ -1391,11 +1447,22 @@ fn ensure_complete_source<P: ReconciliationPage>(
     Ok(())
 }
 
+#[cfg(test)]
 fn advance_open_orders(
     pages: Vec<PmLiveOpenOrderPage>,
     requested_cursors: Vec<String>,
     prior_rows: usize,
     live_source: Option<LiveCutSource>,
+) -> Result<PmOpenOrdersCutProgress, PmLiveAdapterError> {
+    advance_open_orders_filtered(pages, requested_cursors, prior_rows, live_source, false)
+}
+
+fn advance_open_orders_filtered(
+    pages: Vec<PmLiveOpenOrderPage>,
+    requested_cursors: Vec<String>,
+    prior_rows: usize,
+    live_source: Option<LiveCutSource>,
+    condition_filter: bool,
 ) -> Result<PmOpenOrdersCutProgress, PmLiveAdapterError> {
     ensure_live_source_shape(live_source.as_ref(), pages.len(), &requested_cursors)?;
     let page = pages.last().expect("advance always has a page");
@@ -1420,17 +1487,37 @@ fn advance_open_orders(
                 next_cursor,
                 row_count,
                 live_source,
+                condition_filter,
             }))
         }
     }
 }
 
+#[cfg(test)]
 fn advance_trades(
     pages: Vec<PmLiveTradePage>,
     requested_cursors: Vec<String>,
     prior_rows: usize,
     live_source: Option<LiveCutSource>,
     exact_scope_filter: bool,
+) -> Result<PmTradesCutProgress, PmLiveAdapterError> {
+    advance_trades_filtered(
+        pages,
+        requested_cursors,
+        prior_rows,
+        live_source,
+        exact_scope_filter,
+        false,
+    )
+}
+
+fn advance_trades_filtered(
+    pages: Vec<PmLiveTradePage>,
+    requested_cursors: Vec<String>,
+    prior_rows: usize,
+    live_source: Option<LiveCutSource>,
+    exact_scope_filter: bool,
+    condition_filter: bool,
 ) -> Result<PmTradesCutProgress, PmLiveAdapterError> {
     ensure_live_source_shape(live_source.as_ref(), pages.len(), &requested_cursors)?;
     let page = pages.last().expect("advance always has a page");
@@ -1456,6 +1543,7 @@ fn advance_trades(
                 row_count,
                 live_source,
                 exact_scope_filter,
+                condition_filter,
             }))
         }
     }
